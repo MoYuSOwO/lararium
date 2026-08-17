@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 from bundles.memory.gate import Gate
@@ -26,6 +27,57 @@ HELP = """可用命令(这些都不经过模型,是你直接对系统说话):
   /replay <envelope_id>  重放某一轮
   /quit                退出(退出前自动结算)
 """
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    text: str
+    should_quit: bool = False
+
+
+def handle_command(line: str, *, steward: Steward, ledger: Ledger, gate: Gate) -> CommandResult:
+    """执行一条 / 命令,返回要打印的文本。不打印、不退出进程——那是调用方的事。
+
+    抽出来的理由有两个:一是 `/rollback abc` 这类坏参数不能打死 CLI,而只有可测的
+    函数才守得住;二是 M2 的 IM 按钮回调要走同一套分派,两份实现必然漂移。
+    """
+    if line == "/quit":
+        n = steward.settle_if_needed()
+        return CommandResult(f"结算 {n} 条提案后退出。" if n else "退出。", should_quit=True)
+    if line == "/help":
+        return CommandResult(HELP)
+    if line == "/settle":
+        return CommandResult(f"已结算 {steward.settle_if_needed()} 条")
+    if line == "/pending":
+        items = gate.pending()
+        return CommandResult(
+            "\n".join(f"{p.id[:8]} [{p.kind}] {p.content}" for p in items) or "无待审"
+        )
+    if line.startswith(("/approve ", "/reject ")):
+        # 审批走代码,不过模型(DESIGN §6.3)。id 前缀匹配,方便手打。
+        verb, prefix = line.split(maxsplit=1)
+        matched = [p for p in gate.pending() if p.id.startswith(prefix.strip())]
+        if len(matched) != 1:
+            return CommandResult(f"匹配到 {len(matched)} 条,请给出更精确的 id(用 /pending 查看)")
+        gate.resolve(matched[0].id, approved=verb == "/approve")
+        return CommandResult(f"已{'批准' if verb == '/approve' else '否决'}:{matched[0].content}")
+    if line == "/ledger":
+        return CommandResult(ledger.read())
+    if line == "/history":
+        snaps = "\n".join(f"#{snap.id} [{snap.ts[:19]}] {snap.source}" for snap in ledger.history())
+        return CommandResult(snaps)
+    if line.startswith("/rollback "):
+        try:
+            ledger.rollback(int(line.split(maxsplit=1)[1]))
+        except (ValueError, KeyError):
+            return CommandResult("回滚失败:快照 id 要是一个存在的编号,可用 /history 查看")
+        return CommandResult("账本已回滚,可用 /ledger 查看")
+    if line.startswith("/replay "):
+        events = steward.journal.replay(line.split(maxsplit=1)[1])
+        return CommandResult("\n".join(f"  [{e['kind']}] {e['payload']}" for e in events))
+    # 打错的命令绝不当聊天发给模型:/approve 漏 id、/aprove 拼错这种,
+    # 发给模型既浪费 API 调用,又让用户误以为自己批准了提案。
+    return CommandResult(f"未知命令:{line}。输入 /help 看可用命令。")
 
 
 def build_steward(settings: Settings, ledger: Ledger, gate: Gate) -> Steward:
@@ -69,49 +121,17 @@ async def main() -> None:
 
         if not line:
             continue
-        if line == "/quit":
-            n = steward.settle_if_needed()
-            print(f"结算 {n} 条提案后退出。" if n else "退出。")
-            return
-        if line == "/help":
-            print(HELP)
-            continue
-        if line == "/settle":
-            print(f"已结算 {steward.settle_if_needed()} 条")
-            continue
-        if line == "/pending":
-            items = gate.pending()
-            print("\n".join(f"{p.id[:8]} [{p.kind}] {p.content}" for p in items) or "无待审")
-            continue
-        if line.startswith(("/approve ", "/reject ")):
-            # 审批走代码,不过模型(DESIGN §6.3)。id 前缀匹配,方便手打。
-            verb, prefix = line.split(maxsplit=1)
-            matched = [p for p in gate.pending() if p.id.startswith(prefix.strip())]
-            if len(matched) != 1:
-                print(f"匹配到 {len(matched)} 条,请给出更精确的 id(用 /pending 查看)")
-                continue
-            gate.resolve(matched[0].id, approved=verb == "/approve")
-            print(f"已{'批准' if verb == '/approve' else '否决'}:{matched[0].content}")
-            continue
-        if line == "/ledger":
-            print(ledger.read())
-            continue
-        if line == "/history":
-            for snap in ledger.history():
-                print(f"#{snap.id} [{snap.ts[:19]}] {snap.source}")
-            continue
-        if line.startswith("/rollback "):
-            ledger.rollback(int(line.split(maxsplit=1)[1]))
-            print("账本已回滚,可用 /ledger 查看")
-            continue
-        if line.startswith("/replay "):
-            for event in steward.journal.replay(line.split(maxsplit=1)[1]):
-                print(f"  [{event['kind']}] {event['payload']}")
-            continue
         if line.startswith("/"):
-            # 打错的命令绝不当聊天发给模型:/approve 漏 id、/aprove 拼错这种,
-            # 发给模型既浪费 API 调用,又让用户误以为自己批准了提案。
-            print(f"未知命令:{line}。输入 /help 看可用命令。")
+            try:
+                result = handle_command(line, steward=steward, ledger=ledger, gate=gate)
+            except Exception as exc:
+                # 兜底:校验挡已知的坏输入,这里挡没想到的。任何 / 命令出错都不能打死 CLI。
+                print(f"命令出错(不影响后续):{type(exc).__name__}: {exc}")
+                continue
+            if result.should_quit:
+                print(result.text)
+                return
+            print(result.text)
             continue
 
         steward.submit(Envelope.new(source="user", channel="cli", content=line))
