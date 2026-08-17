@@ -27,6 +27,7 @@
 - **Task 4** 账本文件与快照表落地:`Ledger` 管 markdown 账本 + SQLite 快照表,支持手编检测(`sync_manual_edit`)、回滚、diff;`read()` 纯读缺文件即报错(防静默失忆),新建职责交给启动期 `ensure_initialized()`,全代码树只剩 `Ledger.write()` 一处写文件
 - **Task 5** 门控状态机落地:`Gate` 分档审批(user_stated 直通、untrusted 待审批),`settle()` 批量结算护缓存,amend/retire 用 old_text 精确匹配、过期提案打回不阻塞同批;retire 只删第一处匹配行,粗 old_text 不再连坐
 - **Task 6** Memory bundle MCP server 落地:`build_memory_components` 组装 Ledger+Gate、`create_server` 暴露 FastMCP、`memory_tool_functions` 只含 `propose_fact` 与 `list_pending` 两个工具(审批/结算/回滚走代码路径,不经模型);SQLite 连接加 `check_same_thread=False`,框架线程池里的工具调用不再崩
+- **Task 7** 插件注册表落地:`Registry.load` 扫描 `bundles/*/manifest.yaml` 组装目录,`read_skill` 走 manifest 白名单校验挡路径穿越,`directory_lines` 确定性排序保证前缀字节稳定;坏 manifest 点名出错的文件路径,重名 bundle 直接拒绝启动,不留够不着的领域
 
 ---
 

@@ -46,7 +46,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
-| 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☐ | 2026-08-17 |
+| 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
 | 8 | 内置工具三件 | 未开始 | | | |
 | 9 | 上下文组装器 | 未开始 | | | |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
@@ -802,7 +802,31 @@ PLAN.md Task 7 已补 **Step 6–9**:抽出 `_parse_manifest`,解析失败点名
 外加三个测试。
 
 **结论:通过**(补完 manifest 可诊断性即可开始 Task 8)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+**补完记录**(程序员填,commit 8335c0c)
+
+按 Step 6–9 补 manifest 加载可诊断性:
+
+- `Registry.load` 重写:解析走 `_parse_manifest`(static method),失败时 `raise ValueError(f"{path} 不是合法的 bundle manifest:{exc}")`,捕获 `KeyError` / `TypeError` / `yaml.YAMLError`
+- 加载后检查重名:用 `names.count(n)` 找出重复的 name,重名直接 `raise ValueError("bundle 重名: ...")`,拒绝启动
+- 三个测试:
+  - `test_broken_manifest_names_the_offending_file`:缺 name 字段 → ValueError 含 `finance/manifest.yaml`
+  - `test_invalid_yaml_names_the_offending_file`:坏缩进 yaml → ValueError 含 `health/manifest.yaml`
+  - `test_duplicate_bundle_names_are_rejected`:两个 `name: finance` → ValueError 含「重名」
+- 共用 `_write_bundle` 辅助函数写临时 bundle 目录
+
+测试输出(Step 8 确认通过):
+```
+$ uv run pytest tests/steward/test_registry.py -v
+...
+tests/steward/test_registry.py::test_broken_manifest_names_the_offending_file PASSED [ 80%]
+tests/steward/test_registry.py::test_invalid_yaml_names_the_offending_file PASSED [ 90%]
+tests/steward/test_registry.py::test_duplicate_bundle_names_are_rejected PASSED [100%]
+============================== 10 passed in 0.03s ===============================
+```
+
+门禁四关全绿(66 passed, 1 skipped)。CHANGELOG Task 7 条目已追加。偏离:RUF043 要求 `pytest.raises(match=...)` 里的 `.` 转义(正则元字符),两处改用 `r"...\.yaml"` 原始字符串;ruff format 将 `load()` 的列表推导式收为一行。均为纯修正,无逻辑变化。
 
 ---
 
