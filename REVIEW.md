@@ -46,7 +46,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
-| 7 | 插件注册表与 read_skill | 未开始 | | | |
+| 7 | 插件注册表与 read_skill | **待验收** | | | 2026-08-17 |
 | 8 | 内置工具三件 | 未开始 | | | |
 | 9 | 上下文组装器 | 未开始 | | | |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
@@ -713,6 +713,40 @@ tests/bundles/test_memory_server.py::test_tools_work_when_called_from_a_worker_t
 ```
 
 门禁四关全绿(56 passed, 1 skipped)。CHANGELOG Task 6 条目已追加。ruff format 将两处多行调用收为一行(纯格式,无逻辑变化)。
+
+---
+
+### Task 7:插件注册表与 read_skill
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_registry.py -v
+...
+tests/steward/test_registry.py:5: in <module>
+    from lararium.steward.registry import Registry
+E   ModuleNotFoundError: No module named 'lararium.steward.registry'
+ERROR tests/steward/test_registry.py
+=============================== 1 error in 0.06s ===============================
+```
+
+测试输出(Step 4 确认通过):
+```
+$ uv run pytest tests/steward/test_registry.py -v
+...
+tests/steward/test_registry.py::test_load_discovers_memory_bundle PASSED [ 14%]
+tests/steward/test_registry.py::test_directory_lines_include_name_description_and_skills PASSED [ 28%]
+tests/steward/test_registry.py::test_directory_lines_are_deterministic PASSED [ 42%]
+tests/steward/test_registry.py::test_read_skill_without_name_returns_overview PASSED [ 57%]
+tests/steward/test_registry.py::test_read_skill_with_name_returns_body PASSED [ 71%]
+tests/steward/test_registry.py::test_read_skill_rejects_unknown_bundle PASSED [ 85%]
+tests/steward/test_registry.py::test_read_skill_rejects_path_traversal PASSED [100%]
+============================== 7 passed in 0.02s ===============================
+```
+
+与计划的偏离:
+- **ruff format 将 `skills=tuple(...)` 生成器表达式收为一行**:纯格式,无逻辑变化。
 
 ---
 
