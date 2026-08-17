@@ -40,7 +40,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 
 | # | 任务 | 状态 | 验收人结论 | CHANGELOG | 日期 |
 |---|---|---|---|---|---|
-| 1 | 环境、门禁与配置加载 | 未开始 | | | |
+| 1 | 环境、门禁与配置加载 | 待验收 | | | |
 | 2 | 信封模型与收件箱 | 未开始 | | | |
 | 3 | 起居注与中文检索 | 未开始 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
@@ -86,6 +86,38 @@ $ uv run pytest tests/... -v
 - 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 -->
+
+### Task 1:环境、门禁与配置加载
+
+**执行记录**(程序员填)
+
+测试输出:
+```
+$ uv run pytest tests/test_config.py -v
+============================= test session starts ==============================
+platform darwin -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- /Users/jayhuang/Code/lararium/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /Users/jayhuang/Code/lararium
+configfile: pyproject.toml
+plugins: logfire-4.40.0, asyncio-1.4.0, anyio-4.14.2
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 2 items
+
+tests/test_config.py::test_load_reads_env PASSED                         [ 50%]
+tests/test_config.py::test_load_rejects_missing_api_key PASSED           [100%]
+
+============================== 2 passed in 0.01s ===============================
+```
+
+与计划的偏离:
+- Step 1 的 `pre-commit autoupdate` 将 pre-commit-hooks 从 v5.0.0 更新到 v6.0.0,`.pre-commit-config.yaml` 的 `rev` 字段相应改变。这是计划 Step 1 明确要求的步骤(配置注释也写了"装好后跑一次 autoupdate 拉到最新并提交"),一并纳入本次 commit。
+- `tests/test_config.py` 的 import 排序:ruff 的 isort(I001)要求 `import pytest` 与 `from lararium.config import Settings` 之间加空行(第三方与第一方分组),计划原文两者紧邻。已按 ruff 要求修正。
+- `tests/test_config.py` 的注释对齐:计划原文用多余空格对齐 `# 默认值` 注释,ruff format 会去掉对齐空格。已按 ruff format 要求修正为单空格。
+- 环境说明:本机 `uv` 在 `/opt/homebrew/bin` 但不在默认 PATH,且沙箱禁止写 `~/.cache`,故运行 uv 命令时需 `export PATH=/opt/homebrew/bin:$PATH` 与 `UV_CACHE_DIR=<workspace>/.uv-cache`、`PRE_COMMIT_HOME=<workspace>/.pre-commit-cache`。这些是环境适配,不影响代码与门禁结果;`.uv-cache` 由 uv 自带 `.gitignore` 忽略,`.pre-commit-cache` 需确认不进 git(见下)。
+
+**验收结论**(Claude 填)
+
+(待验收)
 
 ---
 
