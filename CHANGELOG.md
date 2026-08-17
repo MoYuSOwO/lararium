@@ -25,6 +25,7 @@
 - **Task 2** 信封模型与严格串行收件箱落地:`Envelope` 走 pydantic、`Inbox` 用 SQLite 持久化 + `BEGIN IMMEDIATE` 保证任一时刻最多一条 processing;崩溃恢复 `recover_stale()` 在启动时清理遗留的 processing 记录,带重试上限防毒消息,避免硬崩溃后队列永久卡死、助手静默
 - **Task 3** 起居注落地:append-only `Journal`,FTS5 trigram 做中文检索、两字词回退 LIKE;`replay()` 逐字重放单轮、`recent_turns()` 给 L0 取最近对话;内部事件(prompt/tool_call)不进检索索引
 - **Task 4** 账本文件与快照表落地:`Ledger` 管 markdown 账本 + SQLite 快照表,支持手编检测(`sync_manual_edit`)、回滚、diff;`read()` 纯读缺文件即报错(防静默失忆),新建职责交给启动期 `ensure_initialized()`,全代码树只剩 `Ledger.write()` 一处写文件
+- **Task 5** 门控状态机落地:`Gate` 分档审批(user_stated 直通、untrusted 待审批),`settle()` 批量结算护缓存,amend/retire 用 old_text 精确匹配、过期提案打回不阻塞同批;retire 只删第一处匹配行,粗 old_text 不再连坐
 
 ---
 

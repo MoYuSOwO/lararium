@@ -44,7 +44,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
-| 5 | 门控状态机 | **通过** | 全绿;retire 连坐补做 + Task 6 计划有严重漏洞已修 | ☐ | 2026-08-17 |
+| 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
 | 8 | 内置工具三件 | 未开始 | | | |
@@ -575,9 +575,22 @@ PLAN.md Task 5 的 `settle()` 已改为只删第一处匹配行(与 amend 对齐
 并加了测试 `test_retire_removes_only_the_first_match`。
 
 **结论:通过**(补完 retire 即可开始 Task 6;Task 6 请按修订后的计划做)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
 
-(待验收)
+**补完记录**(程序员填,commit 9e7b482)
+
+`settle()` 的 retire 分支改为只删第一处匹配行(与 amend 的 `replace(..., 1)` 语义一致),
+加测试 `test_retire_removes_only_the_first_match`(三条含"望京"的事实,retire「望京」只删第一条)。
+
+```
+$ uv run pytest tests/bundles/test_gate.py -v
+...
+tests/bundles/test_gate.py::test_retire_removes_only_the_first_match PASSED [ 84%]
+...
+============================== 13 passed in 0.08s ===============================
+```
+
+门禁四关全绿(45 passed, 1 skipped)。CHANGELOG Task 5 条目已追加。无偏离。
 
 ---
 
