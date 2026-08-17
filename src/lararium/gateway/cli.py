@@ -108,9 +108,20 @@ async def main() -> None:
             for event in steward.journal.replay(line.split(maxsplit=1)[1]):
                 print(f"  [{event['kind']}] {event['payload']}")
             continue
+        if line.startswith("/"):
+            # 打错的命令绝不当聊天发给模型:/approve 漏 id、/aprove 拼错这种,
+            # 发给模型既浪费 API 调用,又让用户误以为自己批准了提案。
+            print(f"未知命令:{line}。输入 /help 看可用命令。")
+            continue
 
         steward.submit(Envelope.new(source="user", channel="cli", content=line))
-        reply = await steward.process_next()
+        try:
+            reply = await steward.process_next()
+        except Exception as exc:
+            # 一次 API 错误(限流/网络抖动/401)不能打死 CLI——它要"随时可用"。
+            # loop.py 已记 error 事件并标记信封 failed,这里只需接住不让它冒泡。
+            print(f"处理出错(不影响后续):{type(exc).__name__}: {exc}")
+            continue
         print(f"\nLararium > {reply}")
 
 
