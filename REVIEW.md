@@ -40,7 +40,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 
 | # | 任务 | 状态 | 验收人结论 | CHANGELOG | 日期 |
 |---|---|---|---|---|---|
-| 1 | 环境、门禁与配置加载 | **通过** | 全绿;附一处计划缺陷待补(conftest 环境隔离) | ☐ | 2026-08-17 |
+| 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | 未开始 | | | |
 | 3 | 起居注与中文检索 | 未开始 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
@@ -155,7 +155,23 @@ PLAN.md Task 1 已补 **Step 3:写 `tests/conftest.py`**(autouse fixture 清掉�
 用 autouse 是为了让后续 Task 11、12 的 fixture 自动受益,不必每个任务各自记得。
 
 **结论:通过**(补完 conftest.py 即可开始 Task 2,不必等二次验收)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+**补完记录**(程序员填,commit 2e5470e)
+
+按新 Step 3 写 `tests/conftest.py`(autouse fixture 清所有 `LARARIUM_*`)。验证隔离生效——
+宿主 shell 注入干扰值后测试仍全绿:
+
+```
+$ LARARIUM_API_KEY=sk-LEAKED-FROM-HOST LARARIUM_TIMEZONE=Asia/Tokyo \
+  LARARIUM_L0_MAX_TURNS=999 uv run pytest tests/test_config.py -v
+tests/test_config.py::test_load_reads_env PASSED                         [ 50%]
+tests/test_config.py::test_load_rejects_missing_api_key PASSED           [100%]
+============================== 2 passed in 0.01s ===============================
+```
+
+门禁四关全绿(9 files formatted / mypy 6 files / 3 kept 0 broken / 5 passed 1 skipped)。
+单独 commit:`test: 隔离宿主环境变量,堵住 source .env 后测试串读的坑`。CHANGELOG M1 条目已追加。
 
 ---
 

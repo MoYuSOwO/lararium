@@ -21,6 +21,8 @@
 
 <!-- ↓ 第一条从这里开始写,删掉本行注释 -->
 
+- **Task 1** 配置加载就位:`Settings.load()` 从 `LARARIUM_*` 环境变量读模型与运行参数,缺 API key 即报错;人格总则 `prompts/persona.md` 落地;测试经 conftest 与宿主环境隔离,`source .env` 后跑测试不再串读真实配置
+
 ---
 
 ## M0 · 立项与工程基建(已完成)
