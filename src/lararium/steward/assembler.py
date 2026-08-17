@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 from lararium.envelope import Envelope
 
@@ -24,8 +25,11 @@ class AssembledContext:
     messages: list[dict[str, str]]
 
 
-def _render_envelope(envelope: Envelope) -> str:
-    stamp = envelope.ts.astimezone().isoformat(timespec="seconds")
+def _render_envelope(envelope: Envelope, tz: ZoneInfo) -> str:
+    # 必须用配置的时区,不能用裸 astimezone()——后者取的是操作系统本地时区。
+    # VPS 默认基本都是 UTC,那样信封会显示 UTC 时间而 current_time 工具显示
+    # Asia/Shanghai,同一轮对话里差 8 小时,模型对"今天/昨天/晚上"的判断就全错了。
+    stamp = envelope.ts.astimezone(tz).isoformat(timespec="seconds")
     if envelope.meta.get("untrusted"):
         return (
             f"[{stamp}] 来自 {envelope.channel} 的外部数据。"
@@ -45,6 +49,7 @@ def assemble(
     l1: str,
     l0: list[Turn],
     envelope: Envelope,
+    timezone: str,
 ) -> AssembledContext:
     """纯函数。输入全部来自持久层 —— 这是可重放的前提(DESIGN §6.6)。
 
@@ -64,6 +69,6 @@ def assemble(
             continue
         messages.append({"role": "user", "content": turn.user})
         messages.append({"role": "assistant", "content": turn.assistant})
-    messages.append({"role": "user", "content": _render_envelope(envelope)})
+    messages.append({"role": "user", "content": _render_envelope(envelope, ZoneInfo(timezone))})
 
     return AssembledContext(system_prompt=system_prompt, messages=messages)

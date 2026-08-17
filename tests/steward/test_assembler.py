@@ -6,9 +6,22 @@ DIRECTORY = "- memory:核心账本与门控写入"
 LEDGER = "## 身份\n- 对芒果过敏\n"
 
 
-def build(envelope: Envelope, *, ledger: str = LEDGER, l1: str = "", l0=None):
+def build(
+    envelope: Envelope,
+    *,
+    ledger: str = LEDGER,
+    l1: str = "",
+    l0=None,
+    timezone: str = "Asia/Shanghai",
+):
     return assemble(
-        persona=PERSONA, directory=DIRECTORY, ledger=ledger, l1=l1, l0=l0 or [], envelope=envelope
+        persona=PERSONA,
+        directory=DIRECTORY,
+        ledger=ledger,
+        l1=l1,
+        l0=l0 or [],
+        envelope=envelope,
+        timezone=timezone,
     )
 
 
@@ -32,6 +45,19 @@ def test_prefix_contains_no_timestamp():
     ctx = build(env)
     assert str(env.ts.year) not in ctx.system_prompt
     assert env.ts.isoformat() not in ctx.system_prompt
+
+
+def test_envelope_timestamp_follows_configured_timezone_not_the_os():
+    """VPS 默认时区基本都是 UTC。用裸 astimezone() 的话,信封会显示 UTC 时间,
+    而 current_time 工具显示配置的 Asia/Shanghai——同一轮对话里差 8 小时,
+    模型对"今天/昨天/晚上"的判断全错。用两个时区对比,测试本身不依赖开发机的 TZ。"""
+    env = Envelope.new(source="user", channel="cli", content="现在几点")
+    shanghai = build(env, timezone="Asia/Shanghai").messages[-1]["content"]
+    utc = build(env, timezone="UTC").messages[-1]["content"]
+
+    assert "+08:00" in shanghai
+    assert "+00:00" in utc
+    assert shanghai != utc
 
 
 def test_envelope_message_carries_the_timestamp():
