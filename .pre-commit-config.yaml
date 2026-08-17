@@ -6,7 +6,7 @@
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0 # 装好后跑一次 `pre-commit autoupdate` 拉到最新并提交
+    rev: v6.0.0 # 装好后跑一次 `pre-commit autoupdate` 拉到最新并提交
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
