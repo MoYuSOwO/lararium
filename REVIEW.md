@@ -50,7 +50,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
 | 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | **通过** | 四条 API 修正均属实;run() 全路径已验证,无补做 | ☑ | 2026-08-17 |
-| 11 | 一轮的编排与 CLI | **待验收** | | | 2026-08-17 |
+| 11 | 一轮的编排与 CLI | **通过** | 边界与接线全对;CLI 健壮性补做 | ☐ | 2026-08-17 |
 | 12 | 端到端验收 | 未开始 | | | |
 
 状态取值:未开始 / 进行中 / 待验收 / **通过** / 打回
@@ -1205,6 +1205,73 @@ exit=0
 - 其余照抄即过:recover_stale() 在 main() 启动时调用 ✓、`assemble(..., timezone=self.settings.timezone)` ✓、loop.py 全程走 `LedgerPort`/`GatePort` Protocol 不碰 bundles ✓。
 
 门禁四关全绿(101 passed, 0 skipped;mypy 20 files;import-linter **3 kept, 0 broken**——Steward 首次需要 Memory 能力,契约验证守住)。
+
+**验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(20 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(101 passed, 0 skipped)
+- 重跑结果:独立重跑全绿。`test_loop.py` 9 passed。
+- 规范核对(CONVENTIONS.md):`Steward.__init__` 全 keyword-only(F3);
+  `settle_if_needed` / `all_tools` 副作用写在名字里(F6);`process_next` 的
+  `except Exception` 后记账+标记+`raise`,不吞异常(E1)。**CLI 层两处违反见下。**
+- 契约核对:`LedgerPort` / `GatePort` / `Steward`(含 `bundle_tools`、`all_tools`)
+  与计划一致。
+- **不变量核对(本任务是三条的汇合点,逐条查)**:
+  - **前缀字节稳定 ☑** —— `test_prefix_identical_between_turns_when_ledger_unchanged`
+    与 `test_settled_fact_appears_in_next_prefix` 一正一反守住了。
+  - **可见即入账 ☑** —— `test_recorded_prompt_matches_what_model_received` 断言落账的
+    prompt 与模型实收逐字相同,不是事后重拼的。这条是重放的地基。
+  - **账本单写路径 ☑** —— `loop.py` 只经 `GatePort.settle()`,不碰 `ledger.write`。
+- **架构边界 ☑** —— `loop.py` 的 import 我逐行看过,全程 `lararium.*`,
+  经 `ports.py` 的 Protocol 拿 Memory 能力;`cli.py` 作为组装根 import bundles(契约允许)。
+  **这是 import-linter 契约第一次真正受考验,守住了。**
+- 三个前序补做的接线点全部到位:`recover_stale()` 在启动时调用 ✓、
+  `assemble(..., timezone=...)` ✓、`bundle_tools=memory_tool_functions(gate)` ✓。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动。
+
+两条偏离全部成立。**ASYNC250 那条是好的改进**——`input()` 在事件循环里阻塞,
+ruff 抓得对,而且改成 `to_thread` 也为 M3 的定时任务腾出了 loop。
+
+**真跑 CLI 验证(测试驱动不了 `main()`,只能手动)**
+
+用假 API key 驱动命令路径(命令不碰模型),四项都对:
+
+```
+上次有未处理完的消息:1 条已重新排队,0 条已放弃。   ← Task 2 崩溃恢复真的生效
+你 > 已否决:允许免确认转账                          ← 恶意提案被挡
+你 > 已批准:住在望京
+你 > 已结算 1 条                                     ← 只落盘批准的那条
+你 > ## 身份
+- 住在望京                                           ← 账本里没有"免确认转账"
+```
+
+**但真跑也暴露了两处必须补的健壮性问题**
+
+**1. 打错的命令被当成聊天消息发给模型。** 实测 `/approve`(漏 id)与 `/aprove abc`
+(拼错)都落到了模型调用上,发出真实 API 请求。`/approve` 是**安全关键路径**——
+打错就变成聊天的话,用户可能以为自己批准了某条提案,实际什么也没发生,
+而账本里那条恶意内容还静静躺在 pending 里等下一次误操作。
+
+**2. 一次 API 错误直接打死整个 CLI。** 实测发一句话触发 401,异常一路冒泡出 `main()`,
+后续的 `/ledger`、`/quit` 全部没执行,**退出前的自动结算也没跑**:
+
+```
+$ printf '你好\n/ledger\n/quit\n' | ... python -m lararium.gateway.cli
+pydantic_ai.exceptions.ModelHTTPError: status_code: 401 ...
+(没有 '## 身份',没有 '退出。' —— CLI 已死)
+```
+
+限流、网络抖动这类瞬时错误在 VPS 上是常态,一次就让助手下线且需手动重启,
+对「随时可用」是硬伤;M2 换成 Telegram 后更严重。
+
+要说清楚:**`loop.py` 的处理是对的**——记 error 事件、标记信封 failed、然后 `raise`,
+符合 E1 的「要么处理,要么让它冒泡」。问题是**没有任何一层接住它**,
+而最外层循环正是该处理的那一层。
+
+PLAN.md Task 11 已补 **Step 9–11**,并在 Task 12 的冒烟清单里加了第 6 项
+(打错命令应给提示且不发 API 请求)。
+
+**结论:通过**(补完 CLI 健壮性即可开始 Task 12)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 ---
 

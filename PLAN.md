@@ -3363,8 +3363,23 @@ async def main() -> None:
                 print(f"  [{event['kind']}] {event['payload']}")
             continue
 
+        if line.startswith("/"):
+            # 以 / 开头却没匹配上任何命令 = 打错了。绝不能落到下面发给模型:
+            # /approve 是安全关键路径,打错变成聊天的话,用户会以为自己批准了什么。
+            print(f"未知命令:{line.split()[0]}。输入 /help 看可用命令。")
+            continue
+
         steward.submit(Envelope.new(source="user", channel="cli", content=line))
-        reply = await steward.process_next()
+        try:
+            reply = await steward.process_next()
+        except Exception as exc:
+            # 最外层循环必须接住:限流、网络抖动这类瞬时错误在 VPS 上是常态,
+            # 一次就把助手打死、还得手动重启,对"随时可用"是硬伤。
+            # loop.py 里已经记了 error 事件并把信封标记为 failed(不吞异常,E1),
+            # CLI 这一层才是该处理它的地方。
+            print(f"\n这一轮没能处理完:{type(exc).__name__}: {exc}")
+            print("(已记进起居注,信封标记为 failed。可以继续说话。)")
+            continue
         print(f"\nLararium > {reply}")
 
 
@@ -3392,6 +3407,57 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 ```bash
 git add src/lararium/steward/loop.py src/lararium/gateway/cli.py tests/steward/test_loop.py
 git commit -m "feat: 一轮编排与 CLI 适配器"
+```
+
+### Task 11 补做:CLI 的两处健壮性(验收时补入)
+
+真跑 CLI 时暴露的,单元测试覆盖不到(`main()` 的循环没有测试驱动):
+
+**1. 打错的命令会被当成聊天消息发给模型。** 实测 `/approve`(漏了 id)与 `/aprove abc`
+(拼错)都落到了模型调用上,发出真实 API 请求。`/approve` 是**安全关键路径**——
+打错就变成聊天的话,用户可能以为自己批准了某条待审提案,实际什么也没发生。
+
+**2. 一次 API 错误直接打死整个 CLI。** 实测发一句话触发 401,异常一路冒泡出 `main()`,
+后续的 `/ledger`、`/quit` 全部没执行,退出前的自动结算也没跑。限流、网络抖动这类
+瞬时错误在 VPS 上是常态,一次就让助手下线并需要手动重启,对「随时可用」是硬伤。
+M2 换成 Telegram 后更严重。
+
+注意 `loop.py` 的处理是**对的**:它记 error 事件、标记信封 failed、然后 `raise`
+(不吞异常,E1)。问题在于**没有任何一层接住它**——最外层循环才是该处理的地方。
+
+- [ ] **Step 9: 按上方 Step 6 的新版改 `main()` 的循环尾部**
+
+加两段:所有 `/` 开头但未匹配的命令给「未知命令」提示并 `continue`(绝不发给模型);
+`await steward.process_next()` 包进 try/except,出错时打印友好信息后 `continue`。
+
+- [ ] **Step 10: 手动验证两条**
+
+```bash
+D=$(mktemp -d)
+printf '/aprove abc
+/ledger
+/quit
+' | LARARIUM_API_KEY=sk-dummy LARARIUM_DATA_DIR=$D uv run python -m lararium.gateway.cli
+```
+
+预期:`/aprove abc` 得到「未知命令」提示且**没有任何 HTTP 请求**;
+`/ledger` 正常打印账本;`/quit` 正常退出。
+
+```bash
+printf '你好
+/ledger
+/quit
+' | LARARIUM_API_KEY=sk-dummy LARARIUM_DATA_DIR=$D uv run python -m lararium.gateway.cli
+```
+
+预期:「你好」因假 key 报错,但**打印友好错误后 CLI 继续存活**,
+`/ledger` 与 `/quit` 照常执行。
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add src/lararium/gateway/cli.py
+git commit -m "fix: 未知命令不发给模型,模型出错不打死 CLI"
 ```
 
 ---
@@ -3570,7 +3636,9 @@ set -a && source .env && set +a && uv run python -m lararium.gateway.cli
 2. 再说一句别的——确认第二轮 `[cache]` 命中数**明显大于 0**(前缀被缓存住了);
 3. 说「我对芒果过敏,记一下」——确认它调了 `propose_fact` 并回显"已记下";
 4. `/settle` 然后 `/ledger`——确认账本里有这条,小节正确;
-5. `/replay <上一轮的 envelope_id>`——确认能看到 envelope/prompt/reply 全套。
+5. `/replay <上一轮的 envelope_id>`——确认能看到 envelope/prompt/reply 全套;
+6. 打一个不存在的命令(如 `/aprove x`)——确认给出「未知命令」提示,**且没有发起 API 请求**
+   (日志里不应出现 HTTP Request 行)。
 
 - [ ] **Step 5: Commit**
 
