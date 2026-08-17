@@ -47,7 +47,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
-| 8 | 内置工具三件 | 未开始 | | | |
+| 8 | 内置工具三件 | **待验收** | | | 2026-08-17 |
 | 9 | 上下文组装器 | 未开始 | | | |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
@@ -827,6 +827,40 @@ tests/steward/test_registry.py::test_duplicate_bundle_names_are_rejected PASSED 
 ```
 
 门禁四关全绿(66 passed, 1 skipped)。CHANGELOG Task 7 条目已追加。偏离:RUF043 要求 `pytest.raises(match=...)` 里的 `.` 转义(正则元字符),两处改用 `r"...\.yaml"` 原始字符串;ruff format 将 `load()` 的列表推导式收为一行。均为纯修正,无逻辑变化。
+
+---
+
+### Task 8:内置工具 current_time 与 search_history
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_tools.py -v
+...
+tests/steward/test_tools.py:8: in <module>
+    from lararium.steward.tools import BuiltinTools
+E   ModuleNotFoundError: No module named 'lararium.steward.tools'
+ERROR tests/steward/test_tools.py
+=============================== 1 error in 0.06s ===============================
+```
+
+测试输出(Step 4 确认通过):
+```
+$ uv run pytest tests/steward/test_tools.py -v
+...
+tests/steward/test_tools.py::test_current_time_returns_iso_with_configured_zone PASSED [ 14%]
+tests/steward/test_tools.py::test_read_skill_delegates_to_registry PASSED [ 28%]
+tests/steward/test_tools.py::test_read_skill_returns_readable_error_for_unknown PASSED [ 42%]
+tests/steward/test_tools.py::test_search_history_finds_chinese_and_formats_hits PASSED [ 57%]
+tests/steward/test_tools.py::test_search_history_reports_no_match_clearly PASSED [ 71%]
+tests/steward/test_tools.py::test_tool_function_order_is_fixed PASSED [ 85%]
+tests/steward/test_tools.py::test_search_history_works_from_a_worker_thread PASSED [100%]
+============================== 7 passed in 0.04s ===============================
+```
+
+与计划的偏离:
+- (无)
 
 ---
 
