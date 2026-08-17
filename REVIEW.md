@@ -1667,3 +1667,92 @@ tests/test_acceptance_m1.py::test_acceptance_settled_fact_reaches_the_model_on_t
 - `__init__` 里加了 `self._settings = settings`(计划代码在注入口分支里提前 return 前
   没写它,但原实现有;保持赋值,避免依赖它的代码拿到未初始化属性)。
 - 无其他偏离。
+
+**验收结论**(Claude 填):**实现通过,测试层次需补一处(补1b),补2 之前必须做完。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(20 files)/ import-linter ☑(3 kept)/ pytest ☑(**112 passed**,106 → +6)
+- 「运行测试确认失败」这一步做得比我要求的好:你先拿到夹具缺失的 `TypeError`,
+  又把旧行为(前缀走 `Agent(system_prompt=)`)复原了一遍,拿到**断言层面**的
+  4 failed 1 passed。第二次那份才是真证据,你自己补上了这个区分。
+
+**实现正确,我在真正的 HTTP body 层面复核了三件事**(`httpx.MockTransport` 截请求体,
+不联网):
+
+```
+第一轮  messages[0] = {"role": "system", "content": "PREFIX"}
+第二轮  messages[0] = {"role": "system", "content": "PREFIX"}   跨轮字节一致 True
+带工具往返的一轮(2 次请求):两次的 messages[0] 都是同一份前缀,字节一致
+```
+
+工具往返那条尤其重要——冒烟里就是「2 请求」,而它之前一条测试都没有。
+
+## 补1b:测试层次差一级(我的缺陷,不是实现缺陷)
+
+`tests/steward/test_model_wire.py` 用 `FunctionModel` 捕获的是 **pydantic-ai 的内部
+message 列表**,而 `FunctionModel` 当模型时,**OpenAI 适配器根本不在链路上**。
+于是这五条测试断言的是"我们把 SystemPromptPart 放进了库内部列表的正确位置",
+对真正发出去的字节一无所知。而缓存命中是按发出去的字节算的。
+
+**这跟 P0-1 是同一个形状,只是往下挪了一层**:原来的错是"组装器对了、发出去的错了",
+现在的测试是"内部表示对了、发出去的没人看"。两个证据:
+
+1. 改用 `Agent(instructions=...)` 会产出**逐字节完全相同的 HTTP body**(已实测),
+   但会让这 5 条里的 4 条失败——内部列表里 `system-prompt` 部件数为 0,
+   `instructions` 挂在最后一条 `ModelRequest` 的字段上。
+   **一个会否决正确实现的测试,测的是机制不是行为**(CONVENTIONS T1)。
+2. 反方向更要命:未来 pydantic-ai 保留内部 `SystemPromptPart` 但改了 OpenAI 适配器的
+   序列化,这 5 条照样全绿,而前缀已经断了——正是我们刚被咬的那一口。
+
+**要做的**:把 `wire` 夹具换成 `httpx.MockTransport`(真实 `PydanticAIClient` +
+真实 `OpenAIChatModel`,只换传输层),断言 `body["messages"]`;并补一条工具往返的测试。
+不需要网络也不需要真 key。替换版我已整份跑通(6 passed),代码见
+[PLAN.md](PLAN.md)「补1b」。
+
+**顺带一条记录订正**:你写的偏离「计划代码在提前 return 前没写 `self._settings`」
+——PLAN.md:3873 是有的,你和计划一致,不算偏离。代码本身没问题,只是记录不准。
+
+**为什么必须在补2 之前做完**:补2 要复用这个夹具(计划里写了"不要跳序"),
+夹具层次错了,补2 的包裹测试会继承同一个毛病——那可是安全边界上的断言。
+
+## 补1b:P0-1 报文测试挪到 HTTP 层(commit ebbb279,待验收)
+
+**执行记录**(程序员填)
+
+**Step 2 通过输出**(新 MockTransport 夹具,`6 passed`):
+```
+$ uv run pytest tests/steward/test_model_wire.py -v
+tests/steward/test_model_wire.py::test_prefix_is_the_first_message_on_the_first_turn PASSED [ 16%]
+tests/steward/test_model_wire.py::test_prefix_is_still_the_first_message_on_later_turns PASSED [ 33%]
+tests/steward/test_model_wire.py::test_prefix_appears_exactly_once PASSED [ 50%]
+tests/steward/test_model_wire.py::test_prefix_is_byte_identical_across_turns PASSED [ 66%]
+tests/steward/test_model_wire.py::test_history_reaches_the_model_in_order PASSED [ 83%]
+tests/steward/test_model_wire.py::test_prefix_survives_a_tool_round_trip PASSED [100%]
+============================== 6 passed in 1.29s ===============================
+```
+
+**Step 2 关键验证——临时改回 `Agent(system_prompt=...)` 旧行为,6 条必须失败**:
+```
+$ (改回旧行为后)
+FAILED tests/steward/test_model_wire.py::test_prefix_is_still_the_first_message_on_later_turns
+FAILED tests/steward/test_model_wire.py::test_prefix_appears_exactly_once - A...
+FAILED tests/steward/test_model_wire.py::test_prefix_is_byte_identical_across_turns
+FAILED tests/steward/test_model_wire.py::test_history_reaches_the_model_in_order
+FAILED tests/steward/test_model_wire.py::test_prefix_survives_a_tool_round_trip
+========================= 5 failed, 1 passed in 1.25s ==========================
+```
+(5 failed:第二轮起前缀从 HTTP body 消失;通过的是首轮 `test_prefix_is_the_first_message_on_the_first_turn`,history 为空时 `system_prompt` 注入正常——与 P0-1 完全对应。确认后已改回修复版,复跑 6 passed)
+
+**Step 3 通过输出**(验收①报文复核改断言 body[0],`5 passed`):
+```
+$ uv run pytest tests/test_acceptance_m1.py -v
+...
+tests/test_acceptance_m1.py::test_acceptance_settled_fact_reaches_the_model_on_the_next_turn PASSED [100%]
+============================== 5 passed in 0.98s ===============================
+```
+
+**门禁**:113 passed(106 → +7,新增工具往返测试等),mypy 20 files,import-linter 3 kept。
+
+**与计划的偏离**:
+- 把 `wire` 夹具与验收①的 MockTransport 重复部分抽到 `tests/conftest.py` 的
+  `build_http_spy_client` helper,避免复制两份(CONVENTIONS S 组)。
+- 其余照抄;`httpx` 显式加进 dev 依赖组。
