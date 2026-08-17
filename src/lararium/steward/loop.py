@@ -116,4 +116,14 @@ class Steward:
 
     def _recent_turns(self) -> list[Turn]:
         rows = self.journal.recent_turns(limit=self.settings.l0_max_turns)
-        return [Turn(user=r["user"], assistant=r["assistant"]) for r in rows]
+        return [
+            Turn(
+                user=r["user"],
+                assistant=r["assistant"],
+                source=r.get("source", "user"),
+                channel=r.get("channel", "cli"),
+                untrusted=r.get("untrusted", False),
+                ts=r.get("ts"),
+            )
+            for r in rows
+        ]

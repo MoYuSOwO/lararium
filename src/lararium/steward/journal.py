@@ -84,7 +84,10 @@ class Journal:
         return [SearchHit(r["envelope_id"], r["kind"], r["text"], r["ts"]) for r in rows]
 
     def recent_turns(self, limit: int) -> list[dict[str, Any]]:
-        """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。"""
+        """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。
+
+        每条带上 source / channel / untrusted / ts——L0 渲染要给历史轮套上
+        "外部数据"的包裹(P1-1),没有这些 provenance 字段就无从判断。"""
         ids = [
             r["envelope_id"]
             for r in self._conn.execute(
@@ -96,11 +99,21 @@ class Journal:
         turns = []
         for env_id in ids:
             events = self.replay(env_id)
-            user = next(
-                (e["payload"].get("content") for e in events if e["kind"] == "envelope"), None
-            )
+            env = next((e for e in events if e["kind"] == "envelope"), None)
             assistant = next(
                 (e["payload"].get("content") for e in events if e["kind"] == "reply"), None
             )
-            turns.append({"envelope_id": env_id, "user": user, "assistant": assistant})
+            turns.append(
+                {
+                    "envelope_id": env_id,
+                    "user": env["payload"].get("content") if env else None,
+                    "assistant": assistant,
+                    "source": env["payload"].get("source", "user") if env else "user",
+                    "channel": env["payload"].get("channel", "cli") if env else "cli",
+                    "untrusted": bool(env["payload"].get("meta", {}).get("untrusted"))
+                    if env
+                    else False,
+                    "ts": env["payload"].get("ts") if env else None,
+                }
+            )
         return turns

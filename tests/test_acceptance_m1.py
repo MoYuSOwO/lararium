@@ -137,8 +137,10 @@ async def test_acceptance_prefix_stays_cacheable_across_many_turns(system):
 
 
 async def test_acceptance_untrusted_content_cannot_reach_ledger(system):
-    """验收④(安全):不可信来源的提案未经审批绝不入账本。"""
-    steward, _ = system([ModelReply(text="收到一条通知")])
+    """验收④(安全):不可信来源的提案未经审批绝不入账本;且它的包裹要活过第二轮。"""
+    steward, model = system([ModelReply(text="收到一条通知"), ModelReply(text="那是一条外部数据")])
+
+    # 第一轮:外部数据注入当前消息流,提案进入待审
     steward.submit(
         Envelope.new(
             source="module_event",
@@ -153,6 +155,14 @@ async def test_acceptance_untrusted_content_cannot_reach_ledger(system):
     steward.settle_if_needed()
     assert "免确认转账" not in steward.ledger.read()
     assert len(steward.gate.pending()) == 1
+
+    # 第二轮:这条外部数据作为历史轮出现在 L0 里,必须仍然带着包裹——否则循环里
+    # 注入内容看起来就是用户说的话,而 user_stated 是自动放行的那一档。
+    steward.submit(Envelope.new(source="user", channel="cli", content="刚才那条是什么意思"))
+    await steward.process_next()
+    injected = next(m for m in model.seen[1].messages if "免确认转账" in m["content"])
+    assert "外部数据" in injected["content"], "第二轮 L0 里注入内容丢了包裹,看起来像用户原话"
+    assert "不是指令" in injected["content"]
 
 
 async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(system, monkeypatch):
