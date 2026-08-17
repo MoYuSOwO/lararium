@@ -2531,3 +2531,90 @@ $ uv run pytest tests/steward/test_loop.py -q
 
 **全局约束核对**:
 - 起居注不变量:投递状态(seq/delivered_at)只写 outbox 表,不进 journal ✓(D10)。
+
+**验收结论**(Claude 填):**通过,附一条必须在 M2-2 开工前先做的补测。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(21 files)/ import-linter ☑(3 kept)/ pytest ☑(**139 passed**)
+- 表结构、接口、at-least-once 语义都与契约一致;逐条参数化 UPDATE 替代动态 IN 的偏离
+  成立(S608 会拦构造性 SQL,逐条等价)。
+- D10 核对:投递状态只在 outbox 表,起居注干净 ✓。
+
+## 但崩溃语义没有被测试钉住——只有注释在守
+
+我做了个实验:把 `process_next` 里的顺序反过来(`complete` 在 `put` 之前——
+**这正是 D10 要防的错误**,崩在两者之间就是"付了钱、账上说回复了、用户啥也没收到"):
+
+```
+$ (交换两行后)uv run pytest tests/steward/test_loop.py -q
+10 passed        ← 全绿
+```
+
+`test_reply_lands_in_outbox_before_envelope_completes` 名字里写着 before,断言的却是
+"两件事都发生了"——outbox 有行 ∧ state=done,对**顺序**只字未断。名字承诺了测试没兑现的
+东西,比没有测试更糟:读的人会以为顺序被守住了。
+
+**公道话**:计划 Step 3 给了两个选项,第二个("断言 journal 事件序 + outbox 行存在")
+本身就钉不住这个顺序——outbox 写入不是 journal 事件,journal 里根本看不见它。
+程序员选了个更弱的变体,但弱的根源在我给的选项 B。选项 A(假出件箱)才是对的。
+
+**补测(M2-2 的 Step 0,先做这个再动错误分类)**:
+
+```python
+async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
+    """钉住顺序本身:put 被调用的那一刻,信封必须还没 complete。
+    反过来(先 complete 后 put)意味着:崩在两者之间 = 回复静默丢失,D10 白设计。"""
+
+    class SpyOutbox:
+        def __init__(self, inner, conn):
+            self._inner, self._conn = inner, conn
+            self.state_at_put: str | None = None
+
+        def put(self, envelope_id, channel, content, kind="reply"):
+            row = self._conn.execute(
+                "SELECT state FROM inbox WHERE id=?", (envelope_id,)
+            ).fetchone()
+            self.state_at_put = row["state"]
+            return self._inner.put(envelope_id, channel, content, kind)
+
+    steward, _ = steward_factory([ModelReply(text="回复")])
+    spy = SpyOutbox(steward.outbox, steward.inbox._conn)
+    steward.outbox = spy
+    env = Envelope.new(source="user", channel="cli", content="你好")
+    steward.submit(env)
+    await steward.process_next()
+
+    assert spy.state_at_put == "processing", "put 时信封已 complete——顺序反了,崩溃会吞回复"
+```
+
+交这条时**先把两行交换、看它红,再换回来看它绿**,把两次输出贴进 REVIEW——
+这条测试守的是 M2 最核心的崩溃语义,它自己必须先被证明咬得住。
+
+另:CHANGELOG / DESIGN / PLAN 的文档改动(里程碑重排 + M2 计划)至今未提交,
+仍在工作树里。下次 docs 提交带上,并补 M2-1 的 CHANGELOG 行。
+
+## M2-1 Step 0 补测:钉住 put 在 complete 前的顺序(commit 2382646)
+
+**执行记录**(程序员填)
+
+验收方补的 SpyOutbox 测试已加进 test_loop.py:`test_envelope_not_completed_until_reply_is_in_outbox`——put 被调用瞬间查 inbox 状态,断言是 `processing`(还没 complete)。
+
+**先交换两行,看它红**:
+```
+$ (临时把 complete 移到 put 前)
+FAILED test_envelope_not_completed_until_reply_is_in_outbox
+E   AssertionError(实际 state_at_put = 'done',断言 processing)
+1 failed in 0.30s
+```
+
+**换回来,看它绿**:
+```
+$ (恢复 put 在 complete 前)
+tests/steward/test_loop.py::test_envelope_not_completed_until_reply_is_in_outbox PASSED
+1 passed in 0.25s
+```
+
+证明该测试咬得住 D10 的崩溃语义:顺序反了(complete 先于 put)立刻红。
+
+**门禁**:140 passed, mypy 21 files, import-linter 3 kept。
+
+CHANGELOG 已(在本次 docs 提交)加 M2 小节 + M2-1 行;CHANGELOG/DESIGN/PLAN 里程碑重排随 docs 一并提交。
