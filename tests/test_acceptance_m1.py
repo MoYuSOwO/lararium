@@ -153,3 +153,46 @@ async def test_acceptance_untrusted_content_cannot_reach_ledger(system):
     steward.settle_if_needed()
     assert "免确认转账" not in steward.ledger.read()
     assert len(steward.gate.pending()) == 1
+
+
+async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(system, monkeypatch):
+    """验收①的报文级复核:落盘的事实必须真的出现在下一轮**发出去的报文**里。
+
+    组装器层面的断言不算——P0-1 正是"组装器对了但没发出去"。
+    """
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+
+    from lararium.steward.model import PydanticAIClient
+
+    captured: list[list] = []
+
+    def spy(messages, info):
+        captured.append(messages)
+        return ModelResponse(parts=[TextPart("知道了")])
+
+    steward, _ = system([])
+    steward.model = PydanticAIClient(steward.settings, model=FunctionModel(spy))
+
+    steward.gate.propose(
+        kind="add",
+        content="对芒果过敏",
+        provenance="user_stated",
+        origin="test",
+        section="长期偏好",
+    )
+    assert steward.settle_if_needed() == 1
+
+    steward.submit(Envelope.new(source="user", channel="cli", content="第一问"))
+    await steward.process_next()
+    steward.submit(Envelope.new(source="user", channel="cli", content="晚上吃芒果糯米饭?"))
+    await steward.process_next()
+
+    system_parts = [
+        str(p.content)
+        for m in captured[-1]
+        for p in m.parts
+        if getattr(p, "part_kind", "") == "system-prompt"
+    ]
+    assert len(system_parts) == 1
+    assert "对芒果过敏" in system_parts[0], "账本没进第二轮的报文,模型是失忆状态"

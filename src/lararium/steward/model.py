@@ -64,11 +64,16 @@ def format_cache_log(reply: ModelReply) -> str:
 class PydanticAIClient:
     """真实模型客户端。库 API 若有变动,只改这一个类。"""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, model: Any | None = None) -> None:
+        self._settings = settings
+        # model 是给报文级测试留的注入口(FunctionModel),也是 M2 换服务商的接缝。
+        # 隔离盒是唯一接触第三方语义的地方,必须留得下测试——P0-1 的教训。
+        if model is not None:
+            self._model = model
+            return
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
 
-        self._settings = settings
         self._model = OpenAIChatModel(
             settings.model_name,
             provider=OpenAIProvider(base_url=settings.api_base_url, api_key=settings.api_key),
@@ -78,14 +83,19 @@ class PydanticAIClient:
         self, ctx: AssembledContext, tools: list[Callable], mcp_servers: list[Any]
     ) -> ModelReply:
         from pydantic_ai import Agent
-        from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-
-        agent = Agent(
-            self._model,
-            system_prompt=ctx.system_prompt,
-            tools=tools,
-            toolsets=mcp_servers,
+        from pydantic_ai.messages import (
+            ModelRequest,
+            ModelResponse,
+            SystemPromptPart,
+            TextPart,
+            UserPromptPart,
         )
+
+        # 前缀**不能**走 Agent(system_prompt=...):message_history 非空时
+        # pydantic-ai 不再注入它(2.31.0 实测),第二轮起人格/目录/账本会整个消失。
+        # 唯一可靠的做法是把前缀作为 SystemPromptPart 放进历史首条 ModelRequest。
+        # 首轮历史为空时也照此构造——只有一条路径,才不会有一条悄悄退化。
+        agent = Agent(self._model, tools=tools, toolsets=mcp_servers)
 
         history: list[ModelRequest | ModelResponse] = []
         for msg in ctx.messages[:-1]:
@@ -93,6 +103,12 @@ class PydanticAIClient:
                 history.append(ModelRequest(parts=[UserPromptPart(content=msg["content"])]))
             else:
                 history.append(ModelResponse(parts=[TextPart(content=msg["content"])]))
+
+        prefix = SystemPromptPart(content=ctx.system_prompt)
+        if history and isinstance(history[0], ModelRequest):
+            history[0] = ModelRequest(parts=[prefix, *history[0].parts])
+        else:
+            history.insert(0, ModelRequest(parts=[prefix]))
 
         result = await agent.run(ctx.messages[-1]["content"], message_history=history)
         usage = result.usage
