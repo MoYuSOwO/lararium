@@ -50,7 +50,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
 | 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | **通过** | 四条 API 修正均属实;run() 全路径已验证,无补做 | ☑ | 2026-08-17 |
-| 11 | 一轮的编排与 CLI | 未开始 | | | |
+| 11 | 一轮的编排与 CLI | **待验收** | | | 2026-08-17 |
 | 12 | 端到端验收 | 未开始 | | | |
 
 状态取值:未开始 / 进行中 / 待验收 / **通过** / 打回
@@ -1155,6 +1155,56 @@ Agent 接受 toolsets: True
 - 通过后:CHANGELOG.md 已追加条目 ☑
 
 门禁四关全绿(92 passed, 0 skipped;mypy 17 files)。W292 缺结尾换行与 ruff format 重排为纯修正。
+
+---
+
+### Task 11:一轮的编排与 CLI
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_loop.py -v
+...
+tests/steward/test_loop.py:11: in <module>
+    from lararium.steward.loop import Steward
+E   ModuleNotFoundError: No module named 'lararium.steward.loop'
+ERROR tests/steward/test_loop.py
+=============================== 1 error in 0.15s ===============================
+```
+
+测试输出(Step 5 确认通过):
+```
+$ uv run pytest tests/steward/test_loop.py -v
+...
+tests/steward/test_loop.py::test_process_next_returns_reply_text PASSED [ 11%]
+tests/steward/test_loop.py::test_process_next_returns_none_when_inbox_empty PASSED [ 22%]
+tests/steward/test_loop.py::test_model_receives_builtin_and_bundle_tools_in_fixed_order PASSED [ 33%]
+tests/steward/test_loop.py::test_turn_is_fully_recorded_in_journal PASSED [ 44%]
+tests/steward/test_loop.py::test_recorded_prompt_matches_what_model_received PASSED [ 55%]
+tests/steward/test_loop.py::test_second_turn_sees_first_turn_in_l0 PASSED [ 66%]
+tests/steward/test_loop.py::test_prefix_identical_between_turns_when_ledger_unchanged PASSED [ 77%]
+tests/steward/test_loop.py::test_settled_fact_appears_in_next_prefix PASSED [ 88%]
+tests/steward/test_loop.py::test_model_failure_logs_error_and_does_not_wedge_the_queue PASSED [100%]
+============================== 9 passed in 0.64s ===============================
+```
+
+CLI 冒烟(Step 6 之后):用管道喂 EOF 验证启动与退出路径,不真实调 API:
+```
+$ LARARIUM_API_KEY=sk-test LARARIUM_DATA_DIR=$(mktemp -d) uv run python -m lararium.gateway.cli < /dev/null
+Lararium 已启动。输入 /help 看命令,/quit 退出。
+
+你 > 退出。
+exit=0
+```
+数据文件正确创建:memory/ledger.md、memory/memory.sqlite、steward.sqlite。
+
+与计划的偏离:
+- **ASYNC250:`input()` 在 async main() 里阻塞调用**,ruff 拦下。改为 `await asyncio.to_thread(input, "\n你 > ")`——把阻塞式输入移出事件循环(也为 M3 的定时任务留出 loop)。
+- **I001:计划 commit 命令漏了 `ports.py`**,已在 commit 里补上(loop.py import 它,不提交仓库不完整)。
+- 其余照抄即过:recover_stale() 在 main() 启动时调用 ✓、`assemble(..., timezone=self.settings.timezone)` ✓、loop.py 全程走 `LedgerPort`/`GatePort` Protocol 不碰 bundles ✓。
+
+门禁四关全绿(101 passed, 0 skipped;mypy 20 files;import-linter **3 kept, 0 broken**——Steward 首次需要 Memory 能力,契约验证守住)。
 
 ---
 
