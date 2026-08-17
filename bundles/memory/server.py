@@ -11,7 +11,8 @@ from bundles.memory.ledger import Ledger, memory_schema
 def build_memory_components(data_dir: Path) -> tuple[Ledger, Gate]:
     root = Path(data_dir) / "memory"
     root.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(root / "memory.sqlite", isolation_level=None)
+    # check_same_thread=False 的理由同 lararium.db.connect():工具函数跑在线程池里
+    conn = sqlite3.connect(root / "memory.sqlite", isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")  # M2 拆容器后会有多个连接
     conn.executescript(memory_schema())

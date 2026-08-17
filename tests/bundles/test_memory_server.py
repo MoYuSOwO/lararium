@@ -45,6 +45,27 @@ def test_approval_is_not_reachable_from_the_model(components):
         assert forbidden not in exposed
 
 
+async def test_mcp_surface_matches_tool_functions(tmp_path):
+    """模型真正看到的是 MCP 协议暴露的工具表。它必须和函数列表一致,
+    尤其不能因为某次改动把审批类工具漏回去。"""
+    from bundles.memory.server import create_server
+
+    tools = await create_server(tmp_path).list_tools()
+    assert sorted(t.name for t in tools) == ["list_pending", "propose_fact"]
+
+
+async def test_tools_work_when_called_from_a_worker_thread(components):
+    """FastMCP 与 Pydantic AI 都把同步工具丢进线程池执行。
+    连接若带默认的 check_same_thread=True,这里会抛 ProgrammingError——
+    而且只在真跑起来时才炸,单元测试里同线程调用发现不了。"""
+    import asyncio
+
+    _, gate = components
+    propose_fact = memory_tool_functions(gate)[0]
+    result = await asyncio.to_thread(propose_fact, "add", "对芒果过敏", "user_stated", "长期偏好")
+    assert "已记下" in result
+
+
 def test_propose_fact_tool_writes_through_gate(components):
     _ledger, gate = components
     propose_fact = memory_tool_functions(gate)[0]
