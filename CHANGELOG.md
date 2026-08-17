@@ -33,6 +33,8 @@
 - **Task 10** 模型客户端协议与缓存指标落地:自有的 `ModelClient` 协议 + `ModelReply`,Pydantic AI 实现关在隔离盒 `PydanticAIClient` 里(库升级只改一个文件);`extract_cache_hit_tokens` 按服务商探测缓存命中 token(DeepSeek `details` / pydantic-ai `cache_read_tokens`),`format_cache_log` 每轮打印命中率,缓存可观测性落地
 - **Task 11** 一轮编排与 CLI 落地:`Steward.process_next` 认领→记事件→组装→跑模型→记工具事件→记回复→完成,整个循环可从起居注重建;Steward 只经 `ports.py` 的 `LedgerPort`/`GatePort` 接触 Memory(契约首次实战守住);CLI 带 `/approve` `/settle` `/history` `/rollback` `/replay` 等代码路径命令,审批不过模型;打错的 `/` 命令提示「未知命令」不再误发模型,一次 API 错误(限流/401)不再打死 CLI——随时可用的底线
 - **Task 12** M1 端到端验收:四条 DESIGN §12 标准自动化测试(事实走通门控并在后续生效 / 任一轮逐字重放 / 前缀跨轮字节稳定 / 不可信内容进不了账本);真实 API 冒烟六项全过(OpenCode Go + mimo-v2.5),第二轮起 `[cache]` 命中 53.8%;缓存日志标注请求数(用量是整轮累加的,看到「N 请求」就不会把工具往返稀释的百分比误读成前缀不稳)——M1 里程碑完成
+- **补1** M1 审计 P0-1:第二轮起模型前缀(人格/目录/账本)整段丢失。根因是 `message_history` 非空时 pydantic-ai 不再注入 `Agent(system_prompt=)`。改为把前缀作为 `SystemPromptPart` 放进历史首条 `ModelRequest`,首轮同路径;让「事实在后续对话生效」这条验收标准重新成立
+- **补1b** 补1 的报文测试往下挪到 HTTP 层:`FunctionModel` 只看到库内部表示、OpenAI 适配器不在链路上,对发出的字节无知。改用 `httpx.MockTransport` 断言真正发出去的 `body["messages"]`,补上工具往返测试(一轮两次请求);夹具抽 `conftest.py`,`httpx` 显式声明进 dev 依赖
 
 ---
 
