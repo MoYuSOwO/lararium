@@ -17,6 +17,21 @@ CREATE TABLE IF NOT EXISTS ledger_history (
     source       TEXT NOT NULL,
     proposal_ids TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS proposals (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    section     TEXT,
+    content     TEXT NOT NULL,
+    old_text    TEXT,
+    provenance  TEXT NOT NULL,
+    origin      TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    note        TEXT,
+    created_at  TEXT NOT NULL,
+    resolved_at TEXT,
+    settled_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_proposals_state ON proposals(state, settled_at);
 """
 
 
