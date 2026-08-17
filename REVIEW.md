@@ -43,7 +43,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
-| 4 | 账本文件与快照表 | 待验收 | | | |
+| 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化补做(计划缺陷) | ☐ | 2026-08-17 |
 | 5 | 门控状态机 | 未开始 | | | |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
@@ -407,6 +407,48 @@ tests/bundles/test_ledger.py::test_diff_shows_changed_lines PASSED       [100%]
   (bundles 包已存在,缺的只是 ledger 模块)。这是 Step 3 已就位的副作用,不影响 TDD 验证。
 
 **验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(11 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(30 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_ledger.py` 7 passed。
+- 规范核对(CONVENTIONS.md):`Snapshot` 是 frozen dataclass(F1);`_hash`/`_blank_ledger`
+  用下划线标出内部性(S3);`get()` 的 KeyError 带上快照 id(E3);无模块级可变状态(F5)。
+  **一处违反,见下(F4/F6)。**
+- 契约核对:`Ledger` 八个方法、`Snapshot` 五个字段、`LEDGER_SECTIONS`、`memory_schema()`
+  均与计划一致。`rollback` 记为一次新变更(source="rollback"),历史只增不改,正确。
+- 不变量核对:**账本单写路径——这次不通过,见下**。前缀/可见即入账两条本任务不涉及。
+- 抑制与分档:一处 `assert cur.lastrowid is not None` 带理由,与 Task 3 同类,可接受;
+  `pyproject.toml` 未动。
+
+**五条偏离全部成立**,`lastrowid` 与 Task 3 同因,`Path` 未用 import 被 ruff F401 抓出来
+说明门禁在正常工作。省略 Step 3 的判断也对——那两个 `__init__.py` 在 M0 就建好了。
+
+**一处必须补做的缺陷(我的设计错,不是你的实现错)**:
+
+这正是 REVIEW 协议里写明「架构测试挡不住、必须人工看」的那一类。`ledger.py` 里有
+**两处** `write_text`:`write()` 一处,`read()` 里还有一处。后者在文件不存在时
+悄悄建一份空账本——名字是查询,行为在写文件(**违反 F4 命令查询分离、F6 副作用要写进名字**)。
+
+比规范违反更严重的是它的失败模式。组装器每轮都调 `read()`,实测:
+
+```
+文件丢失后 read(): '## 身份\n\n## 关系\n\n## 长期偏好\n\n## 正在进行\n'
+→ 事实还在吗? ❌ 静默消失了,无报错无日志
+→ 历史快照还在吗? 在,1 条(可 rollback 恢复)
+```
+
+账本文件因任何原因丢失(误删、M2 的卷没挂上、备份恢复出错),助手就**静默失忆**:
+不报错、不打日志,用户只会觉得"它怎么把我说过的全忘了",而且根本查不出原因——
+数据其实还在 SQLite 里躺着,但没人会知道要去 rollback。
+
+PLAN.md Task 4 已补 **Step 8–11**:`read()` 改纯读、缺文件抛 `FileNotFoundError` 并
+在消息里给出恢复路径;新建职责移交 `ensure_initialized()`,只在启动时调用。
+Task 5 的 Gate fixture 与 Task 6 的 `build_memory_components` 已同步改好,做到时照新版写。
+
+改完之后**全代码树只剩 `Ledger.write()` 里一行 `write_text`**——「账本单写路径」
+到这时才真正在代码层面成立,而不只是一句口号。
+
+**结论:通过**(补完 `read()` 纯化即可开始 Task 5,不必等二次验收)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 (待验收)
 

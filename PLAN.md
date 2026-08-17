@@ -951,7 +951,8 @@ git commit -m "feat: 起居注(append-only + trigram 中文检索 + 重放)"
 **Interfaces:**
 - Produces:
   - `LEDGER_SECTIONS = ("身份", "关系", "长期偏好", "正在进行")`
-  - `Ledger(path: Path, conn: sqlite3.Connection)`:`.read() -> str`、`.snapshot(content, source, proposal_ids) -> int`、`.write(content, source, proposal_ids) -> int`、`.sync_manual_edit() -> bool`、`.history(limit=20) -> list[Snapshot]`、`.get(snapshot_id) -> Snapshot`、`.rollback(snapshot_id) -> None`、`.diff(id_a, id_b) -> str`;属性 `.path`
+  - `Ledger(path: Path, conn: sqlite3.Connection)`:`.ensure_initialized() -> bool`、`.read() -> str`(纯读,文件缺失即抛 `FileNotFoundError`)、`.snapshot(content, source, proposal_ids) -> int`、`.write(content, source, proposal_ids) -> int`、`.sync_manual_edit() -> bool`、`.history(limit=20) -> list[Snapshot]`、`.get(snapshot_id) -> Snapshot`、`.rollback(snapshot_id) -> None`、`.diff(id_a, id_b) -> str`;属性 `.path`
+  - **全系统只有 `Ledger.write()` 里那一行 `write_text` 会写文件**,`ensure_initialized` 也走它。这是「账本单写路径」在代码层的形态。
   - `Snapshot`(`id: int`, `ts: str`, `content: str`, `source: str`, `proposal_ids: list[str]`)
   - `memory_schema()` 返回建表 SQL(供 server 初始化用)
 
@@ -974,10 +975,30 @@ def ledger(tmp_path):
     return Ledger(tmp_path / "ledger.md", conn)
 
 
-def test_read_creates_file_with_sections(ledger):
+def test_ensure_initialized_creates_file_with_sections(ledger):
+    assert ledger.ensure_initialized() is True
     content = ledger.read()
     for section in LEDGER_SECTIONS:
         assert f"## {section}" in content
+    assert ledger.history()[0].source == "init"
+
+
+def test_ensure_initialized_is_noop_when_file_exists(ledger):
+    ledger.ensure_initialized()
+    assert ledger.ensure_initialized() is False
+    assert len(ledger.history()) == 1
+
+
+def test_read_raises_loudly_when_file_is_missing(ledger):
+    """账本丢了必须炸出来。悄悄返回空账本 = 助手静默失忆,没人会发现。"""
+    ledger.ensure_initialized()
+    ledger.write("## 身份\n- 对芒果过敏\n", source="approval_batch", proposal_ids=["p1"])
+    ledger.path.unlink()
+
+    with pytest.raises(FileNotFoundError, match="rollback"):
+        ledger.read()
+    # 历史仍在,可恢复
+    assert "对芒果过敏" in ledger.history()[0].content
 
 
 def test_write_persists_and_snapshots(ledger):
@@ -1093,10 +1114,21 @@ class Ledger:
         self._conn = conn
 
     def read(self) -> str:
+        """纯读。文件不存在是异常状态,必须响亮地报错——组装器每轮都调它,
+        悄悄返回一份空账本 = 助手静默失忆,而用户只会觉得"它怎么全忘了"。"""
         if not self.path.exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(_blank_ledger(), encoding="utf-8")
+            raise FileNotFoundError(
+                f"账本文件不存在:{self.path}。正常启动时应已由 ensure_initialized() 建好。"
+                f"若是误删,历史快照仍在库里,可用 history() 找到最近一条再 rollback() 恢复。"
+            )
         return self.path.read_text(encoding="utf-8")
+
+    def ensure_initialized(self) -> bool:
+        """账本不存在就建一份空的并落 init 快照。只在启动时调用,返回是否新建了。"""
+        if self.path.exists():
+            return False
+        self.write(_blank_ledger(), source="init", proposal_ids=[])
+        return True
 
     def snapshot(self, content: str, source: str, proposal_ids: list[str]) -> int:
         cur = self._conn.execute(
@@ -1165,6 +1197,45 @@ git add bundles pyproject.toml tests/bundles/test_ledger.py
 git commit -m "feat: 账本文件与快照表(手编检测、回滚、diff)"
 ```
 
+### Task 4 补做:让 `read()` 变纯(验收时补入)
+
+**为什么必须改**:原设计里 `read()` 在文件不存在时会悄悄建一份空账本。这有两个问题——
+
+1. **违反 F4/F6**:名字是查询,行为却在写文件,而且副作用没写进名字。
+2. **更要命的是失败模式**:组装器每轮都调 `read()`。账本文件一旦丢失(误删、卷没挂上、
+   备份恢复出错),它返回一份空账本,**不报错、不打日志**,助手就此静默失忆,
+   用户只会觉得"它怎么把我说过的全忘了",而且查不出原因。实测已复现。
+
+改成:`read()` 纯读、缺文件就响亮报错并给出恢复路径;新建的职责交给 `ensure_initialized()`,
+只在启动时调用一次。改完之后**全代码树只剩 `Ledger.write()` 里一行 `write_text`**,
+「账本单写路径」在代码层面才真正成立。
+
+- [ ] **Step 8: 按上方 Step 6 的新版实现改 `read()` 并新增 `ensure_initialized()`**
+
+- [ ] **Step 9: 替换测试**
+
+删掉 `test_read_creates_file_with_sections`,换成上方 Step 4 里新增的三个测试
+(`test_ensure_initialized_creates_file_with_sections`、
+`test_ensure_initialized_is_noop_when_file_exists`、
+`test_read_raises_loudly_when_file_is_missing`)。
+
+- [ ] **Step 10: 运行测试,确认通过**
+
+```bash
+uv run pytest tests/bundles/test_ledger.py -v
+```
+预期:9 passed
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add bundles/memory/ledger.py tests/bundles/test_ledger.py
+git commit -m "fix: 账本 read() 改为纯读,缺文件即报错而非静默返回空账本"
+```
+
+> Task 5 的 Gate fixture 与 Task 6 的 `build_memory_components` 已同步改为调用
+> `ensure_initialized()`,做到那两个任务时照新版写即可。
+
 ---
 
 ## Task 5:门控状态机
@@ -1207,7 +1278,7 @@ def gate(tmp_path):
     ledger = Ledger(tmp_path / "ledger.md", conn)
     # 与 build_memory_components 保持一致:先建文件并存下 init 快照。
     # 少了这两步,首次 settle 会额外产生一个 init 快照,批量结算的计数就对不上。
-    ledger.read()
+    ledger.ensure_initialized()
     ledger.sync_manual_edit()
     return Gate(ledger, conn)
 
@@ -1711,7 +1782,7 @@ def build_memory_components(data_dir: Path) -> tuple[Ledger, Gate]:
     conn.execute("PRAGMA journal_mode=WAL")   # M2 拆容器后会有多个连接
     conn.executescript(memory_schema())
     ledger = Ledger(root / "ledger.md", conn)
-    ledger.read()          # 确保文件存在
+    ledger.ensure_initialized()   # 唯一允许新建账本文件的地方:启动时
     ledger.sync_manual_edit()
     return ledger, Gate(ledger, conn)
 
