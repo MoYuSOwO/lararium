@@ -47,7 +47,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
-| 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☐ | 2026-08-17 |
+| 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
 | 9 | 上下文组装器 | 未开始 | | | |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
@@ -900,7 +900,28 @@ PLAN.md Task 8 已补 **Step 6–9**:加 `MAX_SEARCH_HITS = 20` 常量、在 `se
 它才不会反复试探**。外加测试 `test_search_history_caps_the_result_count`。
 
 **结论:通过**(补完封顶即可开始 Task 9)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+**补完记录**(程序员填,commit 5fca310)
+
+按 Step 6–9 补检索结果封顶:
+
+- `tools.py` 模块级加 `MAX_SEARCH_HITS = 20` / `MAX_HIT_CHARS = 200`
+- `search_history` 开头钳制:`limit = MAX_SEARCH_HITS if limit < 0 else max(1, min(limit, MAX_SEARCH_HITS))`
+  (负数在 SQLite 里表示"不限制",要钳制到上限而非下限)
+- docstring 补「最多返回 20 条;要更精确就换更具体的关键词,不是加大 limit」
+- 测试 `test_search_history_caps_the_result_count`:40 条记录,验证 `limit=10000`/`limit=-1` 都返回 20 条,`limit=0` 返回 1 条
+
+测试输出(Step 8 确认通过):
+```
+$ uv run pytest tests/steward/test_tools.py -v
+...
+tests/steward/test_tools.py::test_search_history_caps_the_result_count PASSED [ 87%]
+tests/steward/test_tools.py::test_search_history_works_from_a_worker_thread PASSED [100%]
+============================== 8 passed in 0.04s ===============================
+```
+
+门禁四关全绿(74 passed, 1 skipped)。CHANGELOG Task 8 条目已追加。偏离:计划写的钳制公式 `max(1, min(limit, MAX_SEARCH_HITS))` 对 `limit=-1` 得 1 而非 20——SQLite 把负数当"不限制",测试期望钳制到上限 20。改为 `MAX_SEARCH_HITS if limit < 0 else max(1, min(limit, MAX_SEARCH_HITS))`,三组断言全过。
 
 ---
 
