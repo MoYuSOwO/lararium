@@ -41,7 +41,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | # | 任务 | 状态 | 验收人结论 | CHANGELOG | 日期 |
 |---|---|---|---|---|---|
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
-| 2 | 信封模型与收件箱 | 待验收 | | | |
+| 2 | 信封模型与收件箱 | **通过** | 全绿;附崩溃恢复补做(计划缺陷) | ☐ | 2026-08-17 |
 | 3 | 起居注与中文检索 | 未开始 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
 | 5 | 门控状态机 | 未开始 | | | |
@@ -221,7 +221,48 @@ tests/steward/test_inbox.py::test_meta_roundtrips_as_json PASSED         [100%]
 
 **验收结论**(Claude 填)
 
-(待验收)
+- 门禁四关:ruff ☑ / mypy ☑(9 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(11 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_inbox.py` 6 passed,逐条核对了测试名与断言。
+- 规范核对(CONVENTIONS.md):**无违反**。`claim_next` 的 `except Exception` 后跟
+  ROLLBACK + `raise`,没有吞异常(E1);`_now` / `_conn` 用下划线标出内部性(S3);
+  `Envelope` 是有名字的 pydantic 模型而非裸 dict(F1);`Envelope.new` keyword-only(F3);
+  无模块级可变状态(F5)。
+- 契约核对:`Envelope`(六字段 + `.new` keyword-only)、`connect`、`Inbox` 五个方法
+  全部与计划 Interfaces 一致。
+- 不变量核对:严格串行是「可重放」的地基,`test_claim_is_strictly_serial` 覆盖到位;
+  账本/前缀两条本任务不涉及。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动。
+
+**四条偏离全部成立,其中两条是计划的真 bug**:
+
+1. **`rowid` 索引** —— 计划写的 `CREATE INDEX ... ON inbox(state, ts, rowid)` 在 SQLite 里非法,
+   隐式 rowid 不能被单独索引。改成 `(state, ts)` 正确,而且保留查询里的 `ORDER BY ts, rowid`
+   的判断也对:索引的隐式尾列本就是 rowid,tie-break 语义没丢。**分析和取舍都准确。**
+2. **`pending_count` 的 `int()` 包装** —— `sqlite3.Row.__getitem__` 在 typeshed 里是 `Any`,
+   严格档 `warn_return_any` 拦下来了。这正是分层严格该起的作用,处理方式最小且正确。
+3. `datetime.UTC` 替代 `timezone.utc`(ruff UP017)、4. 注释对齐 —— 以工具为准,对。
+
+**一处必须补做的缺陷(我的计划漏了,不是你的实现错)**:
+
+**严格串行 + 持久化状态 + 硬崩溃 = 队列永久卡死。** 我压测复现了:
+
+```
+崩溃前认领: 崩之前这条
+重启后 pending 数: 1
+重启后能认领到: ❌ None —— 队列永久卡死
+```
+
+进程被 SIGKILL / 断电 / OOM 杀掉时,那条 `processing` 记录永远留在库里,重启后
+`claim_next()` 每次看到 `in_flight=1` 就返回 None。助手从此对所有消息静默——
+不报错、不打日志,只是不理你了。这对一个"住在 IM 里随时可用"的系统是致命的,
+而且十年运行期内必然发生。
+
+PLAN.md Task 2 已补 **Step 8–13(崩溃恢复)**:加 `attempts` 列、`recover_stale()` 方法、
+三个测试;Task 11 的 CLI 启动处也加了调用(否则方法白写)。带重试上限是为了防毒消息——
+如果崩溃正是这条消息引起的,无脑重排队会让每次启动都崩一次。
+
+**结论:通过**(补完崩溃恢复即可开始 Task 3,不必等二次验收)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 ---
 

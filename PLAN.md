@@ -332,7 +332,7 @@ git commit -m "chore: 配置加载与人格文件"
 - Produces:
   - `Envelope`(pydantic model:`id: str`, `source: Literal["user","cron","module_event"]`, `channel: str`, `content: str`, `meta: dict`, `ts: datetime`);`Envelope.new(source, channel, content, meta=None) -> Envelope`
   - `db.connect(path: Path) -> sqlite3.Connection`(`isolation_level=None`,`row_factory=sqlite3.Row`,已开 WAL 与外键)
-  - `Inbox(conn)`:`.put(env) -> None`、`.claim_next() -> Envelope | None`、`.complete(env_id) -> None`、`.fail(env_id, error: str) -> None`、`.pending_count() -> int`
+  - `Inbox(conn)`:`.put(env) -> None`、`.claim_next() -> Envelope | None`、`.complete(env_id) -> None`、`.fail(env_id, error: str) -> None`、`.pending_count() -> int`、`.recover_stale(max_attempts: int = 2) -> tuple[int, int]`
 
 - [ ] **Step 1: 写失败的测试 `tests/steward/test_inbox.py`**
 
@@ -567,6 +567,128 @@ uv run pytest tests/steward/test_inbox.py -v
 git add src/lararium/envelope.py src/lararium/db.py src/lararium/steward/inbox.py tests/steward/test_inbox.py
 git commit -m "feat: 信封模型与严格串行收件箱"
 ```
+
+### Task 2 补做:崩溃恢复(验收时补入)
+
+**为什么必须有**:严格串行 + 持久化状态 + 硬崩溃 = **队列永久卡死**。
+进程被 SIGKILL / 断电 / OOM 杀掉时,那条 `processing` 记录永远留在库里,
+重启后 `claim_next()` 每次都看到 `in_flight=1` 而返回 None——助手从此对所有消息静默,
+不报错、不打日志,只是不理你了。实测已复现。
+
+同时要防**毒消息**:如果崩溃正是这条消息引起的,无脑重排队会让每次启动都崩一次。
+所以带重试上限,超了就放弃并留痕。
+
+- [ ] **Step 8: 给 `db.py` 的 SCHEMA 加尝试次数列**
+
+在 `inbox` 表定义里 `completed_at TEXT` 之后加一行:
+
+```sql
+    attempts     INTEGER NOT NULL DEFAULT 0
+```
+
+M1 期间不需要迁移脚本:本地已有的 `data/steward.sqlite` 删掉重建即可。
+
+- [ ] **Step 9: 写失败的测试**
+
+追加到 `tests/steward/test_inbox.py`:
+
+```python
+def test_recover_stale_requeues_interrupted_envelope(tmp_path):
+    """进程崩在处理途中,重启后队列不能永久卡死。"""
+    db = tmp_path / "steward.sqlite"
+    before_crash = Inbox(connect(db))
+    env = Envelope.new(source="user", channel="cli", content="崩之前这条")
+    before_crash.put(env)
+    before_crash.claim_next()  # 认领后"崩溃",既没 complete 也没 fail
+
+    restarted = Inbox(connect(db))
+    assert restarted.claim_next() is None  # 遗留的 processing 把队列堵死了
+    assert restarted.recover_stale() == (1, 0)
+    claimed = restarted.claim_next()
+    assert claimed is not None and claimed.id == env.id
+
+
+def test_recover_stale_abandons_poison_message(inbox):
+    """反复崩在同一条消息上就别再重试了,否则每次启动都崩一次。"""
+    env = Envelope.new(source="user", channel="cli", content="毒消息")
+    inbox.put(env)
+
+    inbox.claim_next()
+    assert inbox.recover_stale(max_attempts=2) == (1, 0)  # 第一次崩:重排队
+    inbox.claim_next()
+    assert inbox.recover_stale(max_attempts=2) == (0, 1)  # 第二次崩:放弃
+    assert inbox.claim_next() is None
+    assert inbox.pending_count() == 0
+
+
+def test_recover_stale_is_noop_on_clean_start(inbox):
+    inbox.put(Envelope.new(source="user", channel="cli", content="正常的"))
+    assert inbox.recover_stale() == (0, 0)
+    assert inbox.claim_next() is not None
+```
+
+- [ ] **Step 10: 运行测试,确认失败**
+
+```bash
+uv run pytest tests/steward/test_inbox.py -v
+```
+预期:三个新测试 FAIL(`Inbox` 没有 `recover_stale`)
+
+- [ ] **Step 11: 实现**
+
+`claim_next()` 的 UPDATE 语句加上计数(其余不动):
+
+```python
+            self._conn.execute(
+                "UPDATE inbox SET state='processing', claimed_at=?, attempts=attempts+1 "
+                "WHERE id=?",
+                (_now(), row["id"]),
+            )
+```
+
+新增方法:
+
+```python
+    def recover_stale(self, max_attempts: int = 2) -> tuple[int, int]:
+        """把上次运行遗留的 processing 记录清理掉,返回 (重新排队数, 放弃数)。
+
+        只应在启动时调用一次。同时跑两个 Steward 会互相抢活——本系统按设计
+        只有一个,这也是"严格串行"成立的前提。
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            abandoned = self._conn.execute(
+                "UPDATE inbox SET state='failed', error=?, completed_at=? "
+                "WHERE state='processing' AND attempts >= ?",
+                ("重启后仍未处理完,已达重试上限,可能是毒消息", _now(), max_attempts),
+            ).rowcount
+            requeued = self._conn.execute(
+                "UPDATE inbox SET state='pending', claimed_at=NULL WHERE state='processing'"
+            ).rowcount
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return requeued, abandoned
+```
+
+注意顺序:先标记放弃的,再把剩下的重排队——反过来会把该放弃的也重排队。
+
+- [ ] **Step 12: 运行测试,确认通过**
+
+```bash
+uv run pytest tests/steward/test_inbox.py -v
+```
+预期:9 passed
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add src/lararium/db.py src/lararium/steward/inbox.py tests/steward/test_inbox.py
+git commit -m "fix: 收件箱崩溃恢复,避免遗留 processing 记录永久卡死队列"
+```
+
+> Task 11 的 CLI 启动时要调用它,见该任务 Step 6。
 
 ---
 
@@ -2789,6 +2911,12 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     settings = Settings.load()
     steward = build_steward(settings)
+
+    # 上次若崩在处理途中,遗留的 processing 记录会把串行队列永久堵死(见 Task 2 补做)
+    requeued, abandoned = steward.inbox.recover_stale()
+    if requeued or abandoned:
+        print(f"上次有未处理完的消息:{requeued} 条已重新排队,{abandoned} 条已放弃。")
+
     print("Lararium 已启动。输入 /help 看命令,/quit 退出。")
 
     while True:
