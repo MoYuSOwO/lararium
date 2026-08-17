@@ -2447,7 +2447,7 @@ git commit -m "fix: 检索结果封顶,防止一次工具调用撑爆上下文"
 - Produces:
   - `Turn`(`user: str | None`, `assistant: str | None`)
   - `AssembledContext`(`system_prompt: str`, `messages: list[dict[str, str]]`)
-  - `assemble(*, persona: str, directory: str, ledger: str, l1: str, l0: list[Turn], envelope: Envelope) -> AssembledContext`
+  - `assemble(*, persona: str, directory: str, ledger: str, l1: str, l0: list[Turn], envelope: Envelope, timezone: str) -> AssembledContext`
 
 - [ ] **Step 1: 写失败的测试 `tests/steward/test_assembler.py`**
 
@@ -2464,9 +2464,10 @@ DIRECTORY = "- memory:核心账本与门控写入"
 LEDGER = "## 身份\n- 对芒果过敏\n"
 
 
-def build(envelope: Envelope, *, ledger: str = LEDGER, l1: str = "", l0=None):
+def build(envelope: Envelope, *, ledger: str = LEDGER, l1: str = "", l0=None,
+          timezone: str = "Asia/Shanghai"):
     return assemble(persona=PERSONA, directory=DIRECTORY, ledger=ledger,
-                    l1=l1, l0=l0 or [], envelope=envelope)
+                    l1=l1, l0=l0 or [], envelope=envelope, timezone=timezone)
 
 
 def test_system_prompt_contains_persona_directory_and_ledger():
@@ -2489,6 +2490,19 @@ def test_prefix_contains_no_timestamp():
     ctx = build(env)
     assert str(env.ts.year) not in ctx.system_prompt
     assert env.ts.isoformat() not in ctx.system_prompt
+
+
+def test_envelope_timestamp_follows_configured_timezone_not_the_os():
+    """VPS 默认时区基本都是 UTC。用裸 astimezone() 的话,信封会显示 UTC 时间,
+    而 current_time 工具显示配置的 Asia/Shanghai——同一轮对话里差 8 小时,
+    模型对"今天/昨天/晚上"的判断全错。用两个时区对比,测试本身不依赖开发机的 TZ。"""
+    env = Envelope.new(source="user", channel="cli", content="现在几点")
+    shanghai = build(env, timezone="Asia/Shanghai").messages[-1]["content"]
+    utc = build(env, timezone="UTC").messages[-1]["content"]
+
+    assert "+08:00" in shanghai
+    assert "+00:00" in utc
+    assert shanghai != utc
 
 
 def test_envelope_message_carries_the_timestamp():
@@ -2569,6 +2583,7 @@ uv run pytest tests/steward/test_assembler.py -v
 
 ```python
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 from lararium.envelope import Envelope
 
@@ -2594,8 +2609,11 @@ class AssembledContext:
     messages: list[dict[str, str]]
 
 
-def _render_envelope(envelope: Envelope) -> str:
-    stamp = envelope.ts.astimezone().isoformat(timespec="seconds")
+def _render_envelope(envelope: Envelope, tz: ZoneInfo) -> str:
+    # 必须用配置的时区,不能用裸 astimezone()——后者取的是操作系统本地时区。
+    # VPS 默认基本都是 UTC,那样信封会显示 UTC 时间而 current_time 工具显示
+    # Asia/Shanghai,同一轮对话里差 8 小时,模型对"今天/昨天/晚上"的判断就全错了。
+    stamp = envelope.ts.astimezone(tz).isoformat(timespec="seconds")
     if envelope.meta.get("untrusted"):
         return (
             f"[{stamp}] 来自 {envelope.channel} 的外部数据。"
@@ -2609,7 +2627,7 @@ def _render_envelope(envelope: Envelope) -> str:
 
 def assemble(
     *, persona: str, directory: str, ledger: str, l1: str,
-    l0: list[Turn], envelope: Envelope,
+    l0: list[Turn], envelope: Envelope, timezone: str,
 ) -> AssembledContext:
     """纯函数。输入全部来自持久层 —— 这是可重放的前提(DESIGN §6.6)。
 
@@ -2629,7 +2647,7 @@ def assemble(
             continue
         messages.append({"role": "user", "content": turn.user})
         messages.append({"role": "assistant", "content": turn.assistant})
-    messages.append({"role": "user", "content": _render_envelope(envelope)})
+    messages.append({"role": "user", "content": _render_envelope(envelope, ZoneInfo(timezone))})
 
     return AssembledContext(system_prompt=system_prompt, messages=messages)
 ```
@@ -2639,7 +2657,7 @@ def assemble(
 ```bash
 uv run pytest tests/steward/test_assembler.py -v
 ```
-预期:11 passed
+预期:12 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2647,6 +2665,51 @@ uv run pytest tests/steward/test_assembler.py -v
 git add src/lararium/steward/assembler.py tests/steward/test_assembler.py
 git commit -m "feat: 上下文组装器(冻结前缀 + 追加流水,含字节稳定性测试)"
 ```
+
+### Task 9 补做:信封时间戳用配置时区(验收时补入)
+
+`_render_envelope` 里的 `envelope.ts.astimezone()` **不带参数**,取的是操作系统本地时区,
+不是 `LARARIUM_TIMEZONE`。开发机恰好是 Asia/Shanghai,所以测试全绿;但 VPS 默认时区
+基本都是 UTC,一上线就分叉。实测:
+
+```
+服务器 TZ=UTC(VPS 默认),配置仍是 Asia/Shanghai:
+  信封消息里的时间 : [2026-08-17T11:57:29+00:00
+  current_time 工具 : 2026-08-17T19:57:29+08:00
+```
+
+**同一轮对话里差 8 小时。** 模型看到一条 11:57 的消息、一个说现在 19:57 的工具,
+对"今天/昨天/晚上"的判断就全错了——而这对一个生活助手是灾难性的,记账、提醒、
+日程全都是时间相对的。违反全局约束「时区统一 Asia/Shanghai」。
+
+不影响前缀:时区是配置值,只作用于流水区的信封消息。
+
+- [ ] **Step 6: 按上方新版改 `assemble` 与 `_render_envelope`**
+
+`assemble` 新增 keyword-only 参数 `timezone: str`,`_render_envelope(envelope, tz)`
+用 `astimezone(tz)`;文件顶部 `from zoneinfo import ZoneInfo`。
+
+- [ ] **Step 7: 测试辅助函数与新测试**
+
+`build()` 加 `timezone: str = "Asia/Shanghai"` 参数并透传;
+新增 `test_envelope_timestamp_follows_configured_timezone_not_the_os`(代码见上方 Step 1)。
+该测试用两个时区对比,**不依赖开发机的 TZ**——否则它在你机器上永远是绿的。
+
+- [ ] **Step 8: 运行测试,确认通过**
+
+```bash
+uv run pytest tests/steward/test_assembler.py -v
+```
+预期:12 passed
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/lararium/steward/assembler.py tests/steward/test_assembler.py
+git commit -m "fix: 信封时间戳用配置时区,避免 UTC 服务器上与 current_time 差 8 小时"
+```
+
+> Task 11 的 `loop.py` 调用 `assemble()` 处已同步加上 `timezone=self.settings.timezone`。
 
 ---
 
@@ -3147,6 +3210,7 @@ class Steward:
                 l1="",   # M3 压缩接管后填充
                 l0=self._recent_turns(),
                 envelope=env,
+                timezone=self.settings.timezone,
             )
             self.journal.append(env.id, "prompt", {
                 "system_prompt": ctx.system_prompt, "messages": ctx.messages,

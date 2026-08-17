@@ -48,7 +48,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
-| 9 | 上下文组装器 | **待验收** | | | 2026-08-17 |
+| 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☐ | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
 | 12 | 端到端验收 | 未开始 | | | |
@@ -965,6 +965,65 @@ tests/steward/test_assembler.py::test_untrusted_module_event_is_wrapped_as_data 
 - **架构测试的组装器时钟检查自动激活**:此前 skipped 的那条「组装器读时钟」检查
   在 assembler.py 存在后开始运行并直接通过,全量从「74 passed, 1 skipped」变为
   「86 passed, 0 skipped」,恰好达到 M1 目标。
+
+**验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(16 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(**86 passed, 0 skipped**)
+- 重跑结果:独立重跑全绿。`test_assembler.py` 11 passed;`test_architecture.py` 4 passed,
+  其中 `test_assembler_never_reads_the_clock` **首次真正启用并通过** ✓
+- 规范核对(CONVENTIONS.md):**无违反**。`Turn` / `AssembledContext` 都是 frozen dataclass(F1);
+  `assemble` 全 keyword-only(F3);纯函数无副作用(F4);`_render_envelope`、`_SYSTEM_TEMPLATE`
+  下划线标出内部性(S3);docstring 说的是"为什么前缀不许含时间"而非"这个函数做什么"(G1)。
+- 契约核对:`assemble` 六参数、`Turn`、`AssembledContext` 与计划一致。
+- 不变量核对:**前缀字节稳定 ☑**(详见下方跨进程验证);账本/可见即入账两条本任务不涉及。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动。
+
+三条偏离全部成立。
+
+**跨进程前缀稳定性:已验证** ✓
+
+单元测试只能证明同进程内一致,但缓存真正要跨**重启**命中。Python 的哈希随机化会让
+set/dict 迭代顺序逐进程变化,一旦前缀路径上有裸 set 就会每次重启换一份前缀,
+而这在测试里永远看不出来。实测五种 `PYTHONHASHSEED`:
+
+```
+seed=0      → 2561d6decafa1b62
+seed=1      → 2561d6decafa1b62
+seed=42     → 2561d6decafa1b62
+seed=12345  → 2561d6decafa1b62
+seed=random → 2561d6decafa1b62
+```
+
+完全一致。`Registry.load` 里那两处 `sorted()` 起了作用。
+
+**一处必须补做的缺陷(我的计划错)**
+
+`_render_envelope` 里的 `envelope.ts.astimezone()` **不带参数**,取的是操作系统本地时区,
+而不是 `LARARIUM_TIMEZONE`。开发机恰好是 Asia/Shanghai,所以测试全绿——但 VPS 默认
+时区基本都是 UTC,一上线就分叉:
+
+```
+服务器 TZ=UTC(VPS 默认),配置仍是 Asia/Shanghai:
+  信封消息里的时间 : [2026-08-17T11:57:29+00:00
+  current_time 工具 : 2026-08-17T19:57:29+08:00
+```
+
+**同一轮对话里差 8 小时。** 模型看到一条 11:57 的消息、一个说现在 19:57 的工具,
+对"今天/昨天/晚上"的判断就全错——而生活助手的一切都是时间相对的:记账归到哪天、
+提醒定在何时、"晚上吃什么"。违反全局约束「时区统一 Asia/Shanghai」。
+
+这个 bug 的讨厌之处在于**在开发机上永远复现不了**,要等 M2 部署到 VPS 才暴露,
+那时候现象是"它对日期的判断有点怪",极难联想到时区。
+
+PLAN.md Task 9 已补 **Step 6–9**:`assemble` 增加 keyword-only 的 `timezone` 参数,
+`_render_envelope(envelope, tz)` 用 `astimezone(tz)`;Task 11 的 `loop.py` 调用点
+已同步传 `timezone=self.settings.timezone`。新测试用**两个时区对比**而不是断言某个固定偏移,
+这样它不依赖开发机的 TZ——否则这条测试在你机器上会永远是绿的,等于没写。
+
+不影响前缀:时区是配置值,只作用于流水区的信封消息。
+
+**结论:通过**(补完时区一致性即可开始 Task 10)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 ---
 
