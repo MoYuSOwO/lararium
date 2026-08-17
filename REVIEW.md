@@ -1756,3 +1756,71 @@ tests/test_acceptance_m1.py::test_acceptance_settled_fact_reaches_the_model_on_t
 - 把 `wire` 夹具与验收①的 MockTransport 重复部分抽到 `tests/conftest.py` 的
   `build_http_spy_client` helper,避免复制两份(CONVENTIONS S 组)。
 - 其余照抄;`httpx` 显式加进 dev 依赖组。
+
+**验收结论**(Claude 填):**通过。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(20 files)/ import-linter ☑(3 kept)/ pytest ☑(**113 passed**,112 → +1,即工具往返那条)
+- 生产代码只多了两行注释(`instructions` 退路),**行为零改动** ——「只改测量位置」这句话对得上 diff。
+- 旧的 `FunctionModel` 那 5 条是被**替换**掉的,不是并存,没留下一份会否决正确实现的死测试。
+
+**关键证据我独立复现了**。把 `model.py` 的前缀注入临时改回
+`Agent(system_prompt=ctx.system_prompt)`(即 P0-1 的旧行为)后重跑:
+
+```
+tests/steward/test_model_wire.py       5 failed, 1 passed
+tests/test_acceptance_m1.py            1 failed, 4 passed
+                                       (失败的正是 ..._reaches_the_model_on_the_next_turn)
+```
+
+新夹具确实咬得住 P0-1,验收①的报文级复核也咬得住。还原后工作树干净。
+
+**一处我的错,你是对的**:我在计划 Step 2 写「这 6 条必须失败」,实际应该是 **5 失败 1 通过**
+——`test_prefix_is_the_first_message_on_the_first_turn` 在旧行为下**本来就该过**,
+因为 P0-1 只影响第二轮起(首轮历史为空,`Agent(system_prompt=)` 正常注入)。
+你报的 5/1 是对的,我的预期数字是错的。**这种时候不要往我的预期上凑**,你没凑,很好。
+
+**三处小问题,不阻塞,请在补2 里顺手带掉**:
+
+1. **`from conftest import build_http_spy_client` 这个导入是脆的。** 它能成立只因为
+   `tests/` 下没有 `__init__.py`、pytest 自动把该目录塞进了 `sys.path`。哪天有人加了
+   `tests/__init__.py`,或者切到 `importmode=importlib`,它就断。改成 conftest 里的
+   **fixture**(返回一个 factory)就不需要 import 了 —— 补2 还要加测试,先把地基摆正。
+2. **响应体 JSON 复制了两份**:`test_model_wire.py` 的 `_text_reply()` 和
+   `test_acceptance_m1.py` 里内联的那 15 行是同一个东西。我在计划里点名要求"重复的部分
+   抽到 conftest,不要复制两份",你抽了 client builder(较小的那半),
+   剩下**较大的那半没抽**。
+3. `build_http_spy_client` 的 `api_key` 参数和 `Settings.load()` 读到的
+   `settings.api_key` 是两个来源,函数看着像"照 settings 配置"其实把 key 覆盖了;
+   返回类型标成 `Any`,函数体里三段 import 交错。都是整洁度问题,顺手即可。
+
+**下一步**:往 CHANGELOG.md 的 **M1** 小节追加补1/补1b 两行(它们让 M1 的一条验收标准
+重新成立,归 M1 名下),然后开**补2**。
+
+## 补2:不可信包裹必须活过一轮(P1-1,commit 66016e7,待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 失败输出**:
+```
+$ uv run pytest tests/steward/test_assembler.py tests/steward/test_journal.py -v
+FAILED tests/steward/test_assembler.py::test_untrusted_turn_keeps_its_wrapper_in_l0
+FAILED tests/steward/test_journal.py::test_recent_turns_carries_provenance_fields
+========================= 2 failed, 21 passed in 0.14s ==========================
+```
+(test_journal 那条:`KeyError: 'source'`——recent_turns 没返回该键;test_assembler 那条因 Turn 缺字段)
+
+**Step 2/3 通过输出**(含新的 assembler/journal/跨轮验收):
+```
+$ uv run pytest tests/steward/test_assembler.py tests/steward/test_journal.py tests/test_acceptance_m1.py tests/steward/test_loop.py -q
+37 passed
+```
+
+**门禁**:115 passed(113 → +2 新增),mypy 20 files,import-linter 3 kept。
+
+**有意副作用确认**:L0 历史轮从此带时间戳(`_render_user_text` 的 `[stamp]` 前缀)。
+时间戳取自起居注、写入时固定,流水区跨轮仍字节稳定;部署后第一轮 L0 格式变一次,
+触发一次性缓存重建,可接受。`test_assembler_never_reads_the_clock` 仍通过
+(`fromisoformat` 不是时钟调用)。
+
+**与计划的偏离**:
+- 无;补齐时顺带验证了补1b 的验收关注点(recent_turns 仍带 content 主字段)。
