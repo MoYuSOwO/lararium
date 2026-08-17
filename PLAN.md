@@ -2056,6 +2056,36 @@ def test_read_skill_rejects_path_traversal(registry):
     """skill 名来自模型输出,必须挡住路径穿越。"""
     with pytest.raises(KeyError):
         registry.read_skill("memory", "../../../etc/passwd")
+
+
+def _write_bundle(root: Path, dirname: str, manifest: str) -> None:
+    (root / dirname / "skills").mkdir(parents=True)
+    (root / dirname / "manifest.yaml").write_text(manifest, encoding="utf-8")
+    (root / dirname / "skills" / "SKILL.md").write_text("# x", encoding="utf-8")
+
+
+def test_broken_manifest_names_the_offending_file(tmp_path):
+    """扔错一个 bundle 要立刻知道错在哪,不能只给一句 KeyError: 'name'。"""
+    _write_bundle(tmp_path, "finance", "description: 缺了 name 字段\ntools: []\n")
+
+    with pytest.raises(ValueError, match="finance/manifest.yaml"):
+        Registry.load(tmp_path)
+
+
+def test_invalid_yaml_names_the_offending_file(tmp_path):
+    _write_bundle(tmp_path, "health", "name: health\n  这行缩进是坏的:\n- x\n")
+
+    with pytest.raises(ValueError, match="health/manifest.yaml"):
+        Registry.load(tmp_path)
+
+
+def test_duplicate_bundle_names_are_rejected(tmp_path):
+    """名字是路由依据。重名时目录行会列出两个,但只有一个调得到——必须拒绝。"""
+    _write_bundle(tmp_path, "a", "name: finance\ndescription: 甲\ntools: []\n")
+    _write_bundle(tmp_path, "b", "name: finance\ndescription: 乙\ntools: []\n")
+
+    with pytest.raises(ValueError, match="重名"):
+        Registry.load(tmp_path)
 ```
 
 - [ ] **Step 2: 运行测试,确认失败**
@@ -2096,21 +2126,34 @@ class Registry:
 
     @classmethod
     def load(cls, bundles_dir: Path) -> "Registry":
-        found: list[BundleInfo] = []
-        for manifest_path in sorted(Path(bundles_dir).glob("*/manifest.yaml")):
-            data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-            found.append(
-                BundleInfo(
-                    name=data["name"],
-                    description=data["description"],
-                    skills=tuple(
-                        SkillInfo(s["name"], s["desc"]) for s in data.get("skills", [])
-                    ),
-                    tools=tuple(data.get("tools", [])),
-                    root=manifest_path.parent,
-                )
+        found = [
+            cls._parse_manifest(p) for p in sorted(Path(bundles_dir).glob("*/manifest.yaml"))
+        ]
+        names = [b.name for b in found]
+        duplicated = sorted({n for n in names if names.count(n) > 1})
+        if duplicated:
+            raise ValueError(
+                f"bundle 重名: {duplicated}。名字是路由依据,重名会让其中一个永远调不到,"
+                f"但目录行里还照样列着——必须唯一。"
             )
         return cls(sorted(found, key=lambda b: b.name))
+
+    @staticmethod
+    def _parse_manifest(path: Path) -> BundleInfo:
+        """解析失败必须说清是哪个文件。「扔个目录进去就能用」是 bundle 系统的卖点,
+        那么「扔错了立刻知道错在哪」就是它的下半句——否则装了五六个 bundle 之后,
+        一句光秃秃的 KeyError: 'name' 只能靠逐个删目录来二分定位。"""
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            return BundleInfo(
+                name=data["name"],
+                description=data["description"],
+                skills=tuple(SkillInfo(s["name"], s["desc"]) for s in data.get("skills", [])),
+                tools=tuple(data.get("tools", [])),
+                root=path.parent,
+            )
+        except (KeyError, TypeError, yaml.YAMLError) as exc:
+            raise ValueError(f"{path} 不是合法的 bundle manifest:{exc}") from exc
 
     def directory_lines(self) -> str:
         """前缀第1层的目录部分。排序确定,内容不含时间——字节稳定。"""
@@ -2144,13 +2187,49 @@ class Registry:
 ```bash
 uv run pytest tests/steward/test_registry.py -v
 ```
-预期:7 passed
+预期:10 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/lararium/steward/registry.py tests/steward/test_registry.py
 git commit -m "feat: 插件注册表与分层路由的 read_skill"
+```
+
+### Task 7 补做:manifest 加载的可诊断性(验收时补入)
+
+「扔一个新 bundle 进 compose,主控零改动」是本项目的硬指标(见「里程碑范围」)。
+那么「扔错了立刻知道错在哪」就是它的下半句。当前有两个静默失败:
+
+1. **坏 manifest 不说是哪个文件**。缺字段只给 `KeyError: 'name'`,yaml 语法错更糟——
+   因为是从字符串解析,PyYAML 只会说 `in "<unicode string>"`。装了五六个 bundle 之后,
+   定位手段只剩逐个删目录二分。违反 E3(异常信息要带上下文)。
+2. **bundle 重名被静默吞掉**。实测:两个 manifest 都写 `name: finance` 时,
+   目录行里老老实实列出两行,但 `get("finance")` 只能拿到后加载的那个——
+   模型会在前缀里看见一个它永远够不着的领域,而这事没有任何报错。
+
+- [ ] **Step 6: 按上方 Step 3 的新版重写 `Registry.load`,新增 `_parse_manifest`**
+
+要点:解析包在 try 里,失败时 `raise ValueError(f"{path} 不是合法的 bundle manifest:{exc}")`;
+加载完检查重名,重名直接拒绝启动(宁可起不来,也不要带着一个够不着的 bundle 跑)。
+
+- [ ] **Step 7: 补三个测试**
+
+`test_broken_manifest_names_the_offending_file`、`test_invalid_yaml_names_the_offending_file`、
+`test_duplicate_bundle_names_are_rejected`(代码见上方 Step 1),外加共用的 `_write_bundle` 辅助函数。
+
+- [ ] **Step 8: 运行测试,确认通过**
+
+```bash
+uv run pytest tests/steward/test_registry.py -v
+```
+预期:10 passed
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/lararium/steward/registry.py tests/steward/test_registry.py
+git commit -m "fix: manifest 解析失败点名文件,bundle 重名直接拒绝"
 ```
 
 ---

@@ -46,7 +46,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
-| 7 | 插件注册表与 read_skill | **待验收** | | | 2026-08-17 |
+| 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☐ | 2026-08-17 |
 | 8 | 内置工具三件 | 未开始 | | | |
 | 9 | 上下文组装器 | 未开始 | | | |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
@@ -747,6 +747,62 @@ tests/steward/test_registry.py::test_read_skill_rejects_path_traversal PASSED [1
 
 与计划的偏离:
 - **ruff format 将 `skills=tuple(...)` 生成器表达式收为一行**:纯格式,无逻辑变化。
+
+**验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(14 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(63 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_registry.py` 7 passed。
+- 规范核对(CONVENTIONS.md):`BundleInfo` / `SkillInfo` 是 frozen dataclass,
+  且用 tuple 而非 list 保证不可变(F1、F5);`get()` 的 KeyError 列出了已注册的 bundle(E3);
+  `directory_lines` 的 docstring 说清了"为什么字节稳定"(G1)。**一类违反见下(E3)。**
+- 契约核对:`Registry.load` / `directory_lines` / `get` / `read_skill`、
+  `BundleInfo` 五字段、`SkillInfo` 两字段均与计划一致。
+- 不变量核对:**前缀字节稳定 ☑** —— `directory_lines()` 排序确定、不含时间,
+  `test_directory_lines_are_deterministic` 守住了。账本/起居注两条本任务不涉及。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动。
+
+唯一偏离(formatter 收行)成立。
+
+**路径穿越防护:扎实,六种花样全挡住** ✓
+
+skill 名来自模型输出,是本任务最危险的输入。白名单(必须在 manifest 声明的 skills 里)
+而非字符串过滤,这个选择是对的——实测:
+
+```
+'../../../etc/passwd'                   → ✓ 白名单拒绝
+'..%2f..%2fetc%2fpasswd'                → ✓ 白名单拒绝
+'/etc/passwd'                           → ✓ 白名单拒绝
+'writing-facts/../../../../etc/passwd'  → ✓ 白名单拒绝
+'writing-facts\x00.md'                  → ✓ 白名单拒绝
+'SKILL'                                 → ✓ 白名单拒绝
+```
+
+**两处必须补做的静默失败(我的计划漏了)**
+
+「扔一个新 bundle 进 compose,主控零改动」是本项目的硬指标。那么「扔错了立刻知道错在哪」
+就是它的下半句,而现在这半句没有:
+
+1. **坏 manifest 不说是哪个文件**(违反 E3)。缺字段只给 `KeyError: 'name'`;
+   yaml 语法错更糟,因为是从字符串解析,PyYAML 只会说 `in "<unicode string>"`。
+   装了五六个 bundle 之后,定位手段只剩逐个删目录二分。
+2. **bundle 重名被静默吞掉**。实测两个 manifest 都写 `name: finance`:
+
+```
+目录行:
+- finance:来自目录 finance
+- finance:来自目录 finance_v2
+get('finance') 拿到的是:finance_v2
+→ 另一个 bundle 被静默吞掉了,目录里却还列着两行
+```
+
+模型会在前缀里看见一个它永远够不着的领域,而这事没有任何报错。
+
+PLAN.md Task 7 已补 **Step 6–9**:抽出 `_parse_manifest`,解析失败点名文件;
+加载后检查重名,重名直接拒绝启动(宁可起不来,也不要带着一个够不着的 bundle 跑);
+外加三个测试。
+
+**结论:通过**(补完 manifest 可诊断性即可开始 Task 8)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 ---
 
