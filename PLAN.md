@@ -473,9 +473,15 @@ CREATE INDEX IF NOT EXISTS idx_inbox_state ON inbox(state, ts, rowid);
 
 
 def connect(path: Path) -> sqlite3.Connection:
-    """isolation_level=None:自己管事务,claim 要用 BEGIN IMMEDIATE。"""
+    """isolation_level=None:自己管事务,claim 要用 BEGIN IMMEDIATE。
+
+    check_same_thread=False:FastMCP 和 Pydantic AI 都把**同步**工具函数丢进线程池执行,
+    而连接是在主线程建的。不关掉这个检查,任何碰数据库的工具调用都会抛
+    ProgrammingError。安全性由架构保证——收件箱严格串行,任一时刻只有一轮在跑,
+    不存在真正的并发访问。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None)
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -1735,6 +1741,29 @@ def test_approval_is_not_reachable_from_the_model(components):
         assert forbidden not in exposed
 
 
+async def test_mcp_surface_matches_tool_functions(tmp_path):
+    """模型真正看到的是 MCP 协议暴露的工具表。它必须和函数列表一致,
+    尤其不能因为某次改动把审批类工具漏回去。"""
+    from bundles.memory.server import create_server
+
+    tools = await create_server(tmp_path).list_tools()
+    assert sorted(t.name for t in tools) == ["list_pending", "propose_fact"]
+
+
+async def test_tools_work_when_called_from_a_worker_thread(components):
+    """FastMCP 与 Pydantic AI 都把同步工具丢进线程池执行。
+    连接若带默认的 check_same_thread=True,这里会抛 ProgrammingError——
+    而且只在真跑起来时才炸,单元测试里同线程调用发现不了。"""
+    import asyncio
+
+    _, gate = components
+    propose_fact = memory_tool_functions(gate)[0]
+    result = await asyncio.to_thread(
+        propose_fact, "add", "对芒果过敏", "user_stated", "长期偏好"
+    )
+    assert "已记下" in result
+
+
 def test_propose_fact_tool_writes_through_gate(components):
     ledger, gate = components
     propose_fact = memory_tool_functions(gate)[0]
@@ -1807,7 +1836,8 @@ from bundles.memory.ledger import Ledger, memory_schema
 def build_memory_components(data_dir: Path) -> tuple[Ledger, Gate]:
     root = Path(data_dir) / "memory"
     root.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(root / "memory.sqlite", isolation_level=None)
+    # check_same_thread=False 的理由同 lararium.db.connect():工具函数跑在线程池里
+    conn = sqlite3.connect(root / "memory.sqlite", isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")   # M2 拆容器后会有多个连接
     conn.executescript(memory_schema())
@@ -1891,7 +1921,7 @@ if __name__ == "__main__":
 ```bash
 uv run pytest tests/bundles/test_memory_server.py -v
 ```
-预期:8 passed
+预期:11 passed
 
 - [ ] **Step 6: 手动冒烟——确认 server 能起来**
 
@@ -1905,6 +1935,56 @@ LARARIUM_DATA_DIR=./data timeout 5 uv run python -m bundles.memory.server ; echo
 ```bash
 git add bundles/memory tests/bundles/test_memory_server.py
 git commit -m "feat: Memory bundle 的 FastMCP server、manifest 与 skill"
+```
+
+### Task 6 补做:SQLite 跨线程访问(验收时补入)
+
+**症状**:通过真实 MCP 表面调用任何碰数据库的工具,必崩:
+
+```
+sqlite3.ProgrammingError: SQLite objects created in a thread can only be used
+in that same thread. The object was created in thread id 8467963520 and this
+is thread id 6109147136.
+```
+
+**原因**:FastMCP 和 Pydantic AI 都把**同步**工具函数丢进线程池执行(避免阻塞事件循环),
+而我们的连接是在主线程建的、带默认的 `check_same_thread=True`。
+
+**为什么单元测试没发现**:测试里是同线程直接调用函数,压根没经过框架的线程池。
+这是一类典型的"只在真跑起来时才炸"的 bug——M1 的 Task 11 一接上 agent 就会撞上。
+
+**两处连接都要改**(`search_history` 是内置工具,同样会在线程池里碰起居注):
+
+- [ ] **Step 8: 改 `src/lararium/db.py` 的 `connect()`**
+
+按上方 Task 2 Step 4 的新版:加 `check_same_thread=False` 与解释性 docstring。
+安全性由架构保证——收件箱严格串行,任一时刻只有一轮在跑,不存在真正的并发访问。
+
+- [ ] **Step 9: 改 `bundles/memory/server.py` 的 `build_memory_components()`**
+
+同样加 `check_same_thread=False`(见上方 Step 4 新版)。
+
+- [ ] **Step 10: 补两个回归测试**
+
+`tests/bundles/test_memory_server.py` 加 `test_mcp_surface_matches_tool_functions`
+与 `test_tools_work_when_called_from_a_worker_thread`(代码见上方 Step 2)。
+前者防的是"哪次改动把审批类工具漏回 MCP 表面",后者防的正是本 bug。
+
+> Task 8 的 `tests/steward/test_tools.py` 也已加了对应的
+> `test_search_history_works_from_a_worker_thread`,做到那个任务时照写。
+
+- [ ] **Step 11: 运行测试,确认通过**
+
+```bash
+uv run pytest tests/bundles/test_memory_server.py -v
+```
+预期:11 passed
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add src/lararium/db.py bundles/memory/server.py tests/bundles/test_memory_server.py
+git commit -m "fix: SQLite 连接允许跨线程,否则框架线程池里的工具调用必崩"
 ```
 
 ---
@@ -2136,6 +2216,15 @@ def test_tool_function_order_is_fixed(tools):
     """工具 schema 顺序必须稳定,否则每次启动都毁前缀缓存。"""
     names = [f.__name__ for f in tools.as_tool_functions()]
     assert names == ["current_time", "read_skill", "search_history"]
+
+
+async def test_search_history_works_from_a_worker_thread(tools):
+    """同 Task 6:框架把同步工具丢线程池,search_history 会碰起居注的连接。"""
+    import asyncio
+
+    tools.journal.append("env-1", "envelope", {"content": "上周去了那家日料店"})
+    result = await asyncio.to_thread(tools.search_history, "日料店")
+    assert "日料店" in result
 ```
 
 - [ ] **Step 2: 运行测试,确认失败**
@@ -2199,7 +2288,7 @@ class BuiltinTools:
 ```bash
 uv run pytest tests/steward/test_tools.py -v
 ```
-预期:6 passed
+预期:7 passed
 
 - [ ] **Step 5: Commit**
 

@@ -45,7 +45,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
-| 6 | Memory bundle 的 MCP server | 待验收 | | | |
+| 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☐ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
 | 8 | 内置工具三件 | 未开始 | | | |
 | 9 | 上下文组装器 | 未开始 | | | |
@@ -640,6 +640,57 @@ tests/bundles/test_memory_server.py::test_skill_files_referenced_in_manifest_exi
 - **macOS 无 `timeout`**:冒烟改用后台 + kill,等价验证 server 能启动。
 
 **验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(13 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(54 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_memory_server.py` 9 passed。
+- 规范核对(CONVENTIONS.md):**无违反**。两个工具都返回人话错误而非抛异常(E2);
+  `read_ledger` 的 docstring 讲清了"为什么不做成 MCP 工具"而不是"这个函数做什么"(G1);
+  L1(prompt 不硬编码)落实——SKILL.md 与 manifest 都在文件里。
+- 契约核对:`build_memory_components`、`read_ledger`、`memory_tool_functions`、`create_server`
+  四个函数与修订后的计划一致;manifest 的 tools 与实现一致(有测试守着)。
+- 不变量核对:**账本单写路径 ☑**,server 层只经 `gate.propose`,不碰 `ledger.write`。
+- 抑制与分档:两处 `# type: ignore[arg-type]` 带理由、范围最小(单行、指名错误码),
+  符合 G4;`pyproject.toml` 未动,server.py 本就在宽松档。
+
+**五条偏离全部成立**。`type: ignore` 那条的理由尤其对——工具边界收 `str` 而非 `Literal`
+正是因为模型输出是不可信输入(L3),类型收窄该在运行时由 gate 做,不该靠静态类型假装安全。
+
+**安全边界:已在真实 MCP 表面验证有效** ✓
+
+Task 5 验收时打穿门控的那条攻击链,现在断了:
+
+```
+MCP 暴露给模型的工具: ['list_pending', 'propose_fact']
+✓ 审批 / 结算 / 回滚均不在 MCP 表面
+模型能自己批准注入的提案吗? ✓ 不能,攻击链断在这里
+```
+
+**但这次真跑 MCP 又炸出一个必须补的 bug**
+
+```
+sqlite3.ProgrammingError: SQLite objects created in a thread can only be used
+in that same thread.
+```
+
+FastMCP 和 Pydantic AI 都把**同步**工具函数丢进线程池执行(避免阻塞事件循环),
+而连接是主线程建的、带默认 `check_same_thread=True`。**任何碰数据库的工具调用都会崩。**
+
+单元测试发现不了它:测试里是同线程直接调函数,压根没经过框架的线程池。这是典型的
+"只在真跑起来时才炸"——Task 11 一接上 agent 就会撞。实测两种配置的对比:
+
+```
+check_same_thread=True (当前): ❌ ProgrammingError
+check_same_thread=False(修法): ✓ 已记下(提案 e1e3e9f2...)
+```
+
+**两处连接都中招**:`bundles/memory/server.py` 的 `build_memory_components`,
+以及 `src/lararium/db.py` 的 `connect`——`search_history` 是内置工具,同样会在
+线程池里碰起居注。PLAN.md 已改两处并加了三个回归测试(Task 6 两个、Task 8 一个)。
+
+安全性不受影响:收件箱严格串行,任一时刻只有一轮在跑,不存在真正的并发访问。
+
+**结论:通过**(补完跨线程修复即可开始 Task 7)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 (待验收)
 
