@@ -45,7 +45,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
-| 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☐ | 2026-08-17 |
+| 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
 | 8 | 内置工具三件 | 未开始 | | | |
 | 9 | 上下文组装器 | 未开始 | | | |
@@ -690,9 +690,29 @@ check_same_thread=False(修法): ✓ 已记下(提案 e1e3e9f2...)
 安全性不受影响:收件箱严格串行,任一时刻只有一轮在跑,不存在真正的并发访问。
 
 **结论:通过**(补完跨线程修复即可开始 Task 7)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
 
-(待验收)
+**补完记录**(程序员填,commit a1296ab)
+
+按 Step 8–12 补 SQLite 跨线程访问:
+
+- `src/lararium/db.py` `connect()` 加 `check_same_thread=False` + docstring 说明理由(架构保证串行,无并发)
+- `bundles/memory/server.py` `build_memory_components()` 同样加 `check_same_thread=False`
+- 两个回归测试:
+  - `test_mcp_surface_matches_tool_functions`:`await create_server().list_tools()`,验证 MCP 暴露面只有 list_pending / propose_fact
+  - `test_tools_work_when_called_from_a_worker_thread`:`asyncio.to_thread` 模拟框架线程池,验证碰库工具调用不崩
+
+测试输出(Step 11 确认通过):
+```
+$ uv run pytest tests/bundles/test_memory_server.py -v
+...
+tests/bundles/test_memory_server.py::test_mcp_surface_matches_tool_functions PASSED [ 45%]
+tests/bundles/test_memory_server.py::test_tools_work_when_called_from_a_worker_thread PASSED [ 54%]
+...
+============================== 11 passed in 0.53s ===============================
+```
+
+门禁四关全绿(56 passed, 1 skipped)。CHANGELOG Task 6 条目已追加。ruff format 将两处多行调用收为一行(纯格式,无逻辑变化)。
 
 ---
 
