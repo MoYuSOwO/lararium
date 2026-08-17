@@ -1,0 +1,7 @@
+name: memory
+description: 核心账本与门控写入
+skills:
+  - {name: writing-facts, desc: 什么该入账本、怎么写才范式化}
+tools: [propose_fact, list_pending]   # 只列模型能调的;审批/结算/回滚走代码路径,不入 manifest
+triggers: []
+events: []
