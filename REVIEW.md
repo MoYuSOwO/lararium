@@ -2303,3 +2303,111 @@ exit=0
 
 **与计划的偏离**:
 - 无;CommandResult/handle_command 按计划抽,main 对 handle_command 包 try/except 兜底。
+
+**验收结论**(Claude 填):**Step 0(P1-4)通过;补4 本体不通过——它把一次崩溃换成了
+一个退不出去的死循环。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑ / import-linter ☑ / pytest ☑(**134 passed**,+9)
+- **Step 0 我验过了,是对的**:`channel` 加 pattern 之后仍然必填(`Field(pattern=)`
+  没把它变成可选,这一点我专门试了),`"x >>> 伪造"`、中文、大写、超长、空串全部被拒。
+  修在类型边界是对的选择——一个收口挡住三处 untrusted 渲染。
+- `handle_command` / `CommandResult` 的抽法也对,`/rollback` 的
+  `except (ValueError, KeyError)` 覆盖了 `int("abc")` 和快照不存在两种,
+  `/rollback 1 2` 这种也落在 ValueError 里。
+
+## 问题:`/quit` 走在兜底 try 里面,而 EOF 也映射成 `/quit`
+
+`main()` 把 `handle_command` 整个包进了 `try/except Exception: … continue`,
+**`/quit` 也在里面**。于是结算一旦抛异常,`/quit` 就永远走不到 `return`。
+而上面那段 `except (EOFError, KeyboardInterrupt): line = "/quit"` 意味着
+**stdin 到底之后每一轮都会重新变成 `/quit`**——EOF 是永久状态,于是死循环。
+
+先在单元层证实 `/quit` 真的会抛:
+
+```python
+class BoomSteward:
+    def settle_if_needed(self): raise RuntimeError("账本文件不见了")
+
+handle_command("/quit", steward=BoomSteward(), ...)
+→ ★ RuntimeError: 账本文件不见了     # 不是返回 CommandResult
+```
+
+然后端到端跑真的 CLI。场景很现实:**会话中途用户把 `ledger.md` 挪走**
+——手编账本是本设计明确支持的操作(`sync_manual_edit` 就是为它写的),
+而且此时有一条已通过未落盘的提案:
+
+```
+启动后账本存在: True
+已挪走,现在敲 /quit
+
+★ /quit 之后 5 秒仍未退出,被 kill。输出行数 = 241496
+
+尾部:
+  你 > 命令出错(不影响后续):FileNotFoundError: 账本文件不存在:…/memory/ledger.md
+  你 > 命令出错(不影响后续):FileNotFoundError: 账本文件不存在:…/memory/ledger.md
+  你 > …
+```
+
+**5 秒 24 万行,约每秒 4.8 万次。**
+
+注意这个场景绕不过 `ensure_initialized()`:我第一次试的是"启动前就删掉账本",
+被启动期的 `ensure_initialized()` 自愈了(账本重建、结算成功、干净退出)。
+必须是**会话中途**消失才打得中——这也说明这个洞不是纸上推演。
+
+## 为什么这是不通过而不是"通过+小补"
+
+补4 存在的理由就是「命令出错不能打死进程,CLI 要随时可用」。改之前 `/quit` 在
+任何 try 之外,结算抛异常会**崩掉** CLI;改之后它**退不出去,而且以每秒 4.8 万行刷屏**。
+在 VPS 上这是塞满磁盘和日志的路子。**把崩溃换成不可杀的自旋不是修复,是换了个更差的失效方式。**
+
+## 补4b:两处都要改,少一处仍有洞
+
+见 [PLAN.md](PLAN.md)「补4b」。
+
+1. **`/quit` 必须无条件退出**:结算失败在 quit 分支内部接住,报告失败,
+   仍然返回 `should_quit=True`。退出是用户最后的逃生口,**逃生口不许被别的故障堵住**。
+2. **EOF 不许再回到命令分派**:EOF 的含义是"再也没有输入了",出现之后继续循环
+   在任何情况下都是错的。`except EOFError` 里就地做「尽力结算 + 报告 + `return`」,
+   不要绕道 `handle_command`。
+
+只改第 1 条,别的命令抛异常时 EOF 仍会自旋;只改第 2 条,交互式终端里
+(stdin 没到底)`/quit` 仍然退不出去。**两处都要。**
+
+**验收关注点**:上面那个「会话中途挪走账本 → /quit」的端到端脚本必须能干净退出,
+把 returncode 和尾部输出贴进 REVIEW。另加一条单元测试:结算抛异常时
+`handle_command("/quit")` 返回 `should_quit=True` 而不是抛出。
+
+## 补4b:/quit 死循环回归(commit 2a9215c,待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 失败输出**(settle 抛错 → handle_command 直接冒泡,should_quit 失守):
+```
+FAILED test_quit_still_exits_when_settlement_fails - RuntimeError: 账本文件不见了
+(handle_command("/quit") 直接抛,没返回 should_quit=True)
+```
+
+**Step 1-2 通过输出**:
+```
+$ uv run pytest tests/gateway/test_cli_commands.py -q
+7 passed
+```
+
+**Step 3 端到端复验**:一次性脚本(不入库)——`build_memory_components` 预置一条
+user_stated 提案(未结算),启动真 CLI,`sleep(1.5)` 后**会话中途删掉 ledger.md**,
+stdin 写 `/quit`,`communicate(timeout=5)`:
+
+```
+=== returncode: 0
+=== 总行数: 3
+'Lararium 已启动。输入 /help 看命令,/quit 退出。'
+''
+'你 > 退出前结算失败(FileNotFoundError: 账本文件不存在:…ledger.md。…)。提案仍在库里,修好账本后重启会自动结算。'
+脚本退出码: 0
+```
+
+干净退出(rc=0、3 行、无刷屏),结算失败被报告(FileNotFoundError + 恢复路径)且仍已退出。
+
+**门禁**:135 passed(134 → +1),mypy 20 files,import-linter 3 kept(30 deps)。
+
+**偏离**:无。
