@@ -43,7 +43,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
-| 4 | 账本文件与快照表 | 未开始 | | | |
+| 4 | 账本文件与快照表 | 待验收 | | | |
 | 5 | 门控状态机 | 未开始 | | | |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
@@ -360,7 +360,53 @@ limit=3 : [('问2', '答2'), ('问3', '答3'), ('正在处理的这句', None)]
 这是计划里就说明过的,不是缺陷。
 
 **结论:通过**(无补做项,直接开始 Task 4)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+(待验收)
+
+---
+
+### Task 4:账本文件与快照表
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/bundles/test_ledger.py -v
+...
+tests/bundles/test_ledger.py:5: in <module>
+    from bundles.memory.ledger import LEDGER_SECTIONS, Ledger, memory_schema
+E   ModuleNotFoundError: No module named 'bundles.memory.ledger'
+ERROR tests/bundles/test_ledger.py
+=============================== 1 error in 0.02s ===============================
+```
+
+测试输出(Step 5 确认通过):
+```
+$ uv run pytest tests/bundles/test_ledger.py -v
+...
+tests/bundles/test_ledger.py::test_read_creates_file_with_sections PASSED [ 14%]
+tests/bundles/test_ledger.py::test_write_persists_and_snapshots PASSED   [ 28%]
+tests/bundles/test_ledger.py::test_sync_manual_edit_captures_out_of_band_change PASSED [ 42%]
+tests/bundles/test_ledger.py::test_sync_manual_edit_is_noop_when_unchanged PASSED [ 57%]
+tests/bundles/test_ledger.py::test_rollback_restores_content_and_records_new_snapshot PASSED [ 71%]
+tests/bundles/test_ledger.py::test_history_is_newest_first PASSED        [ 85%]
+tests/bundles/test_ledger.py::test_diff_shows_changed_lines PASSED       [100%]
+============================== 7 passed in 0.02s ===============================
+```
+
+与计划的偏离:
+- **Step 3「让 bundles 可导入」已就位,无需改动**:`bundles/__init__.py`、`bundles/memory/__init__.py`
+  在 M0 立项时已建,`pyproject.toml` 的 `pythonpath` 已是 `["src", "."]`。故 Step 3 省略,不影响结果。
+- **`ledger.py` `snapshot` 的 `cur.lastrowid` 类型(计划代码错,与 Task 3 同类)**:typeshed 标 `int|None`,
+  mypy 严格档 `arg-type` 拦截。加 `assert cur.lastrowid is not None` 收窄,注释说明 AUTOINCREMENT 不变量。
+- **`datetime.UTC` 替代 `timezone.utc`(工具为准)**:ruff UP017,与前序任务同类。
+- **测试 import 排序与未用 import**:计划测试 import 了 `from pathlib import Path` 但未用(ruff F401),
+  已删;`import sqlite3` / `import pytest` / `from bundles...` 之间的空行被 ruff isort 去掉。
+- 预期失败信息与计划不同:计划写 `No module named 'bundles'`,实际是 `No module named 'bundles.memory.ledger'`
+  (bundles 包已存在,缺的只是 ledger 模块)。这是 Step 3 已就位的副作用,不影响 TDD 验证。
+
+**验收结论**(Claude 填)
 
 (待验收)
 
