@@ -2411,3 +2411,123 @@ stdin 写 `/quit`,`communicate(timeout=5)`:
 **门禁**:135 passed(134 → +1),mypy 20 files,import-linter 3 kept(30 deps)。
 
 **偏离**:无。
+
+**验收结论**(Claude 填):**通过。P2-1 关闭,M1 补做全部收官。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑ / import-linter ☑ / pytest ☑(**135 passed**)
+- 两处都改了,而且各自独立成立——这是有意的设计,不是冗余。
+- **端到端用同一个场景复打(会话中途挪走 `ledger.md` + `/quit`)**:
+
+```
+进程退出,returncode=0
+你 > 退出前结算失败(FileNotFoundError: 账本文件不存在:…/memory/ledger.md…)。
+     提案仍在库里,修好账本后重启会自动结算。
+```
+
+从 24 万行自旋变成 3 行干净退出。而且这句话是**对用户有用的**:它说清了提案没丢、
+怎么恢复。逃生口报告故障但不被故障堵住,这就是对的形状。
+
+---
+
+# M1 补做收官回归
+
+这一串补做反复改 `assembler` / `tools` / `model` / `cli` 同几个文件,后面的改动可能碰坏
+前面的。收官前我把六处缺陷逐条复打了一遍:
+
+```
+✓ P0-1  第二轮前缀仍在真实 HTTP body 的 messages[0]
+✓ P0-1  前缀跨轮字节一致
+✓ P1-1  历史轮不可信内容仍带包裹
+✓ P1-1  无 ts 时包裹仍在、正文不重复渲染
+✓ P1-2  不可信命中带来源标记
+✓ P1-2b 换行撑不开列表(1 条命中 = 1 个列表项)
+✓ P1-3  检索输出围栏完整
+✓ P1-3  当前信封围栏完整
+✓ P1-4  非法 channel 被类型边界拒绝
+✓ P2-1  结算失败时 /quit 仍然退出
+
+六处缺陷回归:10/10 通过
+```
+
+## M1 状态更正
+
+审计时我撤回的那条验收标准——「事实走完门控并在后续对话生效」——**现在成立了**,
+而且是在**报文层面**成立的(`test_acceptance_settled_fact_reaches_the_model_on_the_next_turn`
+断言 HTTP body 的 `messages[0]` 里含那条事实)。M1 四条验收标准全部达成。
+
+门禁:106(交付时)→ **135**,净增 29 条测试,全部来自补做。
+
+## 这一串补做的账
+
+| 编号 | 缺陷 | 谁的问题 |
+|---|---|---|
+| P0-1 | 第二轮起 system prompt 根本没发出去 | 计划(库语义没验) |
+| 补1b | 报文级测试停在库内部表示,对发出的字节一无所知 | **我的规格** |
+| P1-1 | 不可信包裹只活一轮 | 计划(单轮测试) |
+| 补2b | `ts` 缺失时把正文当时间戳 | 实现 |
+| P1-2 | 检索结果丢掉来源 | 计划 |
+| 补3b | 标记只标开头,换行能撑开列表 | **我的规格** |
+| P1-3 | 围栏界符能被正文伪造 | **我的漏检**(审计时逐行读过 assembler 却没发现) |
+| P1-4 | 围栏外的 `channel` 零校验 | **我的漏检** |
+| P2-1 | CLI 坏参数打死进程 | 实现(原 Task 11) |
+| 补4b | 修 P2-1 时把崩溃换成了每秒 4.8 万行的死循环 | 实现(回归) |
+
+**十处里有四处是我的规格洞或漏检。** 值得记下来的规律:我每次都在问"这个东西有没有",
+没在问"这个东西能不能被伪造"。P1-2 → 补3b → P1-3 → P1-4 是同一个问题往外挪了四层
+(标记缺失 → 边界能撑开 → 界符能伪造 → 界外字段没校验),每一层都是打了才发现的。
+
+**下一层就是「谁能构造信封」——那正是 M2 ingress 要回答的第一个问题。**
+写 ingress 计划时,这四层要一次性对齐,不要再一层一层被咬。
+
+## 渲染不可信内容的三条规矩(已被咬三次才补齐)
+
+1. **折行**——否则换行能撑开行列表
+2. **首尾有界**——只标开头等于没标
+3. **中和正文里的界符**——否则界可以被撬开
+
+外加一条从 P1-4 学到的:**围栏外面的每个插值字段都要在类型边界上校验**,
+别指望渲染时补救。
+
+## 待办
+
+- 程序员:往 CHANGELOG.md 的 M1 小节追加补2 / 补2b / 补3 / 补3b / 补3c / 补4 / 补4b 各一行
+- 程序员:`git tag -a m1 -m "M1 骨架交付(含审计补做)"`
+- Claude:开 M2 计划,第一件是 ingress——统一入站端点 + 出件箱 + worker
+
+## Task M2-1:出件箱(commit 5a4c1e6,待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 失败输出**(outbox 模块不存在):
+```
+$ uv run pytest tests/steward/test_outbox.py -q
+E   ModuleNotFoundError: No module named 'lararium.steward.outbox'
+1 error in 0.05s
+```
+
+**Step 1-2 通过输出**:
+```
+$ uv run pytest tests/steward/test_outbox.py -v
+test_put_then_take_returns_item_and_scopes_to_channel PASSED
+test_take_marks_delivered_but_still_returns_item PASSED
+test_seq_is_monotonic_and_global_across_channels PASSED
+============================== 3 passed ================================
+```
+
+**Step 3 通过输出**(回复先落出件箱,信封才算完成):
+```
+$ uv run pytest tests/steward/test_loop.py -q
+13 passed(incl. test_reply_lands_in_outbox_before_envelope_completes)
+```
+
+**门禁**:139 passed(135 → +4),mypy 21 files,import-linter 3 kept(32 deps)。
+架构测试 `test_only_the_ledger_module_writes_files` 仍过(outbox 只写 SQLite)。
+
+**与计划的偏离**:
+- `take` 的 delivered_at 标记改为**逐条参数化 UPDATE**,没用计划的 `IN (%s)` 动态子句——
+  ruff S608(SQL 注入)会拦 `%` 构造;逐条等价且无构造性 SQL。
+- 实现的 `take` 会重读标记后的行返回 delivered_at;逐条 UPDATE 后再构造 OutboxItem
+  填入 now(不二次 SELECT)。
+
+**全局约束核对**:
+- 起居注不变量:投递状态(seq/delivered_at)只写 outbox 表,不进 journal ✓(D10)。
