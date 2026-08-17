@@ -42,7 +42,16 @@ def handle_command(line: str, *, steward: Steward, ledger: Ledger, gate: Gate) -
     函数才守得住;二是 M2 的 IM 按钮回调要走同一套分派,两份实现必然漂移。
     """
     if line == "/quit":
-        n = steward.settle_if_needed()
+        # 退出是逃生口,不许被别的故障堵住:结算失败要说出来,但一定还是退出。
+        # 少了这层,EOF 会把一次结算失败变成每秒数万行的死循环。
+        try:
+            n = steward.settle_if_needed()
+        except Exception as exc:
+            return CommandResult(
+                f"退出前结算失败({type(exc).__name__}: {exc})。提案仍在库里,"
+                f"修好账本后重启会自动结算。",
+                should_quit=True,
+            )
         return CommandResult(f"结算 {n} 条提案后退出。" if n else "退出。", should_quit=True)
     if line == "/help":
         return CommandResult(HELP)
@@ -117,7 +126,10 @@ async def main() -> None:
             # 阻塞式 input 放线程池,别占着事件循环(ASYNC250)
             line = (await asyncio.to_thread(input, "\n你 > ")).strip()
         except (EOFError, KeyboardInterrupt):
-            line = "/quit"
+            # EOF/中断之后不要绕道 handle_command:万一那条路抛异常,
+            # 兜底会 continue,而 EOF 永久为真 → 死循环。就地退出。
+            print(handle_command("/quit", steward=steward, ledger=ledger, gate=gate).text)
+            return
 
         if not line:
             continue

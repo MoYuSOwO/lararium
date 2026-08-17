@@ -95,3 +95,20 @@ def test_pending_reports_empty(system):
     steward, ledger, gate = system
     result = handle_command("/pending", steward=steward, ledger=ledger, gate=gate)
     assert "无待审" in result.text
+
+
+def test_quit_still_exits_when_settlement_fails():
+    """退出是用户最后的逃生口,不许被别的故障堵住。
+
+    结算失败要报告,但 should_quit 必须仍然为真——否则 EOF 会把它变成死循环
+    (EOF 永久为真 → 每轮重新映射成 /quit → 每轮再抛一次)。
+    """
+    from lararium.gateway.cli import handle_command
+
+    class BoomSteward:
+        def settle_if_needed(self):
+            raise RuntimeError("账本文件不见了")
+
+    result = handle_command("/quit", steward=BoomSteward(), ledger=None, gate=None)
+    assert result.should_quit is True
+    assert "账本文件不见了" in result.text
