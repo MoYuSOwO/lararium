@@ -195,3 +195,29 @@ async def test_reply_lands_in_outbox_before_envelope_completes(steward_factory):
     # 信封已标记完成(complete 在 put 之后)
     row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
     assert row["state"] == "done"
+
+
+async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
+    """钉住顺序本身:put 被调用的那一刻,信封必须还没 complete。
+    反过来(先 complete 后 put)意味着:崩在两者之间 = 回复静默丢失,D10 白设计。"""
+
+    class SpyOutbox:
+        def __init__(self, inner, conn):
+            self._inner, self._conn = inner, conn
+            self.state_at_put: str | None = None
+
+        def put(self, envelope_id, channel, content, kind="reply"):
+            row = self._conn.execute(
+                "SELECT state FROM inbox WHERE id=?", (envelope_id,)
+            ).fetchone()
+            self.state_at_put = row["state"]
+            return self._inner.put(envelope_id, channel, content, kind)
+
+    steward, _ = steward_factory([ModelReply(text="回复")])
+    spy = SpyOutbox(steward.outbox, steward.inbox._conn)
+    steward.outbox = spy
+    env = Envelope.new(source="user", channel="cli", content="你好")
+    steward.submit(env)
+    await steward.process_next()
+
+    assert spy.state_at_put == "processing", "put 时信封已 complete——顺序反了,崩溃会吞回复"
