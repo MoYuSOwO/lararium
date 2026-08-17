@@ -48,7 +48,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
-| 9 | 上下文组装器 | 未开始 | | | |
+| 9 | 上下文组装器 | **待验收** | | | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
 | 12 | 端到端验收 | 未开始 | | | |
@@ -922,6 +922,49 @@ tests/steward/test_tools.py::test_search_history_works_from_a_worker_thread PASS
 ```
 
 门禁四关全绿(74 passed, 1 skipped)。CHANGELOG Task 8 条目已追加。偏离:计划写的钳制公式 `max(1, min(limit, MAX_SEARCH_HITS))` 对 `limit=-1` 得 1 而非 20——SQLite 把负数当"不限制",测试期望钳制到上限 20。改为 `MAX_SEARCH_HITS if limit < 0 else max(1, min(limit, MAX_SEARCH_HITS))`,三组断言全过。
+
+---
+
+### Task 9:上下文组装器
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_assembler.py -v
+...
+tests/steward/test_assembler.py:2: in <module>
+    from lararium.steward.assembler import Turn, assemble
+E   ModuleNotFoundError: No module named 'lararium.steward.assembler'
+ERROR tests/steward/test_assembler.py
+=============================== 1 error in 0.13s ===============================
+```
+
+测试输出(Step 4 确认通过):
+```
+$ uv run pytest tests/steward/test_assembler.py -v
+...
+tests/steward/test_assembler.py::test_system_prompt_contains_persona_directory_and_ledger PASSED [  9%]
+tests/steward/test_assembler.py::test_prefix_is_byte_identical_across_different_envelopes PASSED [ 18%]
+tests/steward/test_assembler.py::test_prefix_contains_no_timestamp PASSED [ 27%]
+tests/steward/test_assembler.py::test_envelope_message_carries_the_timestamp PASSED [ 36%]
+tests/steward/test_assembler.py::test_appending_a_turn_leaves_earlier_messages_untouched PASSED [ 45%]
+tests/steward/test_assembler.py::test_ledger_change_is_the_only_thing_that_moves_the_prefix PASSED [ 54%]
+tests/steward/test_assembler.py::test_l0_turns_become_alternating_messages PASSED [ 63%]
+tests/steward/test_assembler.py::test_incomplete_turn_is_skipped PASSED [ 72%]
+tests/steward/test_assembler.py::test_l1_block_appears_before_l0_when_present PASSED [ 81%]
+tests/steward/test_assembler.py::test_non_user_envelope_is_marked_as_system_trigger PASSED [ 90%]
+tests/steward/test_assembler.py::test_untrusted_module_event_is_wrapped_as_data PASSED [100%]
+============================== 11 passed in 0.04s ===============================
+```
+
+与计划的偏离:
+- **W292:assembler.py 文件末尾缺换行**,ruff 自动补。
+- **ruff format 将 `test_assembler.py` 三处多行调用重排**(`build` 的 `assemble` 调用、
+  `test_l1_block...` 的 `build` 调用、`test_untrusted...` 的 `Envelope.new` 调用):纯格式,无逻辑变化。
+- **架构测试的组装器时钟检查自动激活**:此前 skipped 的那条「组装器读时钟」检查
+  在 assembler.py 存在后开始运行并直接通过,全量从「74 passed, 1 skipped」变为
+  「86 passed, 0 skipped」,恰好达到 M1 目标。
 
 ---
 
