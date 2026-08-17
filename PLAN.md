@@ -2297,6 +2297,17 @@ def test_tool_function_order_is_fixed(tools):
     assert names == ["current_time", "read_skill", "search_history"]
 
 
+def test_search_history_caps_the_result_count(tools):
+    """limit 是模型可控参数。不封顶的话一次调用就能塞进五万 token,
+    撑爆 L0 并逼出一次压缩——而压缩是仅有的两个缓存重建点之一。"""
+    for i in range(40):
+        tools.journal.append(f"env-{i}", "envelope", {"content": f"消费记录 {i}"})
+
+    assert tools.search_history("消费记录", limit=10000).count("\n- ") == 20
+    assert tools.search_history("消费记录", limit=-1).count("\n- ") == 20  # SQLite 把负数当不限制
+    assert tools.search_history("消费记录", limit=0).count("\n- ") == 1
+
+
 async def test_search_history_works_from_a_worker_thread(tools):
     """同 Task 6:框架把同步工具丢线程池,search_history 会碰起居注的连接。"""
     import asyncio
@@ -2324,6 +2335,14 @@ from lararium.steward.journal import Journal
 from lararium.steward.registry import Registry
 
 
+# 检索结果条数的硬上限。limit 是模型可控参数,不封顶的话:
+#   limit=10000 → 一次工具调用返回约 5.6 万 token,撑爆 L0 并逼出一次压缩
+#   limit=-1    → SQLite 把负数当"不限制",全表倒进上下文
+# 而压缩是全系统仅有的两个缓存重建点之一,不能让一次检索就触发。
+MAX_SEARCH_HITS = 20
+MAX_HIT_CHARS = 200
+
+
 class BuiltinTools:
     def __init__(self, journal: Journal, registry: Registry, timezone: str) -> None:
         self.journal = journal
@@ -2348,13 +2367,15 @@ class BuiltinTools:
 
     def search_history(self, query: str, limit: int = 10) -> str:
         """在历史对话记录里检索。用于翻旧账(几个月前提过的事)。
-        搜不到就换个说法再搜——关键词要用对话里可能出现的原话。"""
+        搜不到就换个说法再搜——关键词要用对话里可能出现的原话。
+        最多返回 20 条;要更精确就换更具体的关键词,不是加大 limit。"""
+        limit = max(1, min(limit, MAX_SEARCH_HITS))
         hits = self.journal.search(query, limit=limit)
         if not hits:
             return f"没有找到包含「{query}」的历史记录。换个关键词试试,或者用更短的词。"
         lines = [f"找到 {len(hits)} 条:"]
         for h in hits:
-            lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {h.text[:200]}")
+            lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {h.text[:MAX_HIT_CHARS]}")
         return "\n".join(lines)
 
     def as_tool_functions(self) -> list[Callable]:
@@ -2367,13 +2388,49 @@ class BuiltinTools:
 ```bash
 uv run pytest tests/steward/test_tools.py -v
 ```
-预期:7 passed
+预期:8 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/lararium/steward/tools.py tests/steward/test_tools.py
 git commit -m "feat: 内置工具 current_time / read_skill / search_history"
+```
+
+### Task 8 补做:给检索结果封顶(验收时补入)
+
+`limit` 是模型可控参数,当前完全没有上界。实测:
+
+```
+limit=10000  → 返回 111,399 字符 ≈ 55,699 token
+limit=-1     → 找到 500 条(SQLite 把负数当"不限制",全表倒进上下文)
+limit=0      → 静默返回"没有找到",模型会误以为历史里真没有
+```
+
+一次工具调用就能撑爆 L0、逼出一次压缩——而压缩是全系统仅有的两个缓存重建点之一,
+不能让一次检索随手触发。这也直接违反 bundle 契约里那条「工具返回结论,不返回原料」。
+
+- [ ] **Step 6: 加上限常量并在 `search_history` 里钳制**
+
+按上方 Step 3 的新版:模块级加 `MAX_SEARCH_HITS = 20` / `MAX_HIT_CHARS = 200`,
+`search_history` 开头 `limit = max(1, min(limit, MAX_SEARCH_HITS))`,
+docstring 补一句「最多返回 20 条;要更精确就换更具体的关键词,不是加大 limit」——
+让模型知道边界,它才不会反复试探。
+
+- [ ] **Step 7: 补测试 `test_search_history_caps_the_result_count`**(代码见上方 Step 1)
+
+- [ ] **Step 8: 运行测试,确认通过**
+
+```bash
+uv run pytest tests/steward/test_tools.py -v
+```
+预期:8 passed
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/lararium/steward/tools.py tests/steward/test_tools.py
+git commit -m "fix: 检索结果封顶,防止一次工具调用撑爆上下文"
 ```
 
 ---

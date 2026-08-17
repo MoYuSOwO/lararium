@@ -47,7 +47,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
-| 8 | 内置工具三件 | **待验收** | | | 2026-08-17 |
+| 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☐ | 2026-08-17 |
 | 9 | 上下文组装器 | 未开始 | | | |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
@@ -861,6 +861,46 @@ tests/steward/test_tools.py::test_search_history_works_from_a_worker_thread PASS
 
 与计划的偏离:
 - (无)
+
+**验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(15 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(73 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_tools.py` 7 passed,含 Task 6 遗留的跨线程回归测试
+  `test_search_history_works_from_a_worker_thread` ✓——那个修复确实生效了。
+- 规范核对(CONVENTIONS.md):**无违反**。三个工具都返回人话错误、不抛异常给模型(E2);
+  `read_skill` 分别处理 KeyError 与 FileNotFoundError,后者还提示"检查 bundle 安装是否完整"(E3);
+  docstring 写的是"什么时候用、怎么用"而不是"这个函数做什么"(G1)——这些 docstring
+  会变成模型看到的工具描述,写法正确。
+- 契约核对:`BuiltinTools` 三个工具 + `as_tool_functions()` 顺序固定,与计划一致。
+- 不变量核对:**前缀字节稳定 ☑** —— `as_tool_functions()` 顺序固定有测试守着,
+  工具 schema 是前缀第 0 层,这条守住了。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动。
+
+零偏离,实现干净。
+
+**一处必须补做的缺陷(我的计划漏了)**
+
+`limit` 是**模型可控参数**,而计划里完全没有上界。实测:
+
+```
+limit=10000  → 返回 111,399 字符 ≈ 55,699 token
+limit=-1     → 找到 500 条(SQLite 把负数当"不限制",全表倒进上下文)
+limit=0      → 静默返回"没有找到",模型会误以为历史里真没有
+```
+
+一次工具调用就能塞进五万多 token:撑爆 L0、逼出一次压缩——**而压缩是全系统仅有的
+两个缓存重建点之一**,不能让一次检索随手触发。这同时违反 bundle 契约里那条
+「工具返回结论,不返回原料」:检索本该给钩子,不该把原料倒过来。
+
+负数那条尤其阴——直觉上 `limit=-1` 应该更保守,实际是"不限制"。
+
+PLAN.md Task 8 已补 **Step 6–9**:加 `MAX_SEARCH_HITS = 20` 常量、在 `search_history`
+开头钳制 `limit = max(1, min(limit, MAX_SEARCH_HITS))`,并在 docstring 里明说
+「最多返回 20 条;要更精确就换更具体的关键词,不是加大 limit」——**让模型知道边界,
+它才不会反复试探**。外加测试 `test_search_history_caps_the_result_count`。
+
+**结论:通过**(补完封顶即可开始 Task 9)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 ---
 
