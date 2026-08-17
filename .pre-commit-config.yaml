@@ -1,0 +1,55 @@
+# 门禁:提交前自动跑。装法见 PLAN.md Task 1。
+# 想更快可以换 prek(同一份配置文件,drop-in 替换):uv tool install prek && prek install
+#
+# 类型检查、架构边界、测试都走 language: system + uv run,
+# 让它们用项目自己的依赖环境,不会和 uv.lock 里的版本漂移。
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0 # 装好后跑一次 `pre-commit autoupdate` 拉到最新并提交
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff lint(自动修)
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+
+      - id: mypy
+        name: mypy(分层严格)
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        require_serial: true
+
+      - id: import-linter
+        name: 架构边界
+        entry: uv run lint-imports
+        language: system
+        pass_filenames: false
+        require_serial: true
+
+      - id: pytest
+        name: pytest(含架构不变量)
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+        require_serial: true

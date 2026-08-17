@@ -1,0 +1,115 @@
+[project]
+name = "lararium"
+version = "0.1.0"
+description = "自部署个人生活助手"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "pydantic-ai>=0.0.30",
+    "fastmcp>=2.0",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "import-linter>=2.0",
+    "types-PyYAML",
+    "pre-commit>=3.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lararium"]
+
+# ─────────────────────────── 测试 ───────────────────────────
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = ["live: 需要真实模型 API 的测试(无 API key 时跳过)"]
+
+# ─────────────────────────── Ruff ───────────────────────────
+# Ruff 只做 lint + format,不做类型检查(类型交给 mypy)。
+# 规则集按"能抓真 bug"选,不求全:选进来的每一条都得能说出它防的是什么。
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "bundles"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes:未用变量、未定义名字
+    "I",        # isort:import 排序(顺带保证 diff 稳定)
+    "UP",       # pyupgrade:别写过时语法
+    "B",        # bugbear:可变默认参数之类的真坑
+    "SIM",      # 可简化的写法
+    "C4",       # 推导式
+    "DTZ",      # ★ 禁止 naive datetime —— 全系统时间戳必须带时区
+    "PTH",      # 用 pathlib 而非 os.path
+    "ASYNC",    # async 里的阻塞调用
+    "LOG", "G", # logging 用法
+    "S",        # bandit 安全规则 —— 本项目有明确安全边界(DESIGN §9)
+    "T20",      # 禁止散落的 print
+    "RUF",      # ruff 自有规则
+]
+ignore = [
+    "E501",     # 行长交给 formatter
+    "S101",     # assert:测试里到处都是,src 里也用于不变量断言
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/lararium/gateway/cli.py" = ["T201"]   # CLI 就是靠 print 说话
+"tests/**" = ["S", "T201"]                  # 测试里安全规则噪声大
+
+# ─────────────────────────── mypy ───────────────────────────
+# 分层严格:自己拥有的契约严格,给别人的库做适配的地方宽松。
+# 判断依据不是"这个文件重不重要",而是"这个形状是我们定的,还是第三方定的"。
+# 详见 PLAN.md「工程纪律与门禁」。
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "bundles"]          # 测试不做类型检查
+plugins = ["pydantic.mypy"]
+
+# 基线(宽松档):不强制写注解,但写了的必须自洽
+check_untyped_defs = true           # 没注解的函数体也检查
+warn_redundant_casts = true
+warn_unused_ignores = true          # 防止 type: ignore 越积越多
+no_implicit_optional = true
+strict_equality = true
+warn_unreachable = true
+
+# 严格档:形状由我们自己定义的模块。这些是跨模块契约,类型在这里最值钱。
+[[tool.mypy.overrides]]
+module = [
+    "lararium.config",
+    "lararium.envelope",
+    "lararium.db",
+    "lararium.steward.ports",
+    "lararium.steward.inbox",
+    "lararium.steward.journal",
+    "lararium.steward.registry",
+    "lararium.steward.assembler",
+    "lararium.steward.tools",
+    "lararium.steward.loop",
+    "bundles.memory.ledger",
+    "bundles.memory.gate",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+
+# 第三方库没有完整 stub —— 这不是我们的锅,别让它污染信噪比
+[[tool.mypy.overrides]]
+module = ["fastmcp.*", "pydantic_ai.*", "mcp.*"]
+ignore_missing_imports = true

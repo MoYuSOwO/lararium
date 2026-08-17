@@ -25,8 +25,68 @@
 - **账本写入只有一条代码路径**(DESIGN §6.3):门控的 settle 函数。任何其他地方写 `ledger.md` 都是缺陷。
 - **无 shell**(DESIGN §9):不引入 `subprocess` 执行任意命令、不引入 shell 工具。(FastMCP stdio 传输启动固定 server 进程属于基础设施,不在此列。)
 - **测试用 pytest**,文件名 `test_*.py`,测试函数名用英文、描述行为。禁止 `assert True` 式占位测试。
+- **门禁不可绕过**:提交由 pre-commit 钩子把关(ruff / mypy / import-linter / pytest)。禁止 `git commit --no-verify`。详见下节。
 - **提交信息**用 Conventional Commits(`feat:` / `fix:` / `test:` / `chore:` / `docs:`),正文可用中文。
 - **时区**统一 `Asia/Shanghai`,所有时间戳带时区、存 ISO 8601。
+
+## 工程纪律与门禁
+
+Python 不像 TypeScript 有个 strict 开关一拉就完事——它允许任何模块 import 任何模块、
+允许任何地方写任何文件、允许完全不写类型。**边界只靠自觉,三个月内必烂。**
+所以本项目把纪律做成机械门禁:`pre-commit install` 之后每次提交自动跑,不过不让提交。
+
+### 门禁四关
+
+| 关卡 | 工具 | 管什么 | 配置 |
+|---|---|---|---|
+| 风格与低级 bug | ruff(lint + format)| 未用变量、可变默认参数、**naive datetime**、`print` 残留、安全规则 | `pyproject.toml` |
+| 类型 | mypy(分层严格)| 契约漂移:改了函数签名忘了改调用方 | `pyproject.toml` |
+| 架构边界 | import-linter | Steward 不许直接依赖 bundle;bundle 之间不许互相依赖 | `.importlinter` |
+| 项目不变量 | pytest | 账本单写路径、无 shell、组装器不读时钟、个人数据不入库 | `tests/test_architecture.py` |
+
+手动全跑一遍:
+
+```bash
+uv run ruff check src bundles tests && uv run ruff format --check src bundles tests && uv run mypy && uv run lint-imports && uv run pytest -q
+```
+
+### 类型严格度:为什么分层,线划在哪
+
+全局 strict 在 Python 里是个坏主意——AI 相关的库(Pydantic AI、FastMCP)接口演进快、
+stub 不全,强上 strict 只会逼出满屏 `# type: ignore`,那时候类型检查已经名存实亡了。
+但完全不检查,12 个模块之间的契约漂移又没人管。
+
+所以判据不是"这个文件重不重要",而是:**这个数据的形状是我们自己定的,还是第三方定的?**
+
+- **严格档**(`disallow_untyped_defs` + `warn_return_any`):形状归我们——`envelope`、
+  `assembler`、`inbox`、`journal`、`registry`、`tools`、`loop`、`ledger`、`gate`、`ports`。
+  这些是跨模块契约,类型在这里最值钱:改了 `Envelope` 的字段,所有用到的地方立刻报错。
+- **宽松档**(只查自洽,不强制注解):给别人的库做适配的地方——`steward/model.py`
+  (Pydantic AI)、`bundles/*/server.py`(FastMCP)、`gateway/cli.py`(接线与 I/O)。
+  这几个文件的职责本来就是"把外面的混乱挡在门外",让它们脏一点是设计意图,不是妥协。
+- **完全不查**:`tests/`。测试的正确性由它们自己断言,给测试写全量注解是纯负担。
+
+这条线和架构是同一条线:`model.py` 在设计里本来就是"库变了只改这一个文件"的隔离盒
+(见 Task 10),它同时也是类型宽松区的边界,不是巧合。
+
+### 编辑器配速度,CI 配权威
+
+编辑器里可以装 Astral 的 `ty`(比 mypy 快一到两个数量级,输入即反馈)。
+但**门禁必须用 mypy**:ty 到 2026 年 8 月仍是 beta,官方路线图里"对 Pydantic 等库的
+一等支持"还是待补项,而本项目从头到脚都是 Pydantic。等 ty 出 1.0 且 Pydantic 支持齐了再换,
+换的时候只动 `pyproject.toml` 一处。
+
+### 违反了怎么办
+
+门禁报错时**先假设门禁是对的**。确实需要例外时,用最小范围的抑制并写明理由:
+
+```python
+result = legacy_call()  # noqa: S310 - 这里的 URL 来自本地配置,不是用户输入
+```
+
+禁止的做法:整条规则从 `select` 里删掉、给整个文件加 `# type: ignore`、
+把架构测试的白名单当垃圾桶用。这些都是在拆门禁而不是修问题——真需要拆,
+在 REVIEW.md 里说明,由验收人裁决。
 
 ## 里程碑范围
 
@@ -42,13 +102,15 @@
 ```
 lararium/
 ├── DESIGN.md · PLAN.md · CHANGELOG.md · REVIEW.md
-├── pyproject.toml · .env.example · .gitignore
+├── pyproject.toml · .gitignore · .env.example        # 已就位
+├── .pre-commit-config.yaml · .importlinter           # 门禁,已就位
 ├── prompts/persona.md              # 人格总则(前缀第1层的一部分)
 ├── src/lararium/
 │   ├── config.py                   # 环境变量配置
 │   ├── envelope.py                 # 信封模型
 │   ├── db.py                       # SQLite 连接与建表
 │   ├── steward/
+│   │   ├── ports.py                # Steward 对 Memory 的抽象(守住架构边界)
 │   │   ├── inbox.py                # 收件箱:持久化 + 严格串行认领
 │   │   ├── journal.py              # 起居注:append-only + 中文 FTS + 重放
 │   │   ├── registry.py             # 读 manifest → 目录行 + skill 文件定位
@@ -56,14 +118,22 @@ lararium/
 │   │   ├── tools.py                # 内置工具
 │   │   ├── model.py                # ModelClient 协议 + Pydantic AI 实现 + 缓存指标
 │   │   └── loop.py                 # 一轮的编排
-│   └── gateway/cli.py              # CLI 适配器
+│   └── gateway/cli.py              # 组装根:唯一允许 import bundles 的地方
 ├── bundles/memory/
 │   ├── manifest.yaml · skills/SKILL.md
-│   ├── ledger.py                   # 账本文件 + 快照表
+│   ├── ledger.py                   # 账本文件 + 快照表(全系统唯一写文件的模块)
 │   ├── gate.py                     # 门控状态机
 │   └── server.py                   # FastMCP server
-└── tests/                          # 与 src 同构
+└── tests/
+    ├── test_architecture.py        # 项目不变量门禁,已就位
+    └── ...                          # 其余与 src 同构
 ```
+
+**为什么 `gateway/cli.py` 是唯一能 import bundles 的地方**:import-linter 契约禁止
+`lararium.steward` 依赖 `bundles`(见 `.importlinter`)。Steward 通过 `ports.py` 里的
+Protocol 拿到账本读取与结算能力,具体是哪个 bundle 提供的它不知道也不该知道。
+组装根(cli)负责把两边接起来。这不是为了好看——M2 拆容器时,这条边界就是拆分线,
+现在守住,到时候换传输方式几乎是免费的。
 
 职责边界:`inbox`/`journal` 是 Steward 独占存储;`ledger`/`gate` 是 Memory bundle 独占存储,Steward 只能通过 MCP 工具触达(DESIGN §6.1 产权表)。`assembler` 是纯函数,输入全部来自持久层——这是可重放的前提。
 
@@ -72,67 +142,30 @@ lararium/
 ## Task 1:项目骨架与配置
 
 **Files:**
-- Create: `pyproject.toml`, `.gitignore`, `.env.example`, `src/lararium/__init__.py`, `src/lararium/config.py`, `prompts/persona.md`, `tests/test_config.py`
+- Create: `.env.example`, `src/lararium/config.py`, `prompts/persona.md`, `tests/test_config.py`
+- 已就位(无需创建):`pyproject.toml`、`.gitignore`、`.pre-commit-config.yaml`、`.importlinter`、`tests/test_architecture.py`、包骨架
 
 **Interfaces:**
 - Produces: `lararium.config.Settings`(字段 `model_name: str`, `api_key: str`, `api_base_url: str`, `data_dir: Path`, `timezone: str`, `l0_max_turns: int`);`Settings.load() -> Settings`
 
-- [ ] **Step 1: 建目录与 uv 项目**
+- [ ] **Step 1: 装依赖与门禁钩子,确认空跑全绿**
 
 ```bash
-mkdir -p src/lararium/steward src/lararium/gateway bundles/memory/skills prompts tests/steward tests/bundles
-touch src/lararium/__init__.py src/lararium/steward/__init__.py src/lararium/gateway/__init__.py
-uv init --no-workspace --bare 2>/dev/null || true
+uv sync && uv run pre-commit install && uv run pre-commit autoupdate
 ```
 
-- [ ] **Step 2: 写 `pyproject.toml`**
+然后手动全跑一次,确认四关都通过(此时还没写业务代码,应当全绿):
 
-```toml
-[project]
-name = "lararium"
-version = "0.1.0"
-description = "自部署个人生活助手"
-requires-python = ">=3.12"
-dependencies = [
-    "pydantic>=2.9",
-    "pydantic-ai>=0.0.30",
-    "fastmcp>=2.0",
-    "pyyaml>=6.0",
-]
-
-[dependency-groups]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.6"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/lararium"]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]
-asyncio_mode = "auto"
-markers = ["live: 需要真实模型 API 的测试(无 API key 时跳过)"]
-
-[tool.ruff]
-line-length = 100
+```bash
+uv run ruff check src bundles tests && uv run ruff format --check src bundles tests && uv run mypy && uv run lint-imports && uv run pytest -q
 ```
 
-- [ ] **Step 3: 写 `.gitignore` 与 `.env.example`**
+预期:ruff 通过、mypy `Success`、import-linter `3 kept, 0 broken`、pytest `3 passed, 1 skipped`
+(跳过的是组装器时钟检查,Task 9 之后自动生效)。
 
-`.gitignore`:
-```
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.env
-data/
-```
+**先跑通门禁再写第一行业务代码**——门禁是用来防止腐化的,腐化之后再装就晚了。
 
-`.env.example`:
+- [ ] **Step 2: 写 `.env.example`**
 ```bash
 # 模型 API(OpenAI 兼容接口)
 LARARIUM_API_KEY=sk-xxx
@@ -146,7 +179,7 @@ LARARIUM_TIMEZONE=Asia/Shanghai
 LARARIUM_L0_MAX_TURNS=30
 ```
 
-- [ ] **Step 4: 写失败的测试 `tests/test_config.py`**
+- [ ] **Step 3: 写失败的测试 `tests/test_config.py`**
 
 ```python
 import pytest
@@ -172,14 +205,14 @@ def test_load_rejects_missing_api_key(monkeypatch):
         Settings.load()
 ```
 
-- [ ] **Step 5: 运行测试,确认失败**
+- [ ] **Step 4: 运行测试,确认失败**
 
 ```bash
 uv run pytest tests/test_config.py -v
 ```
 预期:`ModuleNotFoundError: No module named 'lararium.config'`
 
-- [ ] **Step 6: 实现 `src/lararium/config.py`**
+- [ ] **Step 5: 实现 `src/lararium/config.py`**
 
 ```python
 import os
@@ -211,7 +244,7 @@ class Settings:
         )
 ```
 
-- [ ] **Step 7: 写人格文件 `prompts/persona.md`**
+- [ ] **Step 6: 写人格文件 `prompts/persona.md`**
 
 内容是前缀第 1 层的固定部分。**注意最后两条纪律来自 DESIGN §4,不可删**:
 
@@ -232,19 +265,22 @@ class Settings:
   派生结论(从事实推出来的)不要入档。
 ```
 
-- [ ] **Step 8: 运行测试,确认通过**
+- [ ] **Step 7: 运行测试,确认通过**
 
 ```bash
 uv run pytest tests/test_config.py -v
 ```
 预期:2 passed
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit(门禁会在这一步自动拦截)**
 
 ```bash
-git add pyproject.toml .gitignore .env.example src prompts tests uv.lock
-git commit -m "chore: 项目骨架、配置加载与人格文件"
+git add -A
+git commit -m "chore: 配置加载与人格文件"
 ```
+
+钩子会自动跑 ruff → mypy → import-linter → pytest。**报错就修,不要 `--no-verify`。**
+真需要例外,按「工程纪律与门禁」一节的规矩用最小范围抑制并写明理由。
 
 ---
 
@@ -2347,11 +2383,12 @@ git commit -m "feat: 模型客户端协议与缓存命中指标"
 对应 DESIGN §2(一轮的旅程)。
 
 **Files:**
-- Create: `src/lararium/steward/loop.py`, `src/lararium/gateway/cli.py`, `tests/steward/test_loop.py`
+- Create: `src/lararium/steward/ports.py`, `src/lararium/steward/loop.py`, `src/lararium/gateway/cli.py`, `tests/steward/test_loop.py`
 
 **Interfaces:**
 - Consumes: 前面全部
 - Produces:
+  - `LedgerPort`(`.read() -> str`)、`GatePort`(`.settle() -> int`、`.pending() -> list`)——Steward 侧的抽象,守住 import 边界
   - `Steward(settings, inbox, journal, registry, gate, ledger, model, persona, bundle_tools=None, mcp_servers=None)`
   - `.submit(envelope) -> None`、`async .process_next() -> str | None`、`.settle_if_needed() -> int`、`.all_tools() -> list[Callable]`
   - `build_steward(settings) -> Steward`、`run_cli()`(入口,`python -m lararium.gateway.cli`)
@@ -2537,21 +2574,44 @@ uv run pytest tests/steward/test_loop.py -v
 ```
 预期:`ModuleNotFoundError: No module named 'lararium.steward.loop'`
 
-- [ ] **Step 3: 实现 `src/lararium/steward/loop.py`**
+- [ ] **Step 3: 实现 `src/lararium/steward/ports.py`**
+
+Steward 不能直接 import bundle(`.importlinter` 契约会拦下),所以先定义它对 Memory 的抽象。
+Protocol 是结构化的,`Ledger`/`Gate` 不需要显式继承就自动满足:
+
+```python
+from typing import Any, Protocol
+
+
+class LedgerPort(Protocol):
+    """Steward 只需要读账本。写入永远经门控,不在这个接口里——
+    这不是疏漏,是把"单写者"编码进了类型。"""
+
+    def read(self) -> str: ...
+
+
+class GatePort(Protocol):
+    """Steward 只需要触发结算、查待审。提案由工具侧发起,不经过 Steward。"""
+
+    def settle(self) -> int: ...
+
+    def pending(self) -> list[Any]: ...
+```
+
+- [ ] **Step 4: 实现 `src/lararium/steward/loop.py`**
 
 ```python
 import logging
 from collections.abc import Callable
 from typing import Any
 
-from bundles.memory.gate import Gate
-from bundles.memory.ledger import Ledger
 from lararium.config import Settings
 from lararium.envelope import Envelope
 from lararium.steward.assembler import Turn, assemble
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.model import ModelClient, format_cache_log
+from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
 from lararium.steward.tools import BuiltinTools
 
@@ -2561,7 +2621,7 @@ logger = logging.getLogger("lararium")
 class Steward:
     def __init__(
         self, *, settings: Settings, inbox: Inbox, journal: Journal, registry: Registry,
-        ledger: Ledger, gate: Gate, model: ModelClient, persona: str,
+        ledger: LedgerPort, gate: GatePort, model: ModelClient, persona: str,
         bundle_tools: list[Callable] | None = None,
         mcp_servers: list[Any] | None = None,
     ) -> None:
@@ -2639,14 +2699,14 @@ class Steward:
 
 注意 `_recent_turns` 取的是**已完成的历史轮**,当前这一轮的 `envelope` 事件虽已落账但没有 `reply`,`assemble` 会跳过不完整的轮次(Task 9 已测)。
 
-- [ ] **Step 4: 运行测试,确认通过**
+- [ ] **Step 5: 运行测试,确认通过**
 
 ```bash
 uv run pytest tests/steward/test_loop.py -v
 ```
 预期:9 passed
 
-- [ ] **Step 5: 实现 CLI `src/lararium/gateway/cli.py`**
+- [ ] **Step 6: 实现 CLI `src/lararium/gateway/cli.py`**
 
 ```python
 import asyncio
@@ -2738,14 +2798,17 @@ if __name__ == "__main__":
     run_cli()
 ```
 
-- [ ] **Step 6: 全量测试通过**
+- [ ] **Step 7: 全量门禁通过**
 
 ```bash
-uv run pytest -v && uv run ruff check src bundles tests
+uv run ruff check src bundles tests && uv run ruff format --check src bundles tests && uv run mypy && uv run lint-imports && uv run pytest -q
 ```
-预期:全绿
 
-- [ ] **Step 7: Commit**
+预期全绿。**特别关注 import-linter**:这一步是 Steward 第一次需要 Memory 的能力,
+如果偷懒直接 `from bundles.memory.gate import Gate`,契约会在这里报 BROKEN。
+正确做法是走 `ports.py` 的 Protocol,由 `cli.py` 接线。
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/lararium/steward/loop.py src/lararium/gateway/cli.py tests/steward/test_loop.py
@@ -2943,7 +3006,8 @@ git commit -m "test: M1 端到端验收测试"
 
 全部满足才算 M1 交付:
 
-- [ ] `uv run pytest` 全绿,`uv run ruff check src bundles tests` 无告警
+- [ ] 门禁四关全绿:`uv run ruff check src bundles tests && uv run ruff format --check src bundles tests && uv run mypy && uv run lint-imports && uv run pytest -q`
+- [ ] 全程无 `--no-verify` 提交;任何 `noqa` / `type: ignore` 都带了理由注释
 - [ ] Task 12 Step 4 的五项手动冒烟全部通过,输出已贴进 REVIEW.md
 - [ ] 第二轮起缓存命中 token 数 > 0(硬约束的实证)
 - [ ] [CHANGELOG.md](CHANGELOG.md) 已记录 M1 条目

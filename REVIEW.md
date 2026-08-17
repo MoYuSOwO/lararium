@@ -14,11 +14,22 @@
 3. 特别检查跨任务不变量(见下);
 4. 给结论:**通过** / **打回**(附具体问题)。通过后由程序员在 [CHANGELOG.md](CHANGELOG.md) 追加条目。
 
-**每次验收都要专门核对的三条硬不变量**(它们跨任务,单任务测试可能测不出退化):
+**验收第一步永远是跑门禁**(四关任一不过,直接打回,不必往下看):
 
-- **前缀字节稳定**:账本不变时,不同轮次的 `system_prompt` 必须逐字相同;时间戳、消息内容、随机数不得出现在前缀区。凡触碰 `assembler.py`、`registry.py`、`tools.as_tool_functions()` 的改动都要复查。
-- **账本写入单一路径**:除 `Gate.settle()` 外,任何代码不得写 `ledger.md`。验收时 `grep -rn "ledger.md\|\.write_text" src bundles --include=*.py` 复查。
-- **可见即入账**:进过模型上下文的内容必须能从起居注重建;落账的 prompt 必须是模型实收的那一份,不是重新拼的。
+```bash
+uv run ruff check src bundles tests && uv run ruff format --check src bundles tests && uv run mypy && uv run lint-imports && uv run pytest -q
+```
+
+**门禁管不了、必须人工核对的三条硬不变量**(它们跨任务,单任务测试测不出退化):
+
+- **前缀字节稳定**:账本不变时,不同轮次的 `system_prompt` 必须逐字相同。凡触碰 `assembler.py`、`registry.py`、`tools.as_tool_functions()`、`Steward.all_tools()` 的改动都要复查。架构测试只能挡住"组装器读时钟"这一种退化,挡不住别的。
+- **账本写入单一路径**:架构测试已挡住"别的模块写文件",但挡不住"在 `ledger.py` 里加了第二个写入函数、绕开 `Gate.settle()`"——这条要人看。
+- **可见即入账**:落账的 prompt 必须是模型实收的那一份,不是重新拼的;新增的模型可见内容(未来的压缩摘要、状态卡)必须按原文入账。
+
+**还要核对的两条纪律**:
+
+- 新增的 `# noqa` / `# type: ignore` 是否都带了理由,范围是否最小(不是整文件、整规则)。
+- 严格档模块(`pyproject.toml` 里 mypy 的 overrides 列表)有没有被偷偷挪进宽松档。改这个列表等同于改设计,必须在验收记录里说明。
 
 ---
 
@@ -62,9 +73,11 @@ $ uv run pytest tests/... -v
 
 **验收结论**(Claude 填)
 
+- 门禁四关:ruff ☐ / mypy ☐ / import-linter ☐ / pytest ☐
 - 重跑结果:
 - 契约核对:
 - 不变量核对:前缀稳定 ☐ / 账本单写 ☐ / 可见即入账 ☐
+- 抑制与分档:noqa/ignore 有理由 ☐ / 严格档列表未被削弱 ☐
 - 结论:通过 / 打回(原因)
 
 -->
@@ -76,8 +89,8 @@ $ uv run pytest tests/... -v
 全部满足才算 M1 完成:
 
 - [ ] 12 个任务全部「通过」
-- [ ] `uv run pytest` 全绿(预期 86 passed)
-- [ ] `uv run ruff check src bundles tests` 无告警
+- [ ] 门禁四关全绿;`uv run pytest` 预期 86 passed(不含 `test_architecture.py` 的 4 条)
+- [ ] 全程无 `--no-verify` 提交
 - [ ] PLAN.md Task 12 Step 4 的五项真实 API 冒烟通过,终端输出贴在下方
 - [ ] 第二轮起 `[cache]` 命中 token 数 > 0
 

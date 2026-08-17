@@ -1,0 +1,31 @@
+; 架构边界的机械化执行(DESIGN §2 四种容器、§6.1 产权表)。
+; Python 允许任何模块 import 任何模块,边界只靠自觉必然会烂——这个文件让它烂不了。
+; M2 拆容器时,这些边界就是拆分线;现在守住,到时候拆分几乎是免费的。
+
+[importlinter]
+root_packages =
+    lararium
+    bundles
+
+[importlinter:contract:steward-not-depend-on-bundles]
+name = Steward 不得直接依赖任何 bundle(只有 gateway 组装根可以接线)
+type = forbidden
+source_modules =
+    lararium.steward
+forbidden_modules =
+    bundles
+
+[importlinter:contract:bundles-not-depend-on-steward]
+name = bundle 不得反向依赖 Steward 或 Gateway
+type = forbidden
+source_modules =
+    bundles
+forbidden_modules =
+    lararium.steward
+    lararium.gateway
+
+[importlinter:contract:bundles-are-independent]
+name = bundle 之间互不依赖(跨领域流量一律过主控)
+type = independence
+modules =
+    bundles.memory
