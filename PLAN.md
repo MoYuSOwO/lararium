@@ -195,7 +195,27 @@ LARARIUM_TIMEZONE=Asia/Shanghai
 LARARIUM_L0_MAX_TURNS=30
 ```
 
-- [ ] **Step 3: 写失败的测试 `tests/test_config.py`**
+- [ ] **Step 3: 写 `tests/conftest.py`——把测试和宿主环境隔离**
+
+不加这个,`source .env` 之后跑测试会读到真实配置而不是测试配置。Task 12 的冒烟步骤
+正是在同一个 shell 里 source `.env`,这个坑必踩,而且报错现象("时区怎么是 Asia/Tokyo")
+和真正的原因隔得很远,极难查。autouse 让所有测试自动受益,后续任务不用各自记得。
+
+```python
+import os
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_lararium_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """清掉宿主环境里所有 LARARIUM_* 变量,让测试只看见自己设的值。"""
+    for key in list(os.environ):
+        if key.startswith("LARARIUM_"):
+            monkeypatch.delenv(key, raising=False)
+```
+
+- [ ] **Step 4: 写失败的测试 `tests/test_config.py`**
 
 ```python
 import pytest
@@ -221,14 +241,14 @@ def test_load_rejects_missing_api_key(monkeypatch):
         Settings.load()
 ```
 
-- [ ] **Step 4: 运行测试,确认失败**
+- [ ] **Step 5: 运行测试,确认失败**
 
 ```bash
 uv run pytest tests/test_config.py -v
 ```
 预期:`ModuleNotFoundError: No module named 'lararium.config'`
 
-- [ ] **Step 5: 实现 `src/lararium/config.py`**
+- [ ] **Step 6: 实现 `src/lararium/config.py`**
 
 ```python
 import os
@@ -260,7 +280,7 @@ class Settings:
         )
 ```
 
-- [ ] **Step 6: 写人格文件 `prompts/persona.md`**
+- [ ] **Step 7: 写人格文件 `prompts/persona.md`**
 
 内容是前缀第 1 层的固定部分。**注意最后两条纪律来自 DESIGN §4,不可删**:
 
@@ -281,14 +301,14 @@ class Settings:
   派生结论(从事实推出来的)不要入档。
 ```
 
-- [ ] **Step 7: 运行测试,确认通过**
+- [ ] **Step 8: 运行测试,确认通过**
 
 ```bash
 uv run pytest tests/test_config.py -v
 ```
 预期:2 passed
 
-- [ ] **Step 8: Commit(门禁会在这一步自动拦截)**
+- [ ] **Step 9: Commit(门禁会在这一步自动拦截)**
 
 ```bash
 git add -A

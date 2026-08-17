@@ -40,7 +40,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 
 | # | 任务 | 状态 | 验收人结论 | CHANGELOG | 日期 |
 |---|---|---|---|---|---|
-| 1 | 环境、门禁与配置加载 | 待验收 | | | |
+| 1 | 环境、门禁与配置加载 | **通过** | 全绿;附一处计划缺陷待补(conftest 环境隔离) | ☐ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | 未开始 | | | |
 | 3 | 起居注与中文检索 | 未开始 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
@@ -117,7 +117,45 @@ tests/test_config.py::test_load_rejects_missing_api_key PASSED           [100%]
 
 **验收结论**(Claude 填)
 
-(待验收)
+- 门禁四关:ruff ☑ / mypy ☑(6 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(5 passed, 1 skipped)
+- 重跑结果:独立重跑全绿,与报告一致。`tests/test_config.py` 2 passed。
+- 规范核对(CONVENTIONS.md):**无违反**。`Settings` 是 frozen dataclass、无模块级可变状态(F5);
+  `load()` 只读环境不产生副作用(F4);错误消息带出路「请参考 .env.example」(E3)。
+- 契约核对:`Settings` 六个字段与 `load() -> Settings` 与计划 Interfaces 完全一致;
+  严格档要求的全量注解齐备(`lararium.config` 在 mypy strict 列表内且通过)。
+- 不变量核对:本任务不涉及前缀/账本/起居注,三条均不适用。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未改动,严格档列表完好。
+- 卫生检查:`git ls-files` 确认无缓存目录、无 `.env` 被跟踪;`.gitignore` 补的
+  `.pre-commit-cache/`、`.uv-cache/` 两行正确(程序员自行发现并补上,这一处做得好)。
+
+**三条偏离全部接受**:
+
+1. `pre-commit autoupdate` 拉到 v6.0.0 —— 这本来就是 Step 1 要求的动作,配置注释也写了。
+2、3. ruff 的 import 分组与注释对齐修正 —— **计划原文错了,ruff 是对的**。计划里的代码是我手写的,
+没过 formatter;凡此类冲突一律以工具为准,不必回报得这么详细(但报了不扣分)。
+
+**一处必须修的缺陷(我的计划错,不是你的实现错)**:
+
+`tests/test_config.py` 没有和宿主环境隔离。`test_load_reads_env` 只 setenv 了四个变量,
+`LARARIUM_TIMEZONE` 和 `LARARIUM_L0_MAX_TURNS` 靠默认值断言——宿主 shell 里一旦有这两个变量,
+测试就读到真实配置而失败。实测复现:
+
+```
+$ LARARIUM_L0_MAX_TURNS=50 LARARIUM_TIMEZONE=Asia/Tokyo uv run pytest tests/test_config.py -q
+E         - Asia/Shanghai
+E         + Asia/Tokyo
+FAILED tests/test_config.py::test_load_reads_env
+```
+
+这个坑必踩:Task 12 Step 4 的冒烟原文就是 `set -a && source .env && set +a`,
+之后在同一个 shell 跑全量测试正是 M1 的完成标准。而报错现象和真正原因隔得很远,极难查。
+
+PLAN.md Task 1 已补 **Step 3:写 `tests/conftest.py`**(autouse fixture 清掉所有
+`LARARIUM_*`),原 Step 3–8 顺延。请照新 Step 3 补上这个文件,单独 commit,并入 Task 1。
+用 autouse 是为了让后续 Task 11、12 的 fixture 自动受益,不必每个任务各自记得。
+
+**结论:通过**(补完 conftest.py 即可开始 Task 2,不必等二次验收)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 ---
 
