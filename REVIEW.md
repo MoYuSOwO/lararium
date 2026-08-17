@@ -41,7 +41,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | # | 任务 | 状态 | 验收人结论 | CHANGELOG | 日期 |
 |---|---|---|---|---|---|
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
-| 2 | 信封模型与收件箱 | **通过** | 全绿;附崩溃恢复补做(计划缺陷) | ☐ | 2026-08-17 |
+| 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | 未开始 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
 | 5 | 门控状态机 | 未开始 | | | |
@@ -262,7 +262,28 @@ PLAN.md Task 2 已补 **Step 8–13(崩溃恢复)**:加 `attempts` 列、`recove
 如果崩溃正是这条消息引起的,无脑重排队会让每次启动都崩一次。
 
 **结论:通过**(补完崩溃恢复即可开始 Task 3,不必等二次验收)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+**补完记录**(程序员填,commit fcea06e)
+
+按 Step 8–13 补崩溃恢复:
+
+- `db.py` SCHEMA 加 `attempts INTEGER NOT NULL DEFAULT 0`
+- `inbox.py` `claim_next()` 的 UPDATE 加 `attempts=attempts+1`;新增 `recover_stale(max_attempts=2) -> (requeued, abandoned)`,
+  先标记放弃(已达重试上限的)再重排队剩下的,顺序不能反
+- 3 个测试:重启后重排队 / 毒消息放弃 / 干净启动 noop
+
+测试输出(Step 12 确认通过):
+```
+$ uv run pytest tests/steward/test_inbox.py -v
+...
+tests/steward/test_inbox.py::test_recover_stale_requeues_interrupted_envelope PASSED [ 77%]
+tests/steward/test_inbox.py::test_recover_stale_abandons_poison_message PASSED [ 88%]
+tests/steward/test_inbox.py::test_recover_stale_is_noop_on_clean_start PASSED [100%]
+============================== 9 passed in 0.06s ===============================
+```
+
+门禁四关全绿(14 passed, 1 skipped)。CHANGELOG Task 2 条目已追加。无偏离——计划代码照抄即过。
 
 ---
 
