@@ -1,41 +1,92 @@
-import os
 from collections.abc import Callable
 from typing import Any
 
 import httpx
 import pytest
 
+from lararium.config import Settings
+from lararium.steward.model import PydanticAIClient
+
 
 @pytest.fixture(autouse=True)
 def _isolate_lararium_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """清掉宿主环境里所有 LARARIUM_* 变量,让测试只看见自己设的值。"""
+    import os
+
     for key in list(os.environ):
         if key.startswith("LARARIUM_"):
             monkeypatch.delenv(key, raising=False)
 
 
-def build_http_spy_client(
-    handler: Callable[[httpx.Request], httpx.Response], *, api_key: str = "sk-test"
-) -> Any:
-    """报文级测试的帮助:真实 PydanticAIClient + 真实 OpenAIChatModel,
-    只把 HTTP 传输换成 MockTransport。返回底层能捕获 body 的 client。
+def text_reply(content: str = "ok") -> dict[str, Any]:
+    """共用的文本回复体,wire 测试与验收测试共享,避免复制两份 JSON(CONVENTIONS S)。"""
+    return {
+        "id": "1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }
 
-    用例(wire 测试、验收①报文级复核)共享这一份,避免复制两份夹具(CONVENTIONS S)。
+
+def tool_call_reply() -> dict[str, Any]:
+    """共用的工具调用回复体:模型先要求调 current_time,让框架再发一轮。"""
+    return {
+        "id": "1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "current_time", "arguments": "{}"},
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }
+
+
+@pytest.fixture
+def http_spy_factory(monkeypatch):
+    """返回一个能构造"只换 HTTP 传输"的 PydanticAIClient 的工厂。
+
+    报文级测试都要用真实 OpenAIChatModel + MockTransport 抓 body;把这层接线
+    收进 conftest,用 fixture 注入而非 `from conftest import ...`——后者的路径
+    依赖 tests/ 没有 __init__.py 才成立,是脆的。
     """
-    from lararium.config import Settings
+    monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
 
-    settings = Settings.load()
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    model = OpenAIChatModel(
-        settings.model_name,
-        provider=OpenAIProvider(
-            base_url=settings.api_base_url,
-            api_key=api_key,
-            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        ),
-    )
-    from lararium.steward.model import PydanticAIClient
+    def factory(handler: Callable[[httpx.Request], httpx.Response]) -> PydanticAIClient:
+        settings = Settings.load()
+        model = OpenAIChatModel(
+            settings.model_name,
+            provider=OpenAIProvider(
+                base_url=settings.api_base_url,
+                api_key=settings.api_key,
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            ),
+        )
+        return PydanticAIClient(settings, model=model)
 
-    return PydanticAIClient(settings, model=model)
+    return factory

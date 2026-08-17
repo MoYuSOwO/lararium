@@ -5,55 +5,15 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import build_http_spy_client
+from conftest import text_reply, tool_call_reply
 
 from lararium.steward.assembler import AssembledContext
 
 PREFIX = "【前缀】"
 
 
-def _text_reply() -> dict[str, Any]:
-    return {
-        "id": "1",
-        "object": "chat.completion",
-        "created": 0,
-        "model": "m",
-        "choices": [
-            {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
-        ],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-    }
-
-
-def _tool_call_reply() -> dict[str, Any]:
-    return {
-        "id": "1",
-        "object": "chat.completion",
-        "created": 0,
-        "model": "m",
-        "choices": [
-            {
-                "index": 0,
-                "finish_reason": "tool_calls",
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "c1",
-                            "type": "function",
-                            "function": {"name": "current_time", "arguments": "{}"},
-                        }
-                    ],
-                },
-            }
-        ],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-    }
-
-
 @pytest.fixture
-def wire(monkeypatch):
+def wire(http_spy_factory):
     """真实 PydanticAIClient + 真实 OpenAIChatModel,只把 HTTP 传输换掉。"""
     bodies: list[dict[str, Any]] = []
 
@@ -64,12 +24,10 @@ def wire(monkeypatch):
             m.get("role") == "tool" for m in body["messages"]
         )
         return httpx.Response(
-            200, json=_tool_call_reply() if wants_tool_round_trip else _text_reply()
+            200, json=tool_call_reply() if wants_tool_round_trip else text_reply()
         )
 
-    monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
-    client = build_http_spy_client(handler)
-    return client, bodies
+    return http_spy_factory(handler), bodies
 
 
 def ctx(*, history: tuple[tuple[str, str], ...] = (), now: str = "本轮") -> AssembledContext:
