@@ -42,7 +42,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 |---|---|---|---|---|---|
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
-| 3 | 起居注与中文检索 | 未开始 | | | |
+| 3 | 起居注与中文检索 | 待验收 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
 | 5 | 门控状态机 | 未开始 | | | |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
@@ -284,6 +284,51 @@ tests/steward/test_inbox.py::test_recover_stale_is_noop_on_clean_start PASSED [1
 ```
 
 门禁四关全绿(14 passed, 1 skipped)。CHANGELOG Task 2 条目已追加。无偏离——计划代码照抄即过。
+
+---
+
+### Task 3:起居注与中文检索
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_journal.py -v
+...
+tests/steward/test_journal.py:6: in <module>
+    from lararium.steward.journal import Journal
+E   ModuleNotFoundError: No module named 'lararium.steward.journal'
+ERROR tests/steward/test_journal.py
+=============================== 1 error in 0.04s ===============================
+```
+
+测试输出(Step 5 确认通过):
+```
+$ uv run pytest tests/steward/test_journal.py -v
+...
+tests/steward/test_journal.py::test_sqlite_supports_trigram_tokenizer PASSED [ 11%]
+tests/steward/test_journal.py::test_append_and_replay_preserves_order_and_content PASSED [ 22%]
+tests/steward/test_journal.py::test_replay_is_byte_identical_across_calls PASSED [ 33%]
+tests/steward/test_journal.py::test_search_finds_chinese_substring PASSED [ 44%]
+tests/steward/test_journal.py::test_search_finds_two_character_word PASSED [ 55%]
+tests/steward/test_journal.py::test_search_does_not_index_internal_events PASSED [ 66%]
+tests/steward/test_journal.py::test_search_respects_limit PASSED         [ 77%]
+tests/steward/test_journal.py::test_search_returns_empty_for_no_match PASSED [ 88%]
+tests/steward/test_journal.py::test_recent_turns_returns_newest_last PASSED [100%]
+============================== 9 passed in 0.04s ===============================
+```
+
+与计划的偏离:
+- **`journal.py` `append` 的 `cur.lastrowid` 类型(计划代码错)**:typeshed 里 `sqlite3.Cursor.lastrowid`
+  是 `int | None`,`int(cur.lastrowid)` 被 mypy 严格档 `arg-type` 拦截。AUTOINCREMENT 主键的 INSERT
+  必有 lastrowid,这是运行时不变量。修复:加 `assert cur.lastrowid is not None` 收窄类型,注释说明理由。
+- **`datetime.UTC` 替代 `timezone.utc`(工具为准)**:计划原文用 `timezone.utc`,ruff UP017 要求 `UTC`。
+  与 Task 1/2 同类,已按 ruff 修正。
+- **`recent_turns` 一行长生成器被 ruff format 拆多行**:纯格式,无逻辑变化。
+
+**验收结论**(Claude 填)
+
+(待验收)
 
 ---
 
