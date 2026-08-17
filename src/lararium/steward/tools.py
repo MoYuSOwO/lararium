@@ -5,6 +5,13 @@ from zoneinfo import ZoneInfo
 from lararium.steward.journal import Journal
 from lararium.steward.registry import Registry
 
+# 检索结果条数的硬上限。limit 是模型可控参数,不封顶的话:
+#   limit=10000 → 一次工具调用返回约 5.6 万 token,撑爆 L0 并逼出一次压缩
+#   limit=-1    → SQLite 把负数当"不限制",全表倒进上下文
+# 而压缩是全系统仅有的两个缓存重建点之一,不能让一次检索就触发。
+MAX_SEARCH_HITS = 20
+MAX_HIT_CHARS = 200
+
 
 class BuiltinTools:
     def __init__(self, journal: Journal, registry: Registry, timezone: str) -> None:
@@ -30,13 +37,16 @@ class BuiltinTools:
 
     def search_history(self, query: str, limit: int = 10) -> str:
         """在历史对话记录里检索。用于翻旧账(几个月前提过的事)。
-        搜不到就换个说法再搜——关键词要用对话里可能出现的原话。"""
+        搜不到就换个说法再搜——关键词要用对话里可能出现的原话。
+        最多返回 20 条;要更精确就换更具体的关键词,不是加大 limit。"""
+        # 负数在 SQLite 里表示"不限制",要钳制到上限而非下限;0 大概率是误用,给 1 条
+        limit = MAX_SEARCH_HITS if limit < 0 else max(1, min(limit, MAX_SEARCH_HITS))
         hits = self.journal.search(query, limit=limit)
         if not hits:
             return f"没有找到包含「{query}」的历史记录。换个关键词试试,或者用更短的词。"
         lines = [f"找到 {len(hits)} 条:"]
         for h in hits:
-            lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {h.text[:200]}")
+            lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {h.text[:MAX_HIT_CHARS]}")
         return "\n".join(lines)
 
     def as_tool_functions(self) -> list[Callable]:

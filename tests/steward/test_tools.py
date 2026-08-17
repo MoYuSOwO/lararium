@@ -47,6 +47,17 @@ def test_tool_function_order_is_fixed(tools):
     assert names == ["current_time", "read_skill", "search_history"]
 
 
+def test_search_history_caps_the_result_count(tools):
+    """limit 是模型可控参数。不封顶的话一次调用就能塞进五万 token,
+    撑爆 L0 并逼出一次压缩——而压缩是仅有的两个缓存重建点之一。"""
+    for i in range(40):
+        tools.journal.append(f"env-{i}", "envelope", {"content": f"消费记录 {i}"})
+
+    assert tools.search_history("消费记录", limit=10000).count("\n- ") == 20
+    assert tools.search_history("消费记录", limit=-1).count("\n- ") == 20  # SQLite 把负数当不限制
+    assert tools.search_history("消费记录", limit=0).count("\n- ") == 1
+
+
 async def test_search_history_works_from_a_worker_thread(tools):
     """同 Task 6:框架把同步工具丢线程池,search_history 会碰起居注的连接。"""
     import asyncio
