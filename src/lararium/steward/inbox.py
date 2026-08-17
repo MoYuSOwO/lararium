@@ -43,7 +43,8 @@ class Inbox:
                 self._conn.execute("COMMIT")
                 return None
             self._conn.execute(
-                "UPDATE inbox SET state='processing', claimed_at=? WHERE id=?", (_now(), row["id"])
+                "UPDATE inbox SET state='processing', claimed_at=?, attempts=attempts+1 WHERE id=?",
+                (_now(), row["id"]),
             )
             self._conn.execute("COMMIT")
         except Exception:
@@ -73,3 +74,25 @@ class Inbox:
         return int(
             self._conn.execute("SELECT COUNT(*) FROM inbox WHERE state='pending'").fetchone()[0]
         )
+
+    def recover_stale(self, max_attempts: int = 2) -> tuple[int, int]:
+        """把上次运行遗留的 processing 记录清理掉,返回 (重新排队数, 放弃数)。
+
+        只应在启动时调用一次。同时跑两个 Steward 会互相抢活——本系统按设计
+        只有一个,这也是"严格串行"成立的前提。
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            abandoned = self._conn.execute(
+                "UPDATE inbox SET state='failed', error=?, completed_at=? "
+                "WHERE state='processing' AND attempts >= ?",
+                ("重启后仍未处理完,已达重试上限,可能是毒消息", _now(), max_attempts),
+            ).rowcount
+            requeued = self._conn.execute(
+                "UPDATE inbox SET state='pending', claimed_at=NULL WHERE state='processing'"
+            ).rowcount
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return requeued, abandoned

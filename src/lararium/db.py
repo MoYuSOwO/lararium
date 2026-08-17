@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     state        TEXT NOT NULL DEFAULT 'pending',
     error        TEXT,
     claimed_at   TEXT,
-    completed_at TEXT
+    completed_at TEXT,
+    attempts     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_state ON inbox(state, ts);
 """

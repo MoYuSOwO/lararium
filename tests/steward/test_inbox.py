@@ -68,3 +68,37 @@ def test_meta_roundtrips_as_json(inbox):
     )
     inbox.put(env)
     assert inbox.claim_next().meta == {"event": "unusual_expense", "amount": 3000}
+
+
+def test_recover_stale_requeues_interrupted_envelope(tmp_path):
+    """进程崩在处理途中,重启后队列不能永久卡死。"""
+    db = tmp_path / "steward.sqlite"
+    before_crash = Inbox(connect(db))
+    env = Envelope.new(source="user", channel="cli", content="崩之前这条")
+    before_crash.put(env)
+    before_crash.claim_next()  # 认领后"崩溃",既没 complete 也没 fail
+
+    restarted = Inbox(connect(db))
+    assert restarted.claim_next() is None  # 遗留的 processing 把队列堵死了
+    assert restarted.recover_stale() == (1, 0)
+    claimed = restarted.claim_next()
+    assert claimed is not None and claimed.id == env.id
+
+
+def test_recover_stale_abandons_poison_message(inbox):
+    """反复崩在同一条消息上就别再重试了,否则每次启动都崩一次。"""
+    env = Envelope.new(source="user", channel="cli", content="毒消息")
+    inbox.put(env)
+
+    inbox.claim_next()
+    assert inbox.recover_stale(max_attempts=2) == (1, 0)  # 第一次崩:重排队
+    inbox.claim_next()
+    assert inbox.recover_stale(max_attempts=2) == (0, 1)  # 第二次崩:放弃
+    assert inbox.claim_next() is None
+    assert inbox.pending_count() == 0
+
+
+def test_recover_stale_is_noop_on_clean_start(inbox):
+    inbox.put(Envelope.new(source="user", channel="cli", content="正常的"))
+    assert inbox.recover_stale() == (0, 0)
+    assert inbox.claim_next() is not None
