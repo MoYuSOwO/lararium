@@ -49,7 +49,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
 | 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
-| 10 | 模型客户端与缓存指标 | 未开始 | | | |
+| 10 | 模型客户端与缓存指标 | **待验收** | | | 2026-08-17 |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
 | 12 | 端到端验收 | 未开始 | | | |
 
@@ -1043,6 +1043,54 @@ tests/steward/test_assembler.py::test_envelope_timestamp_follows_configured_time
 ```
 
 门禁四关全绿(87 passed, 0 skipped)。CHANGELOG Task 9 条目已追加。偏离:ruff format 将 `build()` 的函数签名拆成每行一个参数(行宽超限),纯格式。loop.py 的调用点同步在 Task 11 的计划里已写好,届时照做。
+
+---
+
+### Task 10:模型客户端与缓存指标
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_model.py -v
+...
+tests/steward/test_model.py:3: in <module>
+    from lararium.steward.model import ModelReply, extract_cache_hit_tokens, format_cache_log
+E   ModuleNotFoundError: No module named 'lararium.steward.model'
+ERROR tests/steward/test_model.py
+=============================== 1 error in 0.07s ===============================
+```
+
+测试输出(Step 4 确认通过):
+```
+$ uv run pytest tests/steward/test_model.py -v
+...
+tests/steward/test_model.py::test_extract_cache_hit_from_deepseek_field PASSED [ 20%]
+tests/steward/test_model.py::test_extract_cache_hit_from_openai_style_field PASSED [ 40%]
+tests/steward/test_model.py::test_extract_cache_hit_returns_none_when_absent PASSED [ 60%]
+tests/steward/test_model.py::test_format_cache_log_reports_hit_rate PASSED [ 80%]
+tests/steward/test_model.py::test_format_cache_log_handles_unknown_cache_stats PASSED [100%]
+============================== 5 passed in 0.05s ===============================
+```
+
+Step 5 对着 pydantic-ai 2.31.0 核对 API(实测签名/源码),与计划的出入:
+
+1. **`OpenAIModel` 已改名 `OpenAIChatModel`**(`pydantic_ai.models.openai`),构造函数签名
+   `OpenAIChatModel(model_name, provider, settings)` 与计划一致。
+2. **`AgentRunResult.usage` 是 property 不是方法**:源码里 `@property def usage(self) -> RunUsage`。
+   计划写 `result.usage()` 会在运行时抛 `TypeError: 'RunUsage' object is not callable`,已改为 `result.usage`。
+3. **`_CACHE_HIT_KEYS` 增加 `cache_read_tokens`**:pydantic_ai 的 `RunUsage` 缓存命中 token
+   是顶层字段 `cache_read_tokens`,不在计划探测列表里。不加的话真实运行缓存命中恒为 None,
+   `format_cache_log` 永远打「未知」,Task 12 的「第二轮起 cache 命中 > 0」验收必挂。
+   DeepSeek 兼容层的 `details.prompt_cache_hit_tokens` 路径保留。
+4. **`history` 加显式 union 标注**:mypy 把空列表推断为 `list[ModelRequest]`,追加 `ModelResponse` 报
+   `arg-type`。改为 `history: list[ModelRequest | ModelResponse] = []`。
+5. 其余全对:Agent 的 `toolsets=` 参数、`result.output`、`result.new_messages()`、
+   `part.part_kind` / `part.tool_name` / `part.args` / `part.content` 均按计划原样可用。
+6. 实测两种 usage 形状都能提取:RunUsage 顶层 `cache_read_tokens` → 1200;
+   DeepSeek `details.prompt_cache_hit_tokens` → 500;无缓存字段 → None。
+
+门禁四关全绿(92 passed, 0 skipped;mypy 17 files)。W292 缺结尾换行与 ruff format 重排为纯修正。
 
 ---
 
