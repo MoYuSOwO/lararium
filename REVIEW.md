@@ -44,7 +44,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
-| 5 | 门控状态机 | 未开始 | | | |
+| 5 | 门控状态机 | 待验收 | | | |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
 | 8 | 内置工具三件 | 未开始 | | | |
@@ -470,6 +470,53 @@ tests/bundles/test_ledger.py::test_read_raises_loudly_when_file_is_missing PASSE
 ```
 
 门禁四关全绿(32 passed, 1 skipped)。架构测试 `test_only_the_ledger_module_writes_files` 仍过——`ensure_initialized` 走 `write()`,没有新增写文件点。CHANGELOG Task 4 条目已追加。无偏离。
+
+---
+
+### Task 5:门控状态机
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/bundles/test_gate.py -v
+...
+tests/bundles/test_gate.py:4: in <module>
+    from bundles.memory.gate import Gate
+E   ModuleNotFoundError: No module named 'bundles.memory.gate'
+ERROR tests/bundles/test_gate.py
+=============================== 1 error in 0.05s ===============================
+```
+
+测试输出(Step 5 确认通过):
+```
+$ uv run pytest tests/bundles/test_gate.py -v
+...
+tests/bundles/test_gate.py::test_user_stated_proposal_passes_immediately PASSED [  8%]
+tests/bundles/test_gate.py::test_untrusted_proposal_waits_for_approval PASSED [ 16%]
+tests/bundles/test_gate.py::test_untrusted_proposal_never_reaches_ledger_before_approval PASSED [ 25%]
+tests/bundles/test_gate.py::test_resolve_approve_then_settle_writes_ledger PASSED [ 33%]
+tests/bundles/test_gate.py::test_resolve_reject_drops_proposal PASSED    [ 41%]
+tests/bundles/test_gate.py::test_settle_is_batched_into_single_snapshot PASSED [ 50%]
+tests/bundles/test_gate.py::test_settle_is_idempotent PASSED             [ 58%]
+tests/bundles/test_gate.py::test_add_goes_under_requested_section PASSED [ 66%]
+tests/bundles/test_gate.py::test_amend_replaces_matched_text PASSED      [ 75%]
+tests/bundles/test_gate.py::test_retire_removes_matched_line PASSED      [ 83%]
+tests/bundles/test_gate.py::test_stale_amend_is_dropped_without_blocking_batch PASSED [ 91%]
+tests/bundles/test_gate.py::test_settle_captures_manual_edit_first PASSED [100%]
+============================== 12 passed in 0.04s ===============================
+```
+
+与计划的偏离:
+- **`gate.py` `unsettled_count` 的 `fetchone()[0]` 类型(计划代码错,与前序任务同类)**:typeshed 标 `int|None`,
+  mypy 严格档 `warn_return_any` 拦截。用 `int(...)` 包一层。
+- **`datetime.UTC` 替代 `timezone.utc`(工具为准)**:ruff UP017,与前序任务同类。
+- **`gate.py` / `test_gate.py` 多参数 keyword 调用被 ruff format 拆成每行一个**:100 字符行宽下超长,
+  纯格式,无逻辑变化。
+
+**验收结论**(Claude 填)
+
+(待验收)
 
 ---
 
