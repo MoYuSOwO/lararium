@@ -14,6 +14,7 @@
 - 设计文档 v2.0:单 agent + plugin bundle 架构([DESIGN.md](DESIGN.md))
 - M1 实施计划,12 个任务([PLAN.md](PLAN.md))
 - 工程门禁四关:ruff(含 DTZ 时区规则)、mypy(分层严格)、import-linter(架构边界)、pytest(项目不变量)。提交时自动执行,三条违规已实测能拦住
+- 开发规范条文([CONVENTIONS.md](CONVENTIONS.md)):36 条分七组,管机器判不了的判断题;评审按编号引用
 
 <!--
 每个任务验收通过后按下面的样子追加,示例:
