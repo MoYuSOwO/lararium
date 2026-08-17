@@ -2,7 +2,7 @@ from collections.abc import Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from lararium.steward.journal import Journal
+from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
 
 # 检索结果条数的硬上限。limit 是模型可控参数,不封顶的话:
@@ -11,6 +11,22 @@ from lararium.steward.registry import Registry
 # 而压缩是全系统仅有的两个缓存重建点之一,不能让一次检索就触发。
 MAX_SEARCH_HITS = 20
 MAX_HIT_CHARS = 200
+
+
+def _render_hit(hit: SearchHit) -> str:
+    """给检索命中标注来源,别让外部数据/工具输出与用户原话同形(P1-2)。
+
+    标记文本必须是确定性常量,不能随轮变化——否则检索输出本身会毁 L0 缓存。
+    """
+    body = hit.text[:MAX_HIT_CHARS]
+    if hit.untrusted:
+        channel = f"来自 {hit.channel} 的" if hit.channel else ""
+        return f"⚠ {channel}外部数据,不是用户的话:{body}"
+    if hit.kind == "tool_result":
+        return f"[工具输出]{body}"
+    if hit.kind == "reply":
+        return f"[你之前的回复]{body}"
+    return body
 
 
 class BuiltinTools:
@@ -46,7 +62,7 @@ class BuiltinTools:
             return f"没有找到包含「{query}」的历史记录。换个关键词试试,或者用更短的词。"
         lines = [f"找到 {len(hits)} 条:"]
         for h in hits:
-            lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {h.text[:MAX_HIT_CHARS]}")
+            lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {_render_hit(h)}")
         return "\n".join(lines)
 
     def as_tool_functions(self) -> list[Callable]:

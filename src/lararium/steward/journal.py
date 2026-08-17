@@ -13,6 +13,9 @@ class SearchHit:
     kind: str
     text: str
     ts: str
+    source: str | None = None
+    channel: str = ""
+    untrusted: bool = False
 
 
 def _searchable_text(payload: dict[str, Any]) -> str:
@@ -67,7 +70,10 @@ class Journal:
         if len(query) >= 3:
             escaped = query.replace('"', '""')
             rows = self._conn.execute(
-                "SELECT j.envelope_id, j.kind, f.text, j.ts "
+                "SELECT j.envelope_id, j.kind, f.text, j.ts, "
+                "json_extract(j.payload, '$.source') AS source, "
+                "json_extract(j.payload, '$.channel') AS channel, "
+                "json_extract(j.payload, '$.meta.untrusted') AS untrusted "
                 "FROM journal_fts f JOIN journal j ON j.seq = f.seq "
                 "WHERE journal_fts MATCH ? ORDER BY j.seq DESC LIMIT ?",
                 (f'"{escaped}"', limit),
@@ -77,11 +83,26 @@ class Journal:
             for ch in ("\\", "%", "_"):
                 escaped = escaped.replace(ch, "\\" + ch)
             rows = self._conn.execute(
-                "SELECT envelope_id, kind, search_text AS text, ts FROM journal "
+                "SELECT envelope_id, kind, search_text AS text, ts, "
+                "json_extract(payload, '$.source') AS source, "
+                "json_extract(payload, '$.channel') AS channel, "
+                "json_extract(payload, '$.meta.untrusted') AS untrusted "
+                "FROM journal "
                 "WHERE search_text LIKE ? ESCAPE '\\' ORDER BY seq DESC LIMIT ?",
                 (f"%{escaped}%", limit),
             ).fetchall()
-        return [SearchHit(r["envelope_id"], r["kind"], r["text"], r["ts"]) for r in rows]
+        return [
+            SearchHit(
+                r["envelope_id"],
+                r["kind"],
+                r["text"],
+                r["ts"],
+                source=r["source"],
+                channel=r["channel"] or "",
+                untrusted=bool(r["untrusted"]),
+            )
+            for r in rows
+        ]
 
     def recent_turns(self, limit: int) -> list[dict[str, Any]]:
         """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。
