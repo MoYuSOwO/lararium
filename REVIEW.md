@@ -41,7 +41,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | # | 任务 | 状态 | 验收人结论 | CHANGELOG | 日期 |
 |---|---|---|---|---|---|
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
-| 2 | 信封模型与收件箱 | 未开始 | | | |
+| 2 | 信封模型与收件箱 | 待验收 | | | |
 | 3 | 起居注与中文检索 | 未开始 | | | |
 | 4 | 账本文件与快照表 | 未开始 | | | |
 | 5 | 门控状态机 | 未开始 | | | |
@@ -172,6 +172,56 @@ tests/test_config.py::test_load_rejects_missing_api_key PASSED           [100%]
 
 门禁四关全绿(9 files formatted / mypy 6 files / 3 kept 0 broken / 5 passed 1 skipped)。
 单独 commit:`test: 隔离宿主环境变量,堵住 source .env 后测试串读的坑`。CHANGELOG M1 条目已追加。
+
+---
+
+### Task 2:信封模型与收件箱
+
+**执行记录**(程序员填)
+
+测试输出(Step 2 确认失败):
+```
+$ uv run pytest tests/steward/test_inbox.py -v
+...
+tests/steward/test_inbox.py:5: in <module>
+    from lararium.db import connect
+E   ModuleNotFoundError: No module named 'lararium.db'
+ERROR tests/steward/test_inbox.py
+=============================== 1 error in 0.07s ===============================
+```
+
+测试输出(Step 6 确认通过):
+```
+$ uv run pytest tests/steward/test_inbox.py -v
+...
+tests/steward/test_inbox.py::test_put_then_claim_returns_same_envelope PASSED [ 16%]
+tests/steward/test_inbox.py::test_claim_is_strictly_serial PASSED        [ 33%]
+tests/steward/test_inbox.py::test_claim_order_is_oldest_first PASSED     [ 50%]
+tests/steward/test_inbox.py::test_claim_returns_none_when_empty PASSED   [ 66%]
+tests/steward/test_inbox.py::test_fail_marks_envelope_and_unblocks_queue PASSED [ 83%]
+tests/steward/test_inbox.py::test_meta_roundtrips_as_json PASSED         [100%]
+============================== 6 passed in 0.07s ===============================
+```
+
+与计划的偏离:
+- **`src/lararium/db.py` 索引定义 bug(计划代码错)**:计划原文 `CREATE INDEX ... ON inbox(state, ts, rowid)`
+  在 SQLite 里报 `no such column: rowid`——隐式 `rowid` 是 b-tree 主键,不能被单独建索引。
+  实测确认:`CREATE INDEX ON t(rowid)` 失败,但查询里 `ORDER BY ts, rowid` 正常(rowid 在 rowid 表里
+  永远可引用,且随插入单调递增)。修复:索引改为 `ON inbox(state, ts)`;`inbox.py` 查询里的
+  `ORDER BY ts, rowid` 保留不动——稳定 tie-break 的意图不变,只是 tie-break 不被索引覆盖,
+  个人收件箱全表扫描完全可接受。
+- **`src/lararium/steward/inbox.py` `pending_count` 类型(计划代码错)**:`fetchone()[0]` 在 typeshed
+  里返回 `Any`(sqlite3.Row.__getitem__ → Any),严格档 `warn_return_any` 拦截了 `-> int` 的返回。
+  修复:用 `int(...)` 包一层,最小改动。
+- **`datetime.UTC` 替代 `timezone.utc`(工具为准)**:ruff UP017(pyupgrade)要求 py311+ 用 `datetime.UTC`。
+  计划原文用 `timezone.utc`,envelope.py / inbox.py / test_inbox.py 三处已按 ruff 自动修为 `UTC`。
+  与 Task 1 同类冲突,按既定惯例以工具为准。
+- `tests/steward/test_inbox.py` 一处注释对齐空格被 ruff format 去掉(`is None      # ...` → 单空格),
+  与 Task 1 同类,已修正。
+
+**验收结论**(Claude 填)
+
+(待验收)
 
 ---
 
