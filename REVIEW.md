@@ -42,7 +42,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 |---|---|---|---|---|---|
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
-| 3 | 起居注与中文检索 | 待验收 | | | |
+| 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☐ | 2026-08-17 |
 | 4 | 账本文件与快照表 | 未开始 | | | |
 | 5 | 门控状态机 | 未开始 | | | |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
@@ -327,6 +327,40 @@ tests/steward/test_journal.py::test_recent_turns_returns_newest_last PASSED [100
 - **`recent_turns` 一行长生成器被 ruff format 拆多行**:纯格式,无逻辑变化。
 
 **验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(10 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(23 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_journal.py` 9 passed,含两条中文检索关键测试。
+- 规范核对(CONVENTIONS.md):**无违反**。`SearchHit` 是有名字的 frozen dataclass 而非裸元组(F1);
+  `_searchable_text` 用下划线标出内部性(S3);`search` 只读、`append` 只写,职责分明(F4);
+  `search` 的 docstring 说清了两条路径的分界理由(G1 写为什么)。
+- 契约核对:`Journal` 四个方法、`SearchHit` 四个字段、`SEARCHABLE_KINDS` 均与计划一致。
+- 不变量核对:**可见即入账**的地基在此。`replay` 按 `seq` 排序且逐字返回落账内容,
+  `test_replay_is_byte_identical_across_calls` 守住了幂等性。前缀/账本两条本任务不涉及。
+- 抑制与分档:一处 `assert cur.lastrowid is not None` 带理由注释,范围最小,可接受;
+  无 noqa / type: ignore;`pyproject.toml` 未动。
+
+**三条偏离全部成立**,`lastrowid` 那条又是计划的真 bug(typeshed 标 `int | None`,
+严格档拦得对),用 assert 收窄并注明理由是最小改动。
+
+**额外做了两轮对抗测试,结果都好:**
+
+1. **特殊字符不炸**。模型传进来的查询词不会规矩,而 FTS5 有自己的查询语法。
+   实测 14 个刁钻查询(`C++`、`AI/ML`、`「明天见」`、`say "hi"`、`NOT 日料`、`*`、`^abc`、
+   `100%`、`a_b`)全部正常返回,无一例 `sqlite3.OperationalError`。
+   引号转义与 LIKE 的 `ESCAPE` 都正确;FTS5 的 `NOT`/`OR` 被当字面量处理,
+   这对"检索聊天内容"的用途是正确行为。
+2. **`recent_turns` 对进行中的轮次行为正确**。当前轮 envelope 已落账但还没 reply 时,
+   返回 `assistant=None`,交给 Task 9 的组装器跳过——两边契约对得上:
+
+```
+limit=3 : [('问2', '答2'), ('问3', '答3'), ('正在处理的这句', None)]
+```
+
+注意由此产生的既定行为:`recent_turns(N)` 在处理途中实际只给出 N-1 轮完整历史。
+这是计划里就说明过的,不是缺陷。
+
+**结论:通过**(无补做项,直接开始 Task 4)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 (待验收)
 
