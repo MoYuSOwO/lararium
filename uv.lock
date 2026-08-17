@@ -1134,6 +1134,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx" },
     { name = "import-linter" },
     { name = "mypy" },
     { name = "pre-commit" },
@@ -1153,6 +1154,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "import-linter", specifier = ">=2.0" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "pre-commit", specifier = ">=3.8" },

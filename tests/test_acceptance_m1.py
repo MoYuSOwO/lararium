@@ -156,23 +156,41 @@ async def test_acceptance_untrusted_content_cannot_reach_ledger(system):
 
 
 async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(system, monkeypatch):
-    """验收①的报文级复核:落盘的事实必须真的出现在下一轮**发出去的报文**里。
+    """验收①的报文级复核:落盘的事实必须真的出现在下一轮**发出去(HTTP body)**的报文里。
 
     组装器层面的断言不算——P0-1 正是"组装器对了但没发出去"。
+    甚至 FunctionModel 也不算——它停在序列化之前,OpenAI 适配器不在链路上。
+    这里用 MockTransport 抓业务真正交给 HTTP 层的 body。
     """
-    from pydantic_ai.messages import ModelResponse, TextPart
-    from pydantic_ai.models.function import FunctionModel
+    import json
 
-    from lararium.steward.model import PydanticAIClient
+    import httpx
+    from conftest import build_http_spy_client
 
-    captured: list[list] = []
+    bodies: list[dict] = []
 
-    def spy(messages, info):
-        captured.append(messages)
-        return ModelResponse(parts=[TextPart("知道了")])
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "知道了"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            },
+        )
 
     steward, _ = system([])
-    steward.model = PydanticAIClient(steward.settings, model=FunctionModel(spy))
+    steward.model = build_http_spy_client(handler)
 
     steward.gate.propose(
         kind="add",
@@ -188,11 +206,6 @@ async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(system
     steward.submit(Envelope.new(source="user", channel="cli", content="晚上吃芒果糯米饭?"))
     await steward.process_next()
 
-    system_parts = [
-        str(p.content)
-        for m in captured[-1]
-        for p in m.parts
-        if getattr(p, "part_kind", "") == "system-prompt"
-    ]
-    assert len(system_parts) == 1
-    assert "对芒果过敏" in system_parts[0], "账本没进第二轮的报文,模型是失忆状态"
+    first = bodies[-1]["messages"][0]
+    assert first["role"] == "system", "报文第一条必须是 system(前缀)"
+    assert "对芒果过敏" in first["content"], "账本没进第二轮的报文,模型是失忆状态"

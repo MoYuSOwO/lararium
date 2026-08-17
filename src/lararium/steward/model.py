@@ -95,6 +95,8 @@ class PydanticAIClient:
         # pydantic-ai 不再注入它(2.31.0 实测),第二轮起人格/目录/账本会整个消失。
         # 唯一可靠的做法是把前缀作为 SystemPromptPart 放进历史首条 ModelRequest。
         # 首轮历史为空时也照此构造——只有一条路径,才不会有一条悄悄退化。
+        # 等价写法是 Agent(instructions=...):它是 pydantic-ai 为"每轮重新应用、不进历史"
+        # 这个语义加的参数,HTTP body 逐字节相同(实测)。哪天升级后本写法失效,那是退路。
         agent = Agent(self._model, tools=tools, toolsets=mcp_servers)
 
         history: list[ModelRequest | ModelResponse] = []
