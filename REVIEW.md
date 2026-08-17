@@ -51,7 +51,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | **通过** | 四条 API 修正均属实;run() 全路径已验证,无补做 | ☑ | 2026-08-17 |
 | 11 | 一轮的编排与 CLI | **通过** | 边界与接线全对;CLI 健壮性补做 | ☑ | 2026-08-17 |
-| 12 | 端到端验收 | **通过** | 四条验收标准全达成;缓存日志标注补做 | ☐ | 2026-08-17 |
+| 12 | 端到端验收 | **通过** | 四条验收标准全达成;缓存日志标注补做 | ☑ | 2026-08-17 |
 
 状态取值:未开始 / 进行中 / 待验收 / **通过** / 打回
 
@@ -1472,3 +1472,14 @@ MCP 真实表面、UTC 服务器、模型可控参数给极端值、打错命令
 
 M2 起建议保留这个习惯:每个任务除了跑测试,再问一句「这东西在真实环境里
 会怎么坏」,然后动手试。
+
+**补完记录**(程序员填,commit 41e1f41)
+
+按 Task 12 补做 Step 6–9,缓存日志标注请求数:
+
+- `ModelReply` 加 `requests: int | None = None` 字段,注释说明 token 数字是**整轮累加**的(每调一次工具多一次请求),看到「N 请求」就知道百分比被工具往返稀释过
+- `format_cache_log` 输出改「本轮命中」并追加请求数:`[cache] 本轮命中 1344/2497 (53.8%) · completion=207 · 2 请求`
+- `PydanticAIClient.run` 填充 `requests=getattr(usage, "requests", None)`
+- 测试 `test_format_cache_log_shows_request_count`(6 passed)
+
+门禁四关全绿(**106 passed**, 0 skipped)。偏离:ruff format 将 `ModelReply` 构造与多行 return 重排,纯格式。
