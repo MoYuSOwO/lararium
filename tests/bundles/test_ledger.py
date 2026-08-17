@@ -12,10 +12,30 @@ def ledger(tmp_path):
     return Ledger(tmp_path / "ledger.md", conn)
 
 
-def test_read_creates_file_with_sections(ledger):
+def test_ensure_initialized_creates_file_with_sections(ledger):
+    assert ledger.ensure_initialized() is True
     content = ledger.read()
     for section in LEDGER_SECTIONS:
         assert f"## {section}" in content
+    assert ledger.history()[0].source == "init"
+
+
+def test_ensure_initialized_is_noop_when_file_exists(ledger):
+    ledger.ensure_initialized()
+    assert ledger.ensure_initialized() is False
+    assert len(ledger.history()) == 1
+
+
+def test_read_raises_loudly_when_file_is_missing(ledger):
+    """账本丢了必须炸出来。悄悄返回空账本 = 助手静默失忆,没人会发现。"""
+    ledger.ensure_initialized()
+    ledger.write("## 身份\n- 对芒果过敏\n", source="approval_batch", proposal_ids=["p1"])
+    ledger.path.unlink()
+
+    with pytest.raises(FileNotFoundError, match="rollback"):
+        ledger.read()
+    # 历史仍在,可恢复
+    assert "对芒果过敏" in ledger.history()[0].content
 
 
 def test_write_persists_and_snapshots(ledger):

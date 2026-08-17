@@ -47,10 +47,21 @@ class Ledger:
         self._conn = conn
 
     def read(self) -> str:
+        """纯读。文件不存在是异常状态,必须响亮地报错——组装器每轮都调它,
+        悄悄返回一份空账本 = 助手静默失忆,而用户只会觉得"它怎么全忘了"。"""
         if not self.path.exists():
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(_blank_ledger(), encoding="utf-8")
+            raise FileNotFoundError(
+                f"账本文件不存在:{self.path}。正常启动时应已由 ensure_initialized() 建好。"
+                f"若是误删,历史快照仍在库里,可用 history() 找到最近一条再 rollback() 恢复。"
+            )
         return self.path.read_text(encoding="utf-8")
+
+    def ensure_initialized(self) -> bool:
+        """账本不存在就建一份空的并落 init 快照。只在启动时调用,返回是否新建了。"""
+        if self.path.exists():
+            return False
+        self.write(_blank_ledger(), source="init", proposal_ids=[])
+        return True
 
     def snapshot(self, content: str, source: str, proposal_ids: list[str]) -> int:
         cur = self._conn.execute(
