@@ -149,7 +149,13 @@ class Gate:
                     self._mark_stale(p.id)
             elif p.kind == "retire":
                 if p.old_text and p.old_text in content:
-                    content = "\n".join(ln for ln in content.split("\n") if p.old_text not in ln)
+                    # 只删第一处匹配行,与 amend 的 replace(..., 1) 语义一致。
+                    # 删掉所有匹配行的话,一个偏粗的 old_text(模型凭印象写"望京"
+                    # 而不是整行)会把"住在望京""公司在望京""喜欢望京的烤鸭"一起抹掉。
+                    lines = content.split("\n")
+                    hit = next(i for i, ln in enumerate(lines) if p.old_text in ln)
+                    del lines[hit]
+                    content = "\n".join(lines)
                     applied.append(p.id)
                 else:
                     self._mark_stale(p.id)

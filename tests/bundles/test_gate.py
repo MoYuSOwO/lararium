@@ -168,6 +168,31 @@ def test_retire_removes_matched_line(gate):
     assert "在备考雅思" not in gate.ledger.read()
 
 
+def test_retire_removes_only_the_first_match(gate):
+    """old_text 给粗了不能连坐。amend 用 replace(..., 1),retire 也必须只动一行。"""
+    for fact in ("住在望京", "公司在望京", "喜欢望京的烤鸭"):
+        gate.propose(
+            kind="add",
+            content=fact,
+            provenance="user_stated",
+            origin="env-1",
+            section="身份",
+        )
+    gate.settle()
+
+    gate.propose(
+        kind="retire",
+        content="",
+        old_text="望京",
+        provenance="user_stated",
+        origin="env-2",
+    )
+    gate.settle()
+
+    remaining = [ln for ln in gate.ledger.read().split("\n") if ln.startswith("- ")]
+    assert remaining == ["- 公司在望京", "- 喜欢望京的烤鸭"]
+
+
 def test_stale_amend_is_dropped_without_blocking_batch(gate):
     """账本被手编过导致提案过期:打回该条,不影响同批其他条。"""
     gate.propose(
