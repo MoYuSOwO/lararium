@@ -14,6 +14,7 @@ from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.model import PydanticAIClient
+from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
 
 HELP = """可用命令(这些都不经过模型,是你直接对系统说话):
@@ -101,6 +102,7 @@ def build_steward(settings: Settings, ledger: Ledger, gate: Gate) -> Steward:
         gate=gate,
         model=PydanticAIClient(settings),
         persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
+        outbox=Outbox(conn),
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
         bundle_tools=memory_tool_functions(gate),
     )

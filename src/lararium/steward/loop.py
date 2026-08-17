@@ -8,6 +8,7 @@ from lararium.steward.assembler import Turn, assemble
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.model import ModelClient, format_cache_log
+from lararium.steward.outbox import Outbox
 from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
 from lararium.steward.tools import BuiltinTools
@@ -27,6 +28,7 @@ class Steward:
         gate: GatePort,
         model: ModelClient,
         persona: str,
+        outbox: Outbox,
         bundle_tools: list[Callable] | None = None,
         mcp_servers: list[Any] | None = None,
     ) -> None:
@@ -38,6 +40,7 @@ class Steward:
         self.gate = gate
         self.model = model
         self.persona = persona
+        self.outbox = outbox
         self.bundle_tools = bundle_tools or []
         self.mcp_servers = mcp_servers or []
         self.tools = BuiltinTools(journal, registry, settings.timezone)
@@ -106,6 +109,9 @@ class Steward:
                 },
             )
             logger.info(format_cache_log(reply))
+            # 崩溃语义:回复先落出件箱,信封才算完成。中间崩了,重启后 recover_stale
+            # 重排队、重算一轮(多花一次 API 钱),但绝不静默吞回复——用户至少收到一次。
+            self.outbox.put(env.id, env.channel, reply.text, kind="reply")
             self.inbox.complete(env.id)
             return reply.text
 

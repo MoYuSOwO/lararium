@@ -12,6 +12,7 @@ from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.model import ModelReply
+from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
 
 
@@ -46,6 +47,7 @@ def system(tmp_path, monkeypatch):
             gate=gate,
             model=model,
             persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
+            outbox=Outbox(conn),
             bundle_tools=memory_tool_functions(gate),
         )
         return steward, model

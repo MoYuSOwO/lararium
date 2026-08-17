@@ -27,6 +27,17 @@ CREATE TABLE IF NOT EXISTS journal (
 );
 CREATE INDEX IF NOT EXISTS idx_journal_envelope ON journal(envelope_id, seq);
 
+CREATE TABLE IF NOT EXISTS outbox (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    envelope_id  TEXT NOT NULL,
+    channel      TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'reply',   -- reply | notice
+    content      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_channel ON outbox(channel, seq);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS journal_fts USING fts5(
     text,
     seq UNINDEXED,

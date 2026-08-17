@@ -8,6 +8,7 @@ from lararium.db import connect
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
+from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
 
 
@@ -32,6 +33,7 @@ def system(tmp_path, monkeypatch):
         gate=gate,
         model=_StubModel(),
         persona="P",
+        outbox=Outbox(conn),
     )
     return steward, ledger, gate
 

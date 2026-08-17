@@ -11,6 +11,7 @@ from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.model import ModelReply
+from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
 
 
@@ -46,6 +47,7 @@ def steward_factory(tmp_path, monkeypatch):
             gate=gate,
             model=model,
             persona="你是 Lararium。",
+            outbox=Outbox(conn),
             bundle_tools=memory_tool_functions(gate),
         )
         return steward, model
@@ -176,3 +178,20 @@ async def test_model_failure_logs_error_and_does_not_wedge_the_queue(steward_fac
     steward.submit(Envelope.new(source="user", channel="cli", content="下一条"))
     claimed = steward.inbox.claim_next()
     assert claimed is not None and claimed.content == "下一条"
+
+
+async def test_reply_lands_in_outbox_before_envelope_completes(steward_factory):
+    """崩溃语义:回复先落出件箱,信封才算完成——中间崩了重启重算,但不静默吞回复。"""
+    steward, _ = steward_factory([ModelReply(text="这是回复")])
+    env = Envelope.new(source="user", channel="cli", content="你好")
+    steward.submit(env)
+    await steward.process_next()
+
+    items = steward.outbox.take(env.channel, after=0)
+    assert len(items) == 1
+    assert items[0].kind == "reply"
+    assert items[0].envelope_id == env.id
+    assert items[0].content == "这是回复"
+    # 信封已标记完成(complete 在 put 之后)
+    row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    assert row["state"] == "done"
