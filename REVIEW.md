@@ -49,7 +49,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
 | 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
-| 10 | 模型客户端与缓存指标 | **待验收** | | | 2026-08-17 |
+| 10 | 模型客户端与缓存指标 | **通过** | 四条 API 修正均属实;run() 全路径已验证,无补做 | ☐ | 2026-08-17 |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
 | 12 | 端到端验收 | 未开始 | | | |
 
@@ -1089,6 +1089,70 @@ Step 5 对着 pydantic-ai 2.31.0 核对 API(实测签名/源码),与计划的出
    `part.part_kind` / `part.tool_name` / `part.args` / `part.content` 均按计划原样可用。
 6. 实测两种 usage 形状都能提取:RunUsage 顶层 `cache_read_tokens` → 1200;
    DeepSeek `details.prompt_cache_hit_tokens` → 500;无缓存字段 → None。
+
+**验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(17 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(92 passed, 0 skipped)
+- 重跑结果:独立重跑全绿。`test_model.py` 5 passed。
+- 规范核对(CONVENTIONS.md):**无违反**。`ModelClient` 是 Protocol、`ModelReply` 是
+  frozen dataclass(F1);**D2 落实得干净**——`pydantic_ai` 的 import 全部关在
+  `PydanticAIClient` 内部,连模块顶层都没有,库升级的爆炸半径就是这一个类。
+- 契约核对:`ModelReply` 五字段、`ModelClient.run` 签名、`extract_cache_hit_tokens`、
+  `format_cache_log` 与计划完全一致。**协议与测试一行未改,只动了适配器**——
+  隔离盒的意义正在于此,这一点做对了。
+- 不变量核对:三条本任务均不直接涉及;但缓存可观测性是「前缀稳定」的度量手段,见下。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动(`model.py` 本就在宽松档)。
+
+**四条 API 修正我逐条独立核对,全部属实**:
+
+```
+pydantic-ai: 2.31.0
+OpenAIChatModel 存在: True | OpenAIModel 存在: False
+AgentRunResult.usage 是 property: True
+RunUsage 有 cache_read_tokens: True
+Agent 接受 toolsets: True
+```
+
+`OpenAIModel` 确实已不存在——计划会在 import 处直接崩。`result.usage()` 会抛
+`TypeError: 'RunUsage' object is not callable`。这两条都是真 bug。
+
+**第 3 条(`cache_read_tokens`)的价值最高**:不加它,真实运行时缓存命中恒为 `None`,
+`format_cache_log` 永远打「未知」,而 Task 12 的验收标准「第二轮起 cache 命中 > 0」
+必挂——到那时排查方向会跑偏到"是不是前缀不稳定",实际只是指标读错了字段。
+**你自己把这条和验收标准联系起来了,这正是我期待的判断力。**
+
+**额外验证:`run()` 全路径已跑通(单元测试完全没覆盖这段)**
+
+5 个单元测试只测了两个纯函数,`run()` 里的历史构造、tool 事件提取、输出解包
+都没人跑过。我用 pydantic-ai 自带的 `TestModel` 走了一遍完整 agent 循环,无需 API key:
+
+```
+✓ run() 跑通,没有抛异常
+  回复文本 : success (no tool calls)
+  token    : prompt=56 completion=5 cache_hit=0     ← 0 而非 None,说明字段探测生效
+  日志行   : [cache] 命中 0/56 (0.0%) · completion=5
+```
+
+再强制调用工具,验证最脆的那段(靠 `part_kind` 字符串匹配):
+
+```
+  tool_call    current_time     None
+  tool_call    search_history   {'query': 'a'}
+  tool_result  current_time     2026-08-17T20:00:00+08:00 星期一
+  tool_result  search_history   找到 1 条:关于a
+  调用与结果都提取到了吗?✓ 是
+```
+
+这段直接决定「可见即入账」能不能成立——工具事件漏提取的话,起居注就重建不出完整一轮。
+
+**给 Task 12 的前瞻提醒(不是本任务的缺陷)**
+
+冒烟时若发现第二轮 `cache 命中` 仍是 0,先别怀疑前缀不稳定——DeepSeek 的上下文缓存
+有最小块长要求,前缀太短不会被缓存。我们的前缀(人格 + 目录 + 账本)在 M1 阶段
+只有几百 token,可能不够。真遇到就先确认前缀长度,再查稳定性。
+
+**结论:通过**(无补做项,直接开始 Task 11)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 门禁四关全绿(92 passed, 0 skipped;mypy 17 files)。W292 缺结尾换行与 ruff format 重排为纯修正。
 
