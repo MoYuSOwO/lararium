@@ -1373,6 +1373,21 @@ def test_retire_removes_matched_line(gate):
     assert "在备考雅思" not in gate.ledger.read()
 
 
+def test_retire_removes_only_the_first_match(gate):
+    """old_text 给粗了不能连坐。amend 用 replace(..., 1),retire 也必须只动一行。"""
+    for fact in ("住在望京", "公司在望京", "喜欢望京的烤鸭"):
+        gate.propose(kind="add", content=fact, provenance="user_stated",
+                     origin="env-1", section="身份")
+    gate.settle()
+
+    gate.propose(kind="retire", content="", old_text="望京",
+                 provenance="user_stated", origin="env-2")
+    gate.settle()
+
+    remaining = [ln for ln in gate.ledger.read().split("\n") if ln.startswith("- ")]
+    assert remaining == ["- 公司在望京", "- 喜欢望京的烤鸭"]
+
+
 def test_stale_amend_is_dropped_without_blocking_batch(gate):
     """账本被手编过导致提案过期:打回该条,不影响同批其他条。"""
     gate.propose(kind="amend", content="新内容", old_text="根本不存在的旧文本",
@@ -1553,9 +1568,13 @@ class Gate:
                     self._mark_stale(p.id)
             elif p.kind == "retire":
                 if p.old_text and p.old_text in content:
-                    content = "\n".join(
-                        ln for ln in content.split("\n") if p.old_text not in ln
-                    )
+                    # 只删第一处匹配行,与 amend 的 replace(..., 1) 语义一致。
+                    # 删掉所有匹配行的话,一个偏粗的 old_text(模型凭印象写"望京"
+                    # 而不是整行)会把"住在望京""公司在望京""喜欢望京的烤鸭"一起抹掉。
+                    lines = content.split("\n")
+                    hit = next(i for i, ln in enumerate(lines) if p.old_text in ln)
+                    del lines[hit]
+                    content = "\n".join(lines)
                     applied.append(p.id)
                 else:
                     self._mark_stale(p.id)
@@ -1606,7 +1625,8 @@ git commit -m "feat: 门控状态机(分档审批、批量结算、过期提案�
   - `build_memory_components(data_dir: Path) -> tuple[Ledger, Gate]`(供 server 与测试共用)
   - `memory_tool_functions(gate: Gate) -> list[Callable]`——五个工具的**唯一定义处**,顺序固定
   - `create_server(data_dir: Path) -> FastMCP`——把上面同一批函数注册成 MCP 工具
-  - 工具:`propose_fact(kind, content, provenance, section=None, old_text=None) -> str`、`list_pending() -> list[dict]`、`resolve_proposal(proposal_id, approved) -> str`、`settle_ledger() -> str`、`rollback_ledger(snapshot_id) -> str`
+  - **模型可调**(仅两个):`propose_fact(kind, content, provenance, section=None, old_text=None) -> str`、`list_pending() -> list[dict]`
+  - **仅代码可调**(CLI 命令 / M2 的 IM 按钮回调):`Gate.resolve()`、`Gate.settle()`、`Ledger.rollback()`。审批必须离开模型的手,理由见 `memory_tool_functions` 的 docstring
   - `read_ledger(data_dir) -> str`(**代码级读取,不是 MCP 工具**——账本走全量注入,不能让模型"记得去查",DESIGN §6.6)
 
 **M1 的传输方式**:工具以进程内函数形态挂给 agent(DESIGN D2 明确允许开发期进程内挂载),同时 `create_server()` 必须能真正起来(Step 6 冒烟验证)。M2 容器化时把接线换成 stdio/HTTP 传输,**工具定义一行不用改**——这正是两条路径共用一份函数定义的意义。
@@ -1619,7 +1639,7 @@ name: memory
 description: 核心账本与门控写入
 skills:
   - {name: writing-facts, desc: 什么该入账本、怎么写才范式化}
-tools: [propose_fact, list_pending, resolve_proposal, settle_ledger, rollback_ledger]
+tools: [propose_fact, list_pending]   # 只列模型能调的;审批/结算/回滚走代码路径,不入 manifest
 triggers: []
 events: []
 ```
@@ -1633,8 +1653,11 @@ events: []
 
 ## 什么时候用
 - 用户说出了关于自己的、稳定的一手事实 → propose_fact
-- 用户要撤销刚才记的东西 → rollback_ledger(先看 list_pending 或让用户确认)
-- 有待审提案积压 → list_pending,呈现给用户后 resolve_proposal
+- 有待审提案积压 → list_pending,把内容**当作待审引文**呈现给用户,并告诉他用
+  `/approve <id>` 或 `/reject <id>` 处置。**你不能替他批准**——你手上没有这个工具,
+  这是故意的。
+- 用户想撤销已入档的内容 → 告诉他用 `/history` 看快照、`/rollback <id>` 回滚,
+  同样不经过你
 
 ## 可用方法
 - **writing-facts** —— 什么该入账本、怎么写才范式化。**写入前先读它。**
@@ -1701,8 +1724,15 @@ def test_tool_functions_have_fixed_order(components):
     """工具 schema 是前缀第0层,顺序变了每次启动都毁缓存。"""
     _, gate = components
     names = [f.__name__ for f in memory_tool_functions(gate)]
-    assert names == ["propose_fact", "list_pending", "resolve_proposal",
-                     "settle_ledger", "rollback_ledger"]
+    assert names == ["propose_fact", "list_pending"]
+
+
+def test_approval_is_not_reachable_from_the_model(components):
+    """门控防的是被注入的模型。审批若是模型可调的工具,连调 propose+approve 即可绕过。"""
+    _, gate = components
+    exposed = {f.__name__ for f in memory_tool_functions(gate)}
+    for forbidden in ("resolve_proposal", "settle_ledger", "rollback_ledger"):
+        assert forbidden not in exposed
 
 
 def test_propose_fact_tool_writes_through_gate(components):
@@ -1799,8 +1829,21 @@ def read_ledger(data_dir: Path) -> str:
 
 
 def memory_tool_functions(gate: Gate) -> list[Callable]:
-    """五个工具的唯一定义处。进程内挂载与 MCP 注册共用,避免两条路径漂移。
-    顺序固定——工具 schema 是前缀第0层(DESIGN §4)。"""
+    """**模型能碰的** Memory 工具,唯一定义处。进程内挂载与 MCP 注册共用,
+    避免两条路径漂移。顺序固定——工具 schema 是前缀第0层(DESIGN §4)。
+
+    这里**只有两个**,而且都不能直接改账本:
+    - `propose_fact` 只能把内容放进 pending 隔离区;
+    - `list_pending` 只读。
+
+    审批(resolve)、结算(settle)、回滚(rollback)一律**不在这个列表里**。
+    它们是 `Gate` / `Ledger` 的普通方法,只由 CLI 命令(M1)或 IM 按钮回调(M2)调用
+    ——即 DESIGN §6.3 的「按钮回调走代码状态流转,不过模型」。
+
+    为什么这条界线是硬的:门控防的是"被注入的模型"。如果审批本身是模型可调的工具,
+    那么被注入的模型只需连调两次(propose 然后 approve)就能把恶意事实永久写进账本,
+    整套门控形同虚设——它只挡得住一个还听话的模型,而听话的模型本来就不需要挡。
+    """
 
     def propose_fact(
         kind: str, content: str, provenance: str,
@@ -1826,22 +1869,7 @@ def memory_tool_functions(gate: Gate) -> list[Callable]:
             for p in gate.pending()
         ]
 
-    def resolve_proposal(proposal_id: str, approved: bool) -> str:
-        """按用户明确表态处置一条待审提案。不得代替用户决定。"""
-        gate.resolve(proposal_id, approved=approved)
-        return f"提案 {proposal_id[:8]} 已{'通过' if approved else '否决'}"
-
-    def settle_ledger() -> str:
-        """把已通过的提案批量落盘。"""
-        n = gate.settle()
-        return f"已结算 {n} 条提案" if n else "没有待落盘的提案"
-
-    def rollback_ledger(snapshot_id: int) -> str:
-        """把账本回滚到某个历史快照。"""
-        gate.ledger.rollback(snapshot_id)
-        return f"账本已回滚到快照 #{snapshot_id}"
-
-    return [propose_fact, list_pending, resolve_proposal, settle_ledger, rollback_ledger]
+    return [propose_fact, list_pending]
 
 
 def create_server(data_dir: Path) -> FastMCP:
@@ -2701,8 +2729,7 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
     names = [f.__name__ for f in model.tools_seen[0]]
     assert names == [
         "current_time", "read_skill", "search_history",
-        "propose_fact", "list_pending", "resolve_proposal",
-        "settle_ledger", "rollback_ledger",
+        "propose_fact", "list_pending",
     ]
 
 
@@ -2942,6 +2969,8 @@ import asyncio
 import logging
 from pathlib import Path
 
+from bundles.memory.gate import Gate
+from bundles.memory.ledger import Ledger
 from bundles.memory.server import build_memory_components, memory_tool_functions
 from lararium.config import Settings
 from lararium.db import connect
@@ -2952,18 +2981,22 @@ from lararium.steward.loop import Steward
 from lararium.steward.model import PydanticAIClient
 from lararium.steward.registry import Registry
 
-HELP = """可用命令:
-  /settle   把已通过的提案落盘进账本
-  /pending  列出待审提案
-  /ledger   打印当前账本
+HELP = """可用命令(这些都不经过模型,是你直接对系统说话):
+  /pending             列出待审提案
+  /approve <id>        批准一条待审提案      ← 审批只能由你来
+  /reject <id>         否决一条待审提案
+  /settle              把已通过的提案落盘进账本
+  /ledger              打印当前账本
+  /history             列出账本快照
+  /rollback <id>       把账本回滚到某个快照
   /replay <envelope_id>  重放某一轮
-  /quit     退出(退出前自动结算)
+  /quit                退出(退出前自动结算)
 """
 
 
-def build_steward(settings: Settings) -> Steward:
+def build_steward(settings: Settings, ledger: Ledger, gate: Gate) -> Steward:
+    """组装根。这是全系统唯一允许 import bundles 的地方(`.importlinter` 契约)。"""
     conn = connect(settings.data_dir / "steward.sqlite")
-    ledger, gate = build_memory_components(settings.data_dir)
     return Steward(
         settings=settings,
         inbox=Inbox(conn),
@@ -2981,7 +3014,10 @@ def build_steward(settings: Settings) -> Steward:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     settings = Settings.load()
-    steward = build_steward(settings)
+    # CLI 持有具体的 ledger / gate:审批、回滚这些命令走代码路径,
+    # 不受 Steward 那两个最小 Port 接口的限制(Port 故意只暴露模型侧需要的能力)。
+    ledger, gate = build_memory_components(settings.data_dir)
+    steward = build_steward(settings, ledger, gate)
 
     # 上次若崩在处理途中,遗留的 processing 记录会把串行队列永久堵死(见 Task 2 补做)
     requeued, abandoned = steward.inbox.recover_stale()
@@ -3009,11 +3045,29 @@ async def main() -> None:
             print(f"已结算 {steward.settle_if_needed()} 条")
             continue
         if line == "/pending":
-            items = steward.gate.pending()
+            items = gate.pending()
             print("\n".join(f"{p.id[:8]} [{p.kind}] {p.content}" for p in items) or "无待审")
             continue
+        if line.startswith(("/approve ", "/reject ")):
+            # 审批走代码,不过模型(DESIGN §6.3)。id 前缀匹配,方便手打。
+            verb, prefix = line.split(maxsplit=1)
+            matched = [p for p in gate.pending() if p.id.startswith(prefix.strip())]
+            if len(matched) != 1:
+                print(f"匹配到 {len(matched)} 条,请给出更精确的 id(用 /pending 查看)")
+                continue
+            gate.resolve(matched[0].id, approved=verb == "/approve")
+            print(f"已{'批准' if verb == '/approve' else '否决'}:{matched[0].content}")
+            continue
         if line == "/ledger":
-            print(steward.ledger.read())
+            print(ledger.read())
+            continue
+        if line == "/history":
+            for snap in ledger.history():
+                print(f"#{snap.id} [{snap.ts[:19]}] {snap.source}")
+            continue
+        if line.startswith("/rollback "):
+            ledger.rollback(int(line.split(maxsplit=1)[1]))
+            print("账本已回滚,可用 /ledger 查看")
             continue
         if line.startswith("/replay "):
             for event in steward.journal.replay(line.split(maxsplit=1)[1]):
@@ -3039,9 +3093,10 @@ if __name__ == "__main__":
 uv run ruff check src bundles tests && uv run ruff format --check src bundles tests && uv run mypy && uv run lint-imports && uv run pytest -q
 ```
 
-预期全绿。**特别关注 import-linter**:这一步是 Steward 第一次需要 Memory 的能力,
-如果偷懒直接 `from bundles.memory.gate import Gate`,契约会在这里报 BROKEN。
-正确做法是走 `ports.py` 的 Protocol,由 `cli.py` 接线。
+预期全绿。**特别关注 import-linter**:这一步是 Steward 第一次需要 Memory 的能力。
+`loop.py` 里如果偷懒写 `from bundles.memory.gate import Gate`,契约会在这里报 BROKEN——
+它必须走 `ports.py` 的 Protocol。而 `cli.py` 作为组装根**可以**直接 import bundles
+(契约只禁 `lararium.steward` → `bundles`),审批、回滚这些命令正是靠这一点拿到具体对象。
 
 - [ ] **Step 8: Commit**
 

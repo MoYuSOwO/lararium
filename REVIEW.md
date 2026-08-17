@@ -44,7 +44,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
-| 5 | 门控状态机 | 待验收 | | | |
+| 5 | 门控状态机 | **通过** | 全绿;retire 连坐补做 + Task 6 计划有严重漏洞已修 | ☐ | 2026-08-17 |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
 | 8 | 内置工具三件 | 未开始 | | | |
@@ -515,6 +515,67 @@ tests/bundles/test_gate.py::test_settle_captures_manual_edit_first PASSED [100%]
   纯格式,无逻辑变化。
 
 **验收结论**(Claude 填)
+
+- 门禁四关:ruff ☑ / mypy ☑(12 files)/ import-linter ☑(3 kept, 0 broken)/ pytest ☑(44 passed, 1 skipped)
+- 重跑结果:独立重跑全绿。`test_gate.py` 12 passed。
+- 规范核对(CONVENTIONS.md):**无违反**。`Proposal` 是 frozen dataclass(F1);
+  `propose` keyword-only(F3);`_now`/`_row_to_proposal`/`_insert_under_section`/`_mark_stale`
+  下划线标出内部性(S3);两处 `ValueError` 都带上收到的值与合法值(E3);
+  `settle` 的副作用写在名字里(F6)。
+- 契约核对:`Gate` 六个方法、`Proposal` 九个字段、三种 kind、两种 provenance
+  与计划一致。`_insert_under_section` 的小节定位、空行处理都对。
+- 不变量核对:**账本单写路径 ☑** —— `settle()` 是唯一调 `ledger.write()` 的地方,
+  且落盘前先 `sync_manual_edit()`,手编内容不会被覆盖。批量结算只产生一次快照,
+  「护缓存」的意图落实到位。
+- 抑制与分档:无新增 noqa / type: ignore;`pyproject.toml` 未动。
+
+**三条偏离全部成立**,均与前序任务同因(typeshed 的 `Any`、ruff UP017、formatter 换行)。
+
+**做了三轮注入攻击测试。第二轮打穿了。**
+
+```
+【攻击1】不可信提案直接结算            → ✓ 拦住了
+【攻击2】模型自己批准自己的提案        → ❌ 门控被绕过
+【攻击3】retire 用偏粗的 old_text      → ❌ 三条事实一起没了
+```
+
+**攻击 2(严重,Task 6 计划的漏洞,尚未实现,来得及)**
+
+我在 Task 6 的计划里把 `resolve_proposal` 列进了模型可调的 MCP 工具。那么攻击链是:
+恶意短信进上下文 → 被注入的模型调 `propose_fact(provenance="untrusted")` →
+**再调 `resolve_proposal(approved=True)`** → settle → 永久写入账本,每轮全量注入。
+
+整套门控就此形同虚设。**它只挡得住一个还听话的模型,而听话的模型本来就不需要挡。**
+工具的 docstring 写了「不得代替用户决定」,但那是提示词层面的请求,不是强制——
+被注入的模型恰恰是不听这句话的那个。这直接违背 DESIGN §6.3 白纸黑字的
+「按钮回调走代码状态流转,**不过模型**」。
+
+PLAN.md 已修:`memory_tool_functions()` 从五个砍到**两个**(`propose_fact`、`list_pending`),
+两个都碰不到账本;`resolve` / `settle` / `rollback` 退回成普通 Python 方法,
+只由 CLI 命令(M1)或 IM 按钮回调(M2)调用。Task 11 的 CLI 相应加了
+`/approve <id>`、`/reject <id>`、`/history`、`/rollback <id>`,并让 CLI 直接持有具体的
+`ledger`/`gate`(组装根可以 import bundles,`LedgerPort` 保持只有 `read()` 的最小面)。
+Task 6 另加一条回归测试 `test_approval_is_not_reachable_from_the_model`,
+把这条边界钉死,以后谁想把审批塞回模型工具列表都会被测试拦下。
+
+**攻击 3(中等,Task 5 需补做)**
+
+`retire` 删掉**所有**包含 `old_text` 的行,而 `amend` 用的是 `replace(..., 1)` 只改第一处。
+两者语义不一致,后果是 old_text 给粗了就连坐:
+
+```
+结算后:        ['- 住在望京', '- 公司在望京', '- 喜欢望京的烤鸭']
+retire「望京」后: []
+```
+
+而 `user_stated` 是自动放行的,没有审批环节能拦住它——用户只会发现自己的事实莫名消失。
+模型凭印象写个"望京"而不是整行,这事发生的概率不低。
+
+PLAN.md Task 5 的 `settle()` 已改为只删第一处匹配行(与 amend 对齐),
+并加了测试 `test_retire_removes_only_the_first_match`。
+
+**结论:通过**(补完 retire 即可开始 Task 6;Task 6 请按修订后的计划做)
+- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
 
 (待验收)
 
