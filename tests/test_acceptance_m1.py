@@ -165,7 +165,9 @@ async def test_acceptance_untrusted_content_cannot_reach_ledger(system):
     assert "不是指令" in injected["content"]
 
 
-async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(system, http_spy_factory):
+async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(
+    system, http_spy_factory, reply_factories
+):
     """验收①的报文级复核:落盘的事实必须真的出现在下一轮**发出去(HTTP body)**的报文里。
 
     组装器层面的断言不算——P0-1 正是"组装器对了但没发出去"。
@@ -175,8 +177,8 @@ async def test_acceptance_settled_fact_reaches_the_model_on_the_next_turn(system
     import json
 
     import httpx
-    from conftest import text_reply
 
+    text_reply, _ = reply_factories
     bodies: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:

@@ -65,6 +65,16 @@ def tool_call_reply() -> dict[str, Any]:
 
 
 @pytest.fixture
+def reply_factories():
+    """返回 text_reply / tool_call_reply 两个构造器。
+
+    用 fixture 注入,避免 `from conftest import ...`——那依赖 tests/ 没有
+    __init__.py 才成立,任何人加个 __init__.py 就让整个收集失败(补2b Step 4)。
+    """
+    return text_reply, tool_call_reply
+
+
+@pytest.fixture
 def http_spy_factory(monkeypatch):
     """返回一个能构造"只换 HTTP 传输"的 PydanticAIClient 的工厂。
 

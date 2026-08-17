@@ -5,7 +5,6 @@ from typing import Any
 
 import httpx
 import pytest
-from conftest import text_reply, tool_call_reply
 
 from lararium.steward.assembler import AssembledContext
 
@@ -13,8 +12,9 @@ PREFIX = "【前缀】"
 
 
 @pytest.fixture
-def wire(http_spy_factory):
+def wire(http_spy_factory, reply_factories):
     """真实 PydanticAIClient + 真实 OpenAIChatModel,只把 HTTP 传输换掉。"""
+    text_reply, tool_call_reply = reply_factories
     bodies: list[dict[str, Any]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:

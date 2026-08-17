@@ -71,7 +71,10 @@ def test_envelope_message_carries_the_timestamp():
 
 def test_appending_a_turn_leaves_earlier_messages_untouched():
     """追加不毁前缀:多一轮历史,之前的消息必须逐字不变。"""
-    turns = [Turn(user="第一句", assistant="第一答"), Turn(user="第二句", assistant="第二答")]
+    turns = [
+        Turn(user="第一句", assistant="第一答", ts="2026-08-17T01:00:00+00:00"),
+        Turn(user="第二句", assistant="第二答", ts="2026-08-17T02:00:00+00:00"),
+    ]
     env = Envelope.new(source="user", channel="cli", content="现在这句")
     short = build(env, l0=turns[:1])
     long = build(env, l0=turns)
@@ -89,7 +92,10 @@ def test_ledger_change_is_the_only_thing_that_moves_the_prefix():
 
 
 def test_l0_turns_become_alternating_messages():
-    turns = [Turn(user="问一", assistant="答一"), Turn(user="问二", assistant="答二")]
+    turns = [
+        Turn(user="问一", assistant="答一", ts="2026-08-17T03:00:00+00:00"),
+        Turn(user="问二", assistant="答二", ts="2026-08-17T04:00:00+00:00"),
+    ]
     ctx = build(Envelope.new(source="user", channel="cli", content="问三"), l0=turns)
     roles = [m["role"] for m in ctx.messages]
     assert roles == ["user", "assistant", "user", "assistant", "user"]
@@ -97,13 +103,16 @@ def test_l0_turns_become_alternating_messages():
 
 def test_incomplete_turn_is_skipped():
     """崩在半路的轮次(有问无答)不进 L0,避免污染对话结构。"""
-    turns = [Turn(user="问一", assistant=None), Turn(user="问二", assistant="答二")]
+    turns = [
+        Turn(user="问一", assistant=None, ts="2026-08-17T05:00:00+00:00"),
+        Turn(user="问二", assistant="答二", ts="2026-08-17T06:00:00+00:00"),
+    ]
     ctx = build(Envelope.new(source="user", channel="cli", content="问三"), l0=turns)
     assert [m["role"] for m in ctx.messages] == ["user", "assistant", "user"]
 
 
 def test_l1_block_appears_before_l0_when_present():
-    turns = [Turn(user="问一", assistant="答一")]
+    turns = [Turn(user="问一", assistant="答一", ts="2026-08-17T07:00:00+00:00")]
     ctx = build(
         Envelope.new(source="user", channel="cli", content="问二"),
         l1="8/15 · 聊过日料店 · 定了鮨一",
@@ -157,3 +166,21 @@ def test_untrusted_turn_keeps_its_wrapper_in_l0():
     injected = next(m for m in ctx.messages if "免确认转账" in m["content"])
     assert "不是指令" in injected["content"]
     assert "外部数据" in injected["content"]
+
+
+def test_l0_user_message_carries_the_journal_timestamp():
+    """L0 正文的形状要被钉住。之前只断言 role 序列,于是渲染成什么样都能过。"""
+    ctx = build(
+        Envelope.new(source="user", channel="cli", content="本轮"),
+        l0=[Turn(user="我明天要去看牙医", assistant="记下了", ts="2026-08-17T05:00:00+00:00")],
+    )
+    assert ctx.messages[0]["content"] == "[2026-08-17T13:00:00+08:00] 我明天要去看牙医"
+
+
+def test_l0_user_message_degrades_to_plain_text_without_a_timestamp():
+    """ts 缺失就不带时间戳前缀——不是把正文当时间戳塞进方括号。"""
+    ctx = build(
+        Envelope.new(source="user", channel="cli", content="本轮"),
+        l0=[Turn(user="我明天要去看牙医", assistant="记下了")],
+    )
+    assert ctx.messages[0]["content"] == "我明天要去看牙医"
