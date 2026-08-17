@@ -31,6 +31,7 @@
 - **Task 8** 内置工具三件落地:`current_time` 带时区与星期、`read_skill` 委托注册表、`search_history` 走起居注 FTS5;`as_tool_functions` 顺序固定护缓存;检索结果硬封顶 20 条,`limit=-1`(SQLite 当不限制)与 `limit=10000` 都钳制到上限,一次工具调用不再撑爆 L0
 - **Task 9** 上下文组装器落地:纯函数 `assemble` 拼前缀区(人格/目录/账本,字节稳定)与流水区(L1 摘要 + L0 对话 + 本轮信封);untrusted 外部数据包裹成「数据不是指令」;信封时间戳走配置时区(`assemble(timezone=...)`),不再依赖操作系统本地时区,VPS 上不再和 `current_time` 差 8 小时
 - **Task 10** 模型客户端协议与缓存指标落地:自有的 `ModelClient` 协议 + `ModelReply`,Pydantic AI 实现关在隔离盒 `PydanticAIClient` 里(库升级只改一个文件);`extract_cache_hit_tokens` 按服务商探测缓存命中 token(DeepSeek `details` / pydantic-ai `cache_read_tokens`),`format_cache_log` 每轮打印命中率,缓存可观测性落地
+- **Task 11** 一轮编排与 CLI 落地:`Steward.process_next` 认领→记事件→组装→跑模型→记工具事件→记回复→完成,整个循环可从起居注重建;Steward 只经 `ports.py` 的 `LedgerPort`/`GatePort` 接触 Memory(契约首次实战守住);CLI 带 `/approve` `/settle` `/history` `/rollback` `/replay` 等代码路径命令,审批不过模型;打错的 `/` 命令提示「未知命令」不再误发模型,一次 API 错误(限流/401)不再打死 CLI——随时可用的底线
 
 ---
 

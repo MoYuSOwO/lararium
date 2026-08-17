@@ -50,7 +50,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
 | 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | **通过** | 四条 API 修正均属实;run() 全路径已验证,无补做 | ☑ | 2026-08-17 |
-| 11 | 一轮的编排与 CLI | **通过** | 边界与接线全对;CLI 健壮性补做 | ☐ | 2026-08-17 |
+| 11 | 一轮的编排与 CLI | **通过** | 边界与接线全对;CLI 健壮性补做 | ☑ | 2026-08-17 |
 | 12 | 端到端验收 | 未开始 | | | |
 
 状态取值:未开始 / 进行中 / 待验收 / **通过** / 打回
@@ -1271,7 +1271,41 @@ PLAN.md Task 11 已补 **Step 9–11**,并在 Task 12 的冒烟清单里加了�
 (打错命令应给提示且不发 API 请求)。
 
 **结论:通过**(补完 CLI 健壮性即可开始 Task 12)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+**补完记录**(程序员填,commit 25b4fd7)
+
+按 Step 9–11 补 CLI 两处健壮性:
+
+- 所有 `/` 开头但未匹配的命令(漏 id 的 `/approve`、拼错的 `/aprove`)→ 提示「未知命令」并 `continue`,绝不发给模型
+- `await steward.process_next()` 包进 try/except:出错打印 `处理出错(不影响后续):类型: 消息` 后 `continue`——loop.py 已记 error 事件并标记信封 failed,CLI 只需接住不冒泡
+
+Step 10 手动验证(两条都过):
+
+验证1(打错命令 + /ledger + /quit,dummy key):
+```
+你 > 未知命令:/aprove abc。输入 /help 看可用命令。
+
+你 > ## 身份
+## 关系
+## 长期偏好
+## 正在进行
+
+你 > 退出。
+```
+`/aprove abc` 得到提示且无 HTTP Request 行。
+
+验证2(真实消息 + /ledger + /quit,dummy key 触发 401):
+```
+你 > HTTP Request: POST https://api.deepseek.com/v1/chat/completions "HTTP/1.1 401 ..."
+处理出错(不影响后续):ModelHTTPError: status_code: 401, ...
+你 > ## 身份
+...
+你 > 退出。
+```
+401 打印友好错误,CLI 存活,`/ledger` 与 `/quit` 照常,exit=0。
+
+门禁四关全绿(101 passed, 0 skipped)。CHANGELOG Task 11 条目已追加。偏离:无。
 
 ---
 
