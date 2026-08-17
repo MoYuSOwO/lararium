@@ -43,7 +43,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 1 | 环境、门禁与配置加载 | **通过** | 全绿;conftest 环境隔离已补(commit 2e5470e) | ☑ | 2026-08-17 |
 | 2 | 信封模型与收件箱 | **通过** | 全绿;崩溃恢复已补(commit fcea06e) | ☑ | 2026-08-17 |
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
-| 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化补做(计划缺陷) | ☐ | 2026-08-17 |
+| 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | 未开始 | | | |
 | 6 | Memory bundle 的 MCP server | 未开始 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
@@ -448,9 +448,28 @@ Task 5 的 Gate fixture 与 Task 6 的 `build_memory_components` 已同步改好
 到这时才真正在代码层面成立,而不只是一句口号。
 
 **结论:通过**(补完 `read()` 纯化即可开始 Task 5,不必等二次验收)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
 
-(待验收)
+**补完记录**(程序员填,commit e2a1395)
+
+按 Step 8–11 补 `read()` 纯化:
+
+- `read()` 改纯读,文件缺失抛 `FileNotFoundError`,消息含恢复路径(`history()` + `rollback()`)
+- 新增 `ensure_initialized() -> bool`:文件不存在则走 `write()` 建空账本 + init 快照,返回是否新建;存在则返回 False。全代码树只剩 `Ledger.write()` 一处 `write_text`
+- 测试:删 `test_read_creates_file_with_sections`,换三个(`ensure_initialized` 建文件 / noop / `read` 缺文件抛错且历史可恢复)
+
+测试输出(Step 10 确认通过):
+```
+$ uv run pytest tests/bundles/test_ledger.py -v
+...
+tests/bundles/test_ledger.py::test_ensure_initialized_creates_file_with_sections PASSED [ 11%]
+tests/bundles/test_ledger.py::test_ensure_initialized_is_noop_when_file_exists PASSED [ 22%]
+tests/bundles/test_ledger.py::test_read_raises_loudly_when_file_is_missing PASSED [ 33%]
+...（共 9 passed）
+============================== 9 passed in 0.03s ===============================
+```
+
+门禁四关全绿(32 passed, 1 skipped)。架构测试 `test_only_the_ledger_module_writes_files` 仍过——`ensure_initialized` 走 `write()`,没有新增写文件点。CHANGELOG Task 4 条目已追加。无偏离。
 
 ---
 
