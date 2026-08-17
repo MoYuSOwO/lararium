@@ -45,7 +45,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 3 | 起居注与中文检索 | **通过** | 全绿;对抗测试无失败,无补做项 | ☑ | 2026-08-17 |
 | 4 | 账本文件与快照表 | **通过** | 全绿;read() 纯化已补(commit e2a1395) | ☑ | 2026-08-17 |
 | 5 | 门控状态机 | **通过** | 全绿;retire 连坐已补(commit 9e7b482) | ☑ | 2026-08-17 |
-| 6 | Memory bundle 的 MCP server | 未开始 | | | |
+| 6 | Memory bundle 的 MCP server | 待验收 | | | |
 | 7 | 插件注册表与 read_skill | 未开始 | | | |
 | 8 | 内置工具三件 | 未开始 | | | |
 | 9 | 上下文组装器 | 未开始 | | | |
@@ -591,6 +591,57 @@ tests/bundles/test_gate.py::test_retire_removes_only_the_first_match PASSED [ 84
 ```
 
 门禁四关全绿(45 passed, 1 skipped)。CHANGELOG Task 5 条目已追加。无偏离。
+
+---
+
+### Task 6:Memory bundle 的 MCP server
+
+**执行记录**(程序员填)
+
+测试输出(Step 3 确认失败):
+```
+$ uv run pytest tests/bundles/test_memory_server.py -v
+...
+tests/bundles/test_memory_server.py:2: in <module>
+    from bundles.memory.server import (
+E   ModuleNotFoundError: No module named 'bundles.memory.server'
+ERROR tests/bundles/test_memory_server.py
+=============================== 1 error in 0.07s ===============================
+```
+
+测试输出(Step 5 确认通过):
+```
+$ uv run pytest tests/bundles/test_memory_server.py -v
+...
+tests/bundles/test_memory_server.py::test_build_creates_ledger_and_gate PASSED [ 11%]
+tests/bundles/test_memory_server.py::test_read_ledger_returns_full_text PASSED [ 22%]
+tests/bundles/test_memory_server.py::test_tool_functions_have_fixed_order PASSED [ 33%]
+tests/bundles/test_memory_server.py::test_approval_is_not_reachable_from_the_model PASSED [ 44%]
+tests/bundles/test_memory_server.py::test_propose_fact_tool_writes_through_gate PASSED [ 55%]
+tests/bundles/test_memory_server.py::test_propose_fact_tool_reports_bad_input_instead_of_crashing PASSED [ 66%]
+tests/bundles/test_memory_server.py::test_untrusted_proposal_tool_reports_pending PASSED [ 77%]
+tests/bundles/test_memory_server.py::test_manifest_tools_match_implementation PASSED [ 88%]
+tests/bundles/test_memory_server.py::test_skill_files_referenced_in_manifest_exist PASSED [100%]
+============================== 9 passed in 1.28s ===============================
+```
+
+冒烟(Step 6):server 启动成功,打印 FastMCP banner + "Starting MCP server 'memory' with transport 'stdio'",
+后台进程因 stdin 关闭干净退出(exit=0)。macOS 无 `timeout` 命令,改用后台 + kill 替代,验证效果等价。
+
+与计划的偏离:
+- **计划预期「8 passed」,实际 9 passed**:计划少数了一个测试(`test_skill_files_referenced_in_manifest_exist`
+  是独立的第 9 个),不影响结果。
+- **RUF059:3 个测试里 `ledger` 解包后未用**:ruff 要求加 `_` 前缀,已改 `_ledger, gate`。
+- **I001:函数内 import 排序**:`from pathlib import Path`(stdlib)要先于 `import yaml`(第三方),
+  ruff 自动修。
+- **mypy `arg-type`:`str` → `Literal`**:server.py 的 `propose_fact` 收模型传来的 `str`,
+  传给 `gate.propose` 期望 `Literal["add","amend","retire"]`。这是工具边界——模型输出是不可信输入(L3),
+  gate 在运行时校验。用 `# type: ignore[arg-type]` 最小范围抑制,注释说明理由。server.py 在宽松档。
+- **macOS 无 `timeout`**:冒烟改用后台 + kill,等价验证 server 能启动。
+
+**验收结论**(Claude 填)
+
+(待验收)
 
 ---
 
