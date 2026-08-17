@@ -1,0 +1,82 @@
+import sqlite3
+
+import pytest
+
+from lararium.db import connect
+from lararium.steward.journal import Journal
+
+
+@pytest.fixture
+def journal(tmp_path):
+    return Journal(connect(tmp_path / "steward.sqlite"))
+
+
+def test_sqlite_supports_trigram_tokenizer():
+    """中文检索的前提。SQLite < 3.34 会在这里失败。"""
+    assert sqlite3.sqlite_version_info >= (3, 34, 0), sqlite3.sqlite_version
+
+
+def test_append_and_replay_preserves_order_and_content(journal):
+    journal.append("env-1", "envelope", {"content": "我对芒果过敏"})
+    journal.append("env-1", "tool_call", {"tool": "propose", "args": {"content": "对芒果过敏"}})
+    journal.append("env-1", "reply", {"content": "记下了"})
+    journal.append("env-2", "envelope", {"content": "另一轮"})
+
+    events = journal.replay("env-1")
+    assert [e["kind"] for e in events] == ["envelope", "tool_call", "reply"]
+    assert events[0]["payload"]["content"] == "我对芒果过敏"
+    assert events[1]["payload"]["args"]["content"] == "对芒果过敏"
+
+
+def test_replay_is_byte_identical_across_calls(journal):
+    """可重放:同一轮读两次必须完全一致。"""
+    journal.append("env-1", "envelope", {"content": "重放测试"})
+    journal.append("env-1", "reply", {"content": "好的"})
+    assert journal.replay("env-1") == journal.replay("env-1")
+
+
+def test_search_finds_chinese_substring(journal):
+    journal.append("env-1", "envelope", {"content": "昨天那家日料店真不错"})
+    journal.append("env-2", "envelope", {"content": "今天去了健身房"})
+
+    hits = journal.search("日料店")
+    assert len(hits) == 1
+    assert hits[0].envelope_id == "env-1"
+    assert "日料店" in hits[0].text
+
+
+def test_search_finds_two_character_word(journal):
+    """trigram 不匹配短于3字的查询,必须回退 LIKE——中文两字词是最常用的。"""
+    journal.append("env-1", "envelope", {"content": "昨天那家日料店真不错"})
+    hits = journal.search("日料")
+    assert len(hits) == 1
+    assert hits[0].envelope_id == "env-1"
+
+
+def test_search_does_not_index_internal_events(journal):
+    """prompt/tool_call 是内部结构,不该污染用户的旧账检索。"""
+    journal.append("env-1", "prompt", {"content": "系统提示词里也有日料店三个字"})
+    assert journal.search("日料店") == []
+
+
+def test_search_respects_limit(journal):
+    for i in range(5):
+        journal.append(f"env-{i}", "envelope", {"content": f"消费记录 {i}"})
+    assert len(journal.search("消费", limit=3)) == 3
+
+
+def test_search_returns_empty_for_no_match(journal):
+    journal.append("env-1", "envelope", {"content": "你好"})
+    assert journal.search("量子力学") == []
+
+
+def test_recent_turns_returns_newest_last(journal):
+    journal.append("env-1", "envelope", {"content": "第一轮"})
+    journal.append("env-1", "reply", {"content": "回复一"})
+    journal.append("env-2", "envelope", {"content": "第二轮"})
+    journal.append("env-2", "reply", {"content": "回复二"})
+
+    turns = journal.recent_turns(limit=2)
+    assert [t["envelope_id"] for t in turns] == ["env-1", "env-2"]
+    assert turns[0]["user"] == "第一轮"
+    assert turns[0]["assistant"] == "回复一"
