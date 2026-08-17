@@ -27,6 +27,19 @@ def test_format_cache_log_reports_hit_rate():
     assert "80.0%" in line
 
 
+def test_format_cache_log_shows_request_count():
+    """用量是整轮累加的。带上请求数,免得把工具往返稀释的百分比误读成前缀不稳定。"""
+    reply = ModelReply(
+        text="好的",
+        tool_events=[],
+        cache_hit_tokens=1344,
+        prompt_tokens=2497,
+        completion_tokens=207,
+        requests=2,
+    )
+    assert "2 请求" in format_cache_log(reply)
+
+
 def test_format_cache_log_handles_unknown_cache_stats():
     reply = ModelReply(
         text="好的", tool_events=[], cache_hit_tokens=None, prompt_tokens=1000, completion_tokens=50

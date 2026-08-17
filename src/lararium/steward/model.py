@@ -23,6 +23,11 @@ class ModelReply:
     cache_hit_tokens: int | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # 注意:下面这些 token 数字是**整轮累加**的,不是单次请求。一轮里模型每调一次
+    # 工具就多一次请求(发起调用一次、拿到结果再答一次),用量逐次叠加。
+    # requests 记录请求次数,看到「2 请求」就知道百分比被工具往返稀释过,
+    # 不必怀疑前缀不稳定。
+    requests: int | None = None
 
 
 class ModelClient(Protocol):
@@ -44,13 +49,15 @@ def extract_cache_hit_tokens(usage: Any) -> int | None:
 
 
 def format_cache_log(reply: ModelReply) -> str:
-    """每轮打印缓存命中——这是 DESIGN §1.5 的硬约束的可观测形式。"""
+    """每轮打印缓存命中——这是 DESIGN §1.5 的硬约束的可观测形式。
+    用量是整轮累加的;带上请求数,免得把工具往返稀释的百分比误读成前缀不稳定。"""
+    reqs = f" · {reply.requests} 请求" if reply.requests else ""
     if reply.cache_hit_tokens is None or not reply.prompt_tokens:
-        return f"[cache] 未知 · prompt={reply.prompt_tokens} completion={reply.completion_tokens}"
+        return f"[cache] 未知 · prompt={reply.prompt_tokens} completion={reply.completion_tokens}{reqs}"
     rate = reply.cache_hit_tokens / reply.prompt_tokens * 100
     return (
-        f"[cache] 命中 {reply.cache_hit_tokens}/{reply.prompt_tokens} ({rate:.1f}%) "
-        f"· completion={reply.completion_tokens}"
+        f"[cache] 本轮命中 {reply.cache_hit_tokens}/{reply.prompt_tokens} ({rate:.1f}%) "
+        f"· completion={reply.completion_tokens}{reqs}"
     )
 
 
@@ -119,4 +126,5 @@ class PydanticAIClient:
             or getattr(usage, "request_tokens", None),
             completion_tokens=getattr(usage, "output_tokens", None)
             or getattr(usage, "response_tokens", None),
+            requests=getattr(usage, "requests", None),
         )
