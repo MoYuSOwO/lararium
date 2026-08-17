@@ -48,7 +48,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 | 6 | Memory bundle 的 MCP server | **通过** | 安全边界已验证有效;SQLite 跨线程补做 | ☑ | 2026-08-17 |
 | 7 | 插件注册表与 read_skill | **通过** | 路径穿越防护扎实;manifest 可诊断性补做 | ☑ | 2026-08-17 |
 | 8 | 内置工具三件 | **通过** | 全绿;检索结果封顶补做 | ☑ | 2026-08-17 |
-| 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☐ | 2026-08-17 |
+| 9 | 上下文组装器 | **通过** | 跨进程前缀稳定已验证;时区一致性补做 | ☑ | 2026-08-17 |
 | 10 | 模型客户端与缓存指标 | 未开始 | | | |
 | 11 | 一轮的编排与 CLI | 未开始 | | | |
 | 12 | 端到端验收 | 未开始 | | | |
@@ -1023,7 +1023,26 @@ PLAN.md Task 9 已补 **Step 6–9**:`assemble` 增加 keyword-only 的 `timezon
 不影响前缀:时区是配置值,只作用于流水区的信封消息。
 
 **结论:通过**(补完时区一致性即可开始 Task 10)
-- 通过后:CHANGELOG.md 已追加条目 ☐(程序员补勾)
+- 通过后:CHANGELOG.md 已追加条目 ☑
+
+**补完记录**(程序员填,commit 09d5af1)
+
+按 Step 6–9 补信封时间戳走配置时区:
+
+- `assembler.py` 顶部 `from zoneinfo import ZoneInfo`;`_render_envelope(envelope, tz)` 用 `astimezone(tz)` 替代裸 `astimezone()`,注释说明 VPS 默认 UTC 的坑
+- `assemble` 新增 keyword-only `timezone: str` 参数,`_render_envelope(envelope, ZoneInfo(timezone))`
+- 测试 `build()` 加 `timezone: str = "Asia/Shanghai"` 并透传;新增 `test_envelope_timestamp_follows_configured_timezone_not_the_os`——同一信封分别用 Asia/Shanghai 与 UTC 组装,断言 `+08:00` / `+00:00` 且两者不同,不依赖开发机 TZ
+
+测试输出(Step 8 确认通过):
+```
+$ uv run pytest tests/steward/test_assembler.py -v
+...
+tests/steward/test_assembler.py::test_envelope_timestamp_follows_configured_timezone_not_the_os PASSED [ 33%]
+...
+============================== 12 passed in 0.06s ===============================
+```
+
+门禁四关全绿(87 passed, 0 skipped)。CHANGELOG Task 9 条目已追加。偏离:ruff format 将 `build()` 的函数签名拆成每行一个参数(行宽超限),纯格式。loop.py 的调用点同步在 Task 11 的计划里已写好,届时照做。
 
 ---
 

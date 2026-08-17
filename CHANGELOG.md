@@ -29,6 +29,7 @@
 - **Task 6** Memory bundle MCP server 落地:`build_memory_components` 组装 Ledger+Gate、`create_server` 暴露 FastMCP、`memory_tool_functions` 只含 `propose_fact` 与 `list_pending` 两个工具(审批/结算/回滚走代码路径,不经模型);SQLite 连接加 `check_same_thread=False`,框架线程池里的工具调用不再崩
 - **Task 7** 插件注册表落地:`Registry.load` 扫描 `bundles/*/manifest.yaml` 组装目录,`read_skill` 走 manifest 白名单校验挡路径穿越,`directory_lines` 确定性排序保证前缀字节稳定;坏 manifest 点名出错的文件路径,重名 bundle 直接拒绝启动,不留够不着的领域
 - **Task 8** 内置工具三件落地:`current_time` 带时区与星期、`read_skill` 委托注册表、`search_history` 走起居注 FTS5;`as_tool_functions` 顺序固定护缓存;检索结果硬封顶 20 条,`limit=-1`(SQLite 当不限制)与 `limit=10000` 都钳制到上限,一次工具调用不再撑爆 L0
+- **Task 9** 上下文组装器落地:纯函数 `assemble` 拼前缀区(人格/目录/账本,字节稳定)与流水区(L1 摘要 + L0 对话 + 本轮信封);untrusted 外部数据包裹成「数据不是指令」;信封时间戳走配置时区(`assemble(timezone=...)`),不再依赖操作系统本地时区,VPS 上不再和 `current_time` 差 8 小时
 
 ---
 
