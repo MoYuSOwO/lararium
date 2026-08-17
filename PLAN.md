@@ -2762,6 +2762,13 @@ def test_format_cache_log_reports_hit_rate():
     assert "80.0%" in line
 
 
+def test_format_cache_log_shows_request_count():
+    """用量是整轮累加的。带上请求数,免得把工具往返稀释的百分比误读成前缀不稳定。"""
+    reply = ModelReply(text="好的", tool_events=[], cache_hit_tokens=1344,
+                       prompt_tokens=2497, completion_tokens=207, requests=2)
+    assert "2 请求" in format_cache_log(reply)
+
+
 def test_format_cache_log_handles_unknown_cache_stats():
     reply = ModelReply(text="好的", tool_events=[], cache_hit_tokens=None,
                        prompt_tokens=1000, completion_tokens=50)
@@ -2793,9 +2800,14 @@ _CACHE_HIT_KEYS = ("prompt_cache_hit_tokens", "cache_read_input_tokens", "cached
 class ModelReply:
     text: str
     tool_events: list[dict[str, Any]] = field(default_factory=list)
+    # 注意:以下用量是**整轮累加**的,不是单次请求。一轮里模型每调一次工具就多一次
+    # 请求(发起调用一次、拿到结果再答一次),用量逐次累加。requests 记录了次数,
+    # 没有它的话 "命中 1344/2497" 会被误读成"前缀只缓存了 54%",
+    # 而实际可能是前缀 100% 命中、只是工具往返带来了新 token。
     cache_hit_tokens: int | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    requests: int | None = None
 
 
 class ModelClient(Protocol):
@@ -2817,13 +2829,21 @@ def extract_cache_hit_tokens(usage: Any) -> int | None:
 
 
 def format_cache_log(reply: ModelReply) -> str:
-    """每轮打印缓存命中——这是 DESIGN §1.5 的硬约束的可观测形式。"""
+    """每轮打印缓存命中——这是 DESIGN §1.5 硬约束的可观测形式。
+
+    数字是**本轮合计**(含工具往返的多次模型请求),所以带上请求数:
+    看到 "2 请求" 就知道百分比被工具往返稀释过,不必怀疑前缀不稳定。
+    """
+    reqs = f" · {reply.requests} 请求" if reply.requests else ""
     if reply.cache_hit_tokens is None or not reply.prompt_tokens:
-        return f"[cache] 未知 · prompt={reply.prompt_tokens} completion={reply.completion_tokens}"
+        return (
+            f"[cache] 未知 · 本轮 prompt={reply.prompt_tokens} "
+            f"completion={reply.completion_tokens}{reqs}"
+        )
     rate = reply.cache_hit_tokens / reply.prompt_tokens * 100
     return (
-        f"[cache] 命中 {reply.cache_hit_tokens}/{reply.prompt_tokens} ({rate:.1f}%) "
-        f"· completion={reply.completion_tokens}"
+        f"[cache] 本轮命中 {reply.cache_hit_tokens}/{reply.prompt_tokens} ({rate:.1f}%) "
+        f"· completion={reply.completion_tokens}{reqs}"
     )
 
 
@@ -2888,6 +2908,7 @@ class PydanticAIClient:
             cache_hit_tokens=extract_cache_hit_tokens(usage),
             prompt_tokens=getattr(usage, "input_tokens", None) or getattr(usage, "request_tokens", None),
             completion_tokens=getattr(usage, "output_tokens", None) or getattr(usage, "response_tokens", None),
+            requests=getattr(usage, "requests", None),
         )
 ```
 
@@ -2896,7 +2917,7 @@ class PydanticAIClient:
 ```bash
 uv run pytest tests/steward/test_model.py -v
 ```
-预期:5 passed
+预期:6 passed
 
 - [ ] **Step 5: 对着装好的库核对 API,修正 `PydanticAIClient`**
 
@@ -3645,6 +3666,45 @@ set -a && source .env && set +a && uv run python -m lararium.gateway.cli
 ```bash
 git add tests/test_acceptance_m1.py
 git commit -m "test: M1 端到端验收测试"
+```
+
+### Task 12 补做:缓存日志标注请求数(验收时补入)
+
+冒烟输出里第二轮 `prompt_tokens` 反而比第一轮小(2497 < 4656),查清楚了:
+**`RunUsage` 是整轮累加的**,模型每调一次工具就多一次请求(发起调用一次、
+拿到结果再答一次),用量逐次叠加。实测同一份上下文:
+
+```
+工具调用=0 次 → prompt_tokens=65
+工具调用=1 次 → prompt_tokens=134
+```
+
+所以第一轮数字大只是因为它调了工具,不是 bug。但日志行「命中 1344/2497 (53.8%)」
+会被误读成"前缀只缓存了 54%",而实际可能是前缀 100% 命中、只是工具往返带来了新 token。
+**缓存命中是硬约束的度量仪器,读错了会把排查引向错误方向**——这一处趁记忆新鲜补掉。
+
+- [ ] **Step 6: `ModelReply` 加 `requests: int | None = None` 字段并在适配器里填充**
+
+见上方 Task 10 的新版:`requests=getattr(usage, "requests", None)`,
+字段上方保留解释累加语义的注释。
+
+- [ ] **Step 7: `format_cache_log` 带上请求数**
+
+输出改为 `[cache] 本轮命中 1344/2497 (53.8%) · completion=207 · 2 请求`。
+看到「2 请求」就知道百分比被工具往返稀释过,不必怀疑前缀不稳定。
+
+- [ ] **Step 8: 补测试 `test_format_cache_log_shows_request_count`**(代码见 Task 10 Step 1)
+
+```bash
+uv run pytest tests/steward/test_model.py -v
+```
+预期:6 passed
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add src/lararium/steward/model.py tests/steward/test_model.py
+git commit -m "fix: 缓存日志标注请求数,避免把工具往返稀释的命中率误读为前缀不稳"
 ```
 
 ---
