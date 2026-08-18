@@ -2618,3 +2618,74 @@ tests/steward/test_loop.py::test_envelope_not_completed_until_reply_is_in_outbox
 **门禁**:140 passed, mypy 21 files, import-linter 3 kept。
 
 CHANGELOG 已(在本次 docs 提交)加 M2 小节 + M2-1 行;CHANGELOG/DESIGN/PLAN 里程碑重排随 docs 一并提交。
+
+**验收结论**(Claude 填,M2-1 Step0 补测):**通过。M2-1 完全关闭。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(21 files)/ import-linter ☑(3 kept)/ pytest ☑(**140 passed**,139 → +1)
+- **我没采信你贴的红/绿输出,自己把两行交换后重跑了一遍**:
+
+```
+交换后(complete 在 put 之前,即 D10 要防的错误):
+  tests/steward/test_loop.py:223: AssertionError
+  FAILED test_envelope_not_completed_until_reply_is_in_outbox
+  1 failed, 10 passed
+
+还原后:11 passed
+```
+
+**只有这一条红,其余 10 条全绿**——精确性正是它的价值:这条测试专钉顺序,不多管闲事;
+而在它出现之前,交换两行是**零条**测试会红。M2 最核心的崩溃语义现在有守卫了。
+
+- 工作树已干净,文档(里程碑重排 + M2 计划全文)与 M2-1 的 CHANGELOG 行都已提交。
+
+**接下来**:开 Task M2-2(错误分类与重试,P2-3 在此关闭)。提醒两处计划里已写明、
+但容易做浅的地方:①分类必须在隔离盒 `model.py` 里完成,loop 只认自家的 `ModelCallError`,
+别让 pydantic-ai 的异常类型漏进 loop;②**认不出的异常默认 `retryable=True`**——
+重试上限会把持续失败转成终态,而把可重试误判成终态是消息永久丢失,这个不对称是有意的。
+
+## Task M2-2:错误分类与重试(P2-3 关闭,待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 失败输出**(隔离盒还没有 `ModelCallError`):
+```
+$ uv run pytest tests/steward/test_loop.py -q
+E   ImportError: cannot import name 'ModelCallError' from 'lararium.steward.model'
+1 error in 0.05s   (收集阶段即红,4 条新测试一条都跑不了)
+```
+
+**Step 1 通过输出**(实现后,4 条新测试 + 既有 11 条全绿):
+```
+$ uv run pytest tests/steward/test_loop.py -v
+test_retryable_model_error_releases_envelope_without_notice PASSED
+test_retryable_failures_abandon_after_max_attempts_with_notice PASSED
+test_terminal_model_error_fails_immediately_with_notice PASSED
+test_non_model_error_still_bubbles_up PASSED
+============================== 15 passed ================================
+```
+
+**分类校验**(用真实 pydantic-ai 2.31.0 异常对象,不联网):
+```
+ModelHTTPError(429) -> retryable=True    ModelHTTPError(500/503) -> True
+ModelHTTPError(401/400/422) -> False     ModelHTTPError(418 未知码) -> True
+httpx.ConnectError / ReadTimeout -> True RuntimeError(认不出) -> True
+```
+
+**门禁**:144 passed(140 → +4),mypy 21 files,import-linter 3 kept(32 deps)。
+
+**与计划的偏离**:
+- 计划预测"pydantic-ai 2.31.0 异常形状没实跑过,status code 那段大概率要调整"——实探后
+  **无需调整**:2.31.0 的 `pydantic_ai.exceptions.ModelHTTPError(ModelAPIError)` 确有
+  `status_code: int`,正是计划的 `_classify_retryable` 需要的形状;`429/5xx` vs
+  `400/401/403/404/422` 的判定直接用 `exc.status_code not in _NON_RETRYABLE_STATUS` 一次
+  覆盖,未知码(如 418)自然落回 retryable=True(<用户强调的第二个不对称)。
+- `_classify_retryable` 里对 `pydantic_ai.exceptions` 的 import 放在函数体内(与 `run` 里
+  `pydantic_ai.Agent` 的写法一致,保持隔离盒惰性 import 风格)。
+- loop 的 `self._attempts` 计划草稿落在 `Inbox.attempts(env_id)`(计划原话"加查 attempts
+  的途径",归属收件箱更顺);`release` 不清 attempts——清了等于每次从头算,毒消息会无限重试,
+  已写进 docstring。
+
+**全局约束核对**:
+- 隔离盒边界:loop.py 对 pydantic-ai **零 import**,只认自家 `ModelCallError` ✓
+  (grep 证实 loop.py 无 `pydantic_ai`,仅 `from lararium.steward.model import ModelCallError`)。
+- 认不出的异常默认 retryable=True ✓;重试上限把持续失败转成终态(第 3 次尝试后 failed)。
