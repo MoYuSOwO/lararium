@@ -3109,3 +3109,84 @@ bundles);cli.py 顶层改 `from lararium.gateway.server import build_steward`。
 超长→400 / 合法 hex→202 幂等)。
 
 **门禁**:174 passed(166 → +8),mypy 23 files,import-linter 3 kept(39 deps)。
+
+**验收结论**(Claude 填,M2-4 补做):**通过。M2-4 关闭,可以开 M2-5。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(23 files)/ import-linter ☑(3 kept)/ pytest ☑(**174 passed**,166 → +8)
+- 修在**类型边界**而不是处理函数里,和 `channel` 同一个位置、同一个理由——这是对的选择。
+  `validate_assignment=True` 尤其关键:它堵的不是这一次的 `id`,是**下一次的别的字段**。
+
+### 我打了十一条载荷,不只是原来那三条
+
+```
+原载荷(伪造框定语) → 400      大写 hex        → 400      SQL 味道   → 400
+非字符串 dict       → 400      31 / 33 位 hex  → 400      空串       → 202(见下)
+非字符串 int        → 400      含换行的 hex     → 400      合法 32hex → 202
+超长 5000 字符      → 400
+```
+
+`id: ""` 走 202 是**正确**的:空串被当成"没给",服务端生成合法 id;
+库里非法 id 行数 = 0,没有任何东西溜进去。
+
+幂等我一开始报了个假警(第一次就 `duplicate=True`)——**是我探针复用了前面用过的 id**。
+换全新 id 重验:第一次 `duplicate=False`、第二次 `True`、库里 1 行,幂等正确。
+
+### 兼容性我也核了
+
+新 pattern 是 `^[0-9a-f]{32}$`,而 `uuid.uuid4().hex` 恒为 32 位小写 hex——
+M1 遗留的收件箱/起居注数据全部仍然合法,`claim_next` 重建信封不会因新校验读不出来。
+大写被拒不影响存量(uuid4 不产生大写)。
+
+### 依赖方向也理顺了
+
+`build_steward` 已搬到 `server.py`,`server.py` 不再反向 import `cli.py`。
+M2-6 把 CLI 改成 HTTP 客户端时,cli.py 直接删掉那几行 bundles import 即可,少一次返工。
+
+**M2 进度**:M2-1 ✅ / M2-2 ✅ / M2-3 ✅ / M2-4 ✅,下一个 **M2-5(命令端点)**。
+提醒一句写进 docstring 的事:命令端点从此就是门控的开关(D12),
+M5 做 `python_sandbox` 时"沙箱无网络"就是防它被模型自己 POST 的那道墙,两条约束绑定。
+
+## Task M2-5:命令端点(待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 — 失败的测试先行**:5 条加进 `tests/gateway/test_server.py`,先红(route 不存在,
+所有命令请求 404):
+
+```
+test_post_command_dispatches_to_handle_command            FAILED (404)
+test_post_command_approve_truly_resolves_proposal         FAILED (404)
+test_post_command_quit_responds_but_server_stays_up       FAILED (404)
+test_post_command_unknown_command                         FAILED (404)
+test_post_command_without_token_returns_401               FAILED (404,期望 401)
+```
+
+**Step 2 — 实现**:
+- `handle_command`/`CommandResult`/`HELP` 从 `cli.py` 搬到新模块 `src/lararium/gateway/commands.py`,
+  cli.py 顶层 `from lararium.gateway.commands import handle_command`(M2-6 拆 cli 时这些 imports
+  已不在了)。模块 docstring 写入 D12 安全注意。
+- server.py 加 `POST /v1/commands`:`认证 → 校验 line → handle_command → 包 JSON(200)`。
+  `should_quit` 在 HTTP 语境只翻译成一句「服务端无退出概念,请直接关客户端。」,服务不退
+  (handle_command 里的结算副作用照常执行)。端点 docstring 写入 D12 绑定约束。
+
+**D12 安全注意**(写进 commands.py 模块 docstring + 端点 docstring):
+> 这个端点从此就是门控的开关(D12)。M5 做 python_sandbox 时,"沙箱无网络"就是防它被
+> 模型自己 POST 的那道墙——两条约束是绑定的,谁也不许单独放松。
+
+**Step 1-2 通过输出**:
+```
+$ uv run pytest tests/gateway/test_server.py tests/gateway/test_cli_commands.py -q
+24 passed   (server 17 + cli commands 7;cli commands 已改为从 gateway.commands import)
+```
+
+**真实 HTTP 冒烟(lifespan+worker 真链路,非单元测试)**:
+
+```
+approve: 200 {'text': '已批准:外部来的事实'}
+proposal state after approve: passed        ← 门控开关真的被端点拨动
+quit: 200 {'text': '服务端无退出概念,请直接关客户端。'}
+server still alive -> pending: 200 无待审   ← /quit 不退服
+```
+
+**门禁**:179 passed(174 → +5),mypy 24 files(+commands.py),import-linter 3 kept
+(41 deps,+commands.py:gateway 组装根仍合法 import bundles)。
