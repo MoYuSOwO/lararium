@@ -1,21 +1,15 @@
 import asyncio
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 from bundles.memory.gate import Gate
 from bundles.memory.ledger import Ledger
-from bundles.memory.server import build_memory_components, memory_tool_functions
+from bundles.memory.server import build_memory_components
 
 from lararium.config import Settings
-from lararium.db import connect
 from lararium.envelope import Envelope
-from lararium.steward.inbox import Inbox
-from lararium.steward.journal import Journal
+from lararium.gateway.server import build_steward
 from lararium.steward.loop import Steward
-from lararium.steward.model import PydanticAIClient
-from lararium.steward.outbox import Outbox
-from lararium.steward.registry import Registry
 
 HELP = """可用命令(这些都不经过模型,是你直接对系统说话):
   /pending             列出待审提案
@@ -90,22 +84,8 @@ def handle_command(line: str, *, steward: Steward, ledger: Ledger, gate: Gate) -
     return CommandResult(f"未知命令:{line}。输入 /help 看可用命令。")
 
 
-def build_steward(settings: Settings, ledger: Ledger, gate: Gate) -> Steward:
-    """组装根。这是全系统唯一允许 import bundles 的地方(`.importlinter` 契约)。"""
-    conn = connect(settings.data_dir / "steward.sqlite")
-    return Steward(
-        settings=settings,
-        inbox=Inbox(conn),
-        journal=Journal(conn),
-        registry=Registry.load(Path("bundles")),
-        ledger=ledger,
-        gate=gate,
-        model=PydanticAIClient(settings),
-        persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
-        outbox=Outbox(conn),
-        # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
-        bundle_tools=memory_tool_functions(gate),
-    )
+# build_steward 已从本模块搬到 server.py(M2-6 之后 cli 不再 import bundles),
+# 顶层 `from lararium.gateway.server import build_steward` 直接引用它。
 
 
 async def main() -> None:

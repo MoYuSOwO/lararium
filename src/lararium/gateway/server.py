@@ -10,17 +10,26 @@ import contextlib
 import hmac
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
+from bundles.memory.server import build_memory_components, memory_tool_functions
+from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from lararium.config import Settings
+from lararium.db import connect
 from lararium.envelope import Envelope
+from lararium.steward.inbox import Inbox
+from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
+from lararium.steward.model import PydanticAIClient
+from lararium.steward.outbox import Outbox
+from lararium.steward.registry import Registry
 from lararium.steward.worker import Worker
 
 logger = logging.getLogger("lararium")
@@ -29,6 +38,29 @@ logger = logging.getLogger("lararium")
 MAX_CONTENT = 16 * 1024
 
 _UNAUTHORIZED = JSONResponse({"error": "未授权"}, status_code=401)
+
+
+def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
+    """组装 Steward。这是全系统唯一允许 import bundles 的地方之一(组装根)。
+
+    放这里而不是 cli.py:M2-6 之后 cli 降级为纯 HTTP 客户端、不再 import bundles,
+    build_steward 若留在 cli 上会让那一步被迫动它;server 是和 cli 并列的组装根,
+    放这里是它该在的位置。
+    """
+    conn = connect(settings.data_dir / "steward.sqlite")
+    return Steward(
+        settings=settings,
+        inbox=Inbox(conn),
+        journal=Journal(conn),
+        registry=Registry.load(Path("bundles")),
+        ledger=ledger,
+        gate=gate,
+        model=PydanticAIClient(settings),
+        persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
+        outbox=Outbox(conn),
+        # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
+        bundle_tools=memory_tool_functions(gate),
+    )
 
 
 def create_app(
@@ -93,12 +125,21 @@ def create_app(
         if len(content) > MAX_CONTENT:
             return JSONResponse({"error": "content 超出 16KB 上限"}, status_code=413)
 
-        env = Envelope.new(source="user", channel=channel, content=content, meta={})
+        try:
+            env = Envelope.new(
+                source="user",
+                channel=channel,
+                content=content,
+                meta={},
+                id=payload.get("id"),  # None → 服务端生成;给了就构造时带上,让信封自己把关
+            )
+        except ValidationError:
+            # 畸形 id(非字符串/非 hex/超长)是客户端问题 → 400,不能把网络面打成 500。
+            return JSONResponse({"error": "id 必须是 32 位 hex"}, status_code=400)
+
         duplicate = False
-        client_id = payload.get("id")
-        if client_id:
+        if payload.get("id"):
             # 客户端给 id → 幂等:重发同 id 只处理一次(INSERT OR IGNORE 靠主键)。
-            env.id = client_id
             duplicate = not steward.inbox.put_idempotent(env)
         else:
             steward.inbox.put(env)
@@ -163,11 +204,7 @@ def create_app(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     settings = Settings.load()
-    # 服务端是新的组装根:自己和 cli 一样组装内存 bundle 与 Steward。
-    from bundles.memory.server import build_memory_components
-
-    from lararium.gateway.cli import build_steward
-
+    # 服务端是新的组装根:自己和 cli 一样组装内存 bundle 与 Steward(build_steward 就在本模块)。
     ledger, gate = build_memory_components(settings.data_dir)
     steward = build_steward(settings, ledger, gate)
     wake = asyncio.Event()
