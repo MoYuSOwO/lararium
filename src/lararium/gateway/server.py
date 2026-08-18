@@ -39,6 +39,7 @@ logger = logging.getLogger("lararium")
 MAX_CONTENT = 16 * 1024
 
 _UNAUTHORIZED = JSONResponse({"error": "未授权"}, status_code=401)
+_FORBIDDEN = JSONResponse({"error": "无权限"}, status_code=403)
 
 
 def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
@@ -69,27 +70,48 @@ def create_app(
     steward: Steward,
     ledger: Any,
     gate: Any,
-    tokens: dict[str, str],
+    control_tokens: dict[str, str],
+    ingest_tokens: dict[str, str],
     wake: asyncio.Event,
 ) -> Starlette:
-    """纯组装,可测。tokens 是 {channel: token},token 决定渠道(协议契约)。
+    """纯组装,可测。token 分能力两类(M2-5 补做):
+
+    - control_tokens(控制端,你):四个端点全权——messages + outbox + commands + health;
+    - ingest_tokens(数据面来源):**只准 POST /v1/messages**,其余一律 403。
+
+    命令端点是门控的开关:若是任意 token 都能按它,恶意短信正常入站(提案 pending,
+    门控在正常工作)后,同一个 token 自己 POST /v1/commands 就能批准自己——攻击链
+    不需要攻破模型。所以控制端与数据面必须分开配(token 决定渠道,也决定能力)。
 
     ledger/gate 由 Memory bundle 提供,这里只调用它的少量方法(如
     gate.unsettled_count),形状归 bundle 管——组装根的适配接口,和 build_steward
     里的 ledger/gate 一样不定死类型。
     """
 
-    def channel_for_token(token: str) -> str | None:
-        for channel, expected in tokens.items():
-            if hmac.compare_digest(expected, token):
-                return channel
-        return None
-
-    def authenticate(request: Request) -> str | None:
+    def authenticate(request: Request) -> tuple[str, str] | None:
+        """返回 (scope, channel);scope ∈ {"control","ingest"}。token 对不上 → None。"""
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return None
-        return channel_for_token(auth[len("Bearer ") :].strip())
+        token = auth[len("Bearer ") :].strip()
+        for channel, expected in control_tokens.items():
+            if hmac.compare_digest(expected, token):
+                return ("control", channel)
+        for channel, expected in ingest_tokens.items():
+            if hmac.compare_digest(expected, token):
+                return ("ingest", channel)
+        return None
+
+    def require_control(request: Request) -> tuple[str, str] | JSONResponse:
+        """控制端专属端点认证:通过返回 (scope, channel);否则返回要直接回给客户端的
+        401(无/错 token)或 403(有效 token 但能力不足——ingest 数据面)。"""
+        auth = authenticate(request)
+        if auth is None:
+            return _UNAUTHORIZED
+        if auth[0] != "control":
+            # 有效但只配入站的 token 想按门控开关 → 403。不泄露(比如)token 是否有效。
+            return _FORBIDDEN
+        return (auth[0], auth[1])
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
@@ -111,9 +133,11 @@ def create_app(
                 logger.info("退出前结算 %d 条提案", settled)
 
     async def post_message(request: Request) -> JSONResponse:
-        channel = authenticate(request)
-        if channel is None:
+        # 控制端与数据面都能入站(数据面来的消息照样是 Envelope,照样走门控)。
+        auth = authenticate(request)
+        if auth is None:
             return _UNAUTHORIZED
+        _, channel = auth
         try:
             payload = await request.json()
         except Exception:
@@ -148,9 +172,10 @@ def create_app(
         return JSONResponse({"envelope_id": env.id, "duplicate": duplicate}, status_code=202)
 
     async def get_outbox(request: Request) -> JSONResponse:
-        channel = authenticate(request)
-        if channel is None:
-            return _UNAUTHORIZED
+        auth = require_control(request)
+        if isinstance(auth, JSONResponse):
+            return auth
+        _, channel = auth
         try:
             after = int(request.query_params.get("after", "0"))
         except ValueError:
@@ -186,25 +211,28 @@ def create_app(
         )
 
     async def get_health(request: Request) -> JSONResponse:
-        channel = authenticate(request)
-        if channel is None:
-            return _UNAUTHORIZED
+        auth = require_control(request)
+        if isinstance(auth, JSONResponse):
+            return auth
         return JSONResponse(
             {"pending": steward.inbox.pending_count(), "unsettled": gate.unsettled_count()},
             status_code=200,
         )
 
     async def post_command(request: Request) -> JSONResponse:
-        """命令端点——**这个端点从此就是门控的开关(D12)**。
+        """命令端点——**这个端点从此就是门控的开关(D12)**,且只对控制端开放。
 
-        /approve /settle /rollback 都从这里直通 Gate,不经模型。M5 做 python_sandbox
-        时,"沙箱无网络"就是防它被**模型自己 POST** 到这里的墙——两条约束是绑定的,
-        谁也不许单独放松:沙箱一旦联网,被注入的模型就能自己 /approve 把恶意事实
-        永久写进账本。
+        /approve /settle /rollback 都从这里直通 Gate,不经模型。ingest token 若也能按它,
+        恶意短信正常入站(提案 pending)后同一个 token 自己批准自己——攻击链不需要攻破模型,
+        门控整个溶掉。所以这里只认控制端 token(M2-5 补做)。
+
+        M5 做 python_sandbox 时,"沙箱无网络"就是防它被**模型自己 POST** 到这里的墙——
+        两条约束是绑定的,谁也不许单独放松:沙箱一旦联网,被注入的模型就能自己 /approve
+        把恶意事实永久写进账本。
         """
-        channel = authenticate(request)
-        if channel is None:
-            return _UNAUTHORIZED
+        auth = require_control(request)
+        if isinstance(auth, JSONResponse):
+            return auth
         try:
             payload = await request.json()
         except Exception:
@@ -215,13 +243,13 @@ def create_app(
         if not isinstance(line, str) or not line.strip():
             return JSONResponse({"error": "缺 line 字段"}, status_code=400)
 
+        if line.strip() == "/quit":
+            # /quit 在 HTTP 语境零副作用:结算有它自己的时机(worker 空闲 D11 / /settle),
+            # 客户端关窗口不是系统事件,不该触发前缀缓存重建,也不该吞掉任何错误。
+            return JSONResponse({"text": "服务端无退出概念,请直接关客户端。"}, status_code=200)
+
         result = handle_command(line, steward=steward, ledger=ledger, gate=gate)
-        text = (
-            # /quit 在 HTTP 语境无退出概念:结算已在 handle_command 里执行(副作用),
-            # 只把 should_quit 翻译成一句提示,服务不退。
-            "服务端无退出概念,请直接关客户端。" if result.should_quit else result.text
-        )
-        return JSONResponse({"text": text}, status_code=200)
+        return JSONResponse({"text": result.text}, status_code=200)
 
     routes = [
         Route("/v1/messages", endpoint=post_message, methods=["POST"]),
@@ -243,7 +271,8 @@ def main() -> None:
         steward=steward,
         ledger=ledger,
         gate=gate,
-        tokens=settings.tokens,
+        control_tokens=settings.control_tokens,
+        ingest_tokens=settings.ingest_tokens,
         wake=wake,
     )
     uvicorn.run(app, host=settings.bind_host, port=settings.bind_port)

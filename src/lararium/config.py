@@ -33,7 +33,8 @@ class Settings:
     max_attempts: int
     bind_host: str
     bind_port: int
-    tokens: dict[str, str]
+    control_tokens: dict[str, str]
+    ingest_tokens: dict[str, str]
 
     @classmethod
     def load(cls) -> "Settings":
@@ -50,5 +51,9 @@ class Settings:
             max_attempts=int(os.environ.get("LARARIUM_MAX_ATTEMPTS", "3")),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
-            tokens=parse_tokens(os.environ.get("LARARIUM_TOKENS", "")),
+            # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。
+            # 命令端点是门控的开关——ingest token 若也能按它,恶意短信进站后能自己批准
+            # 自己(攻击链不需要攻破模型),门控整个溶掉。所以两种 token 分开配。
+            control_tokens=parse_tokens(os.environ.get("LARARIUM_TOKENS", "")),
+            ingest_tokens=parse_tokens(os.environ.get("LARARIUM_INGEST_TOKENS", "")),
         )

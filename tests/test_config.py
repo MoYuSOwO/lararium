@@ -17,12 +17,24 @@ def test_load_reads_env(monkeypatch, tmp_path):
     assert settings.max_attempts == 3  # 默认值
     assert settings.bind_host == "127.0.0.1"  # 默认值(M2 只绑本机,不公网)
     assert settings.bind_port == 8420  # 默认值
-    assert settings.tokens == {}  # 默认值
+    assert settings.control_tokens == {}  # 默认值
+    assert settings.ingest_tokens == {}  # 默认值
 
 
 def test_parse_tokens_splits_channels(monkeypatch):
     monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
     assert parse_tokens("cli:tok-abc,web:tok-xyz") == {"cli": "tok-abc", "web": "tok-xyz"}
+
+
+def test_load_separates_control_and_ingest_tokens(monkeypatch):
+    """控制端(全权)与数据面(只准入站)是两份环境变量——命令端点是门控开关,
+    ingest token 若也能按它,恶意短信能自己批准自己(M2-5 补做)。"""
+    monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
+    monkeypatch.setenv("LARARIUM_TOKENS", "cli:tok-abc")
+    monkeypatch.setenv("LARARIUM_INGEST_TOKENS", "smsforwarder:tok-ingest")
+    settings = Settings.load()
+    assert settings.control_tokens == {"cli": "tok-abc"}
+    assert settings.ingest_tokens == {"smsforwarder": "tok-ingest"}
 
 
 def test_parse_tokens_ignores_blank_segments():
