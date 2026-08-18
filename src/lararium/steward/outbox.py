@@ -25,6 +25,11 @@ class Outbox:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """只读暴露连接:与 inbox 同库时才可能同事务(投递+完成原子化),见 loop。"""
+        return self._conn
+
     def put(self, envelope_id: str, channel: str, content: str, kind: str = "reply") -> int:
         """把一条投递写入出件箱,返回其全局递增 seq。"""
         cur = self._conn.execute(

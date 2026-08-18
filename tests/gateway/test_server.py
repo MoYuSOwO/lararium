@@ -94,7 +94,7 @@ def test_post_message_maps_token_to_channel_and_ignores_forged_channel(server):
     body = r.json()
     assert body["duplicate"] is False
     env_id = body["envelope_id"]
-    row = steward.inbox._conn.execute(
+    row = steward.inbox.conn.execute(
         "SELECT channel, state FROM inbox WHERE id=?", (env_id,)
     ).fetchone()
     assert row["channel"] == "cli"
@@ -109,9 +109,7 @@ def test_duplicate_post_same_id_only_processed_once(server):
     r2 = client.post("/v1/messages", json={"id": env_id, "content": "第一条"}, headers=h)
     assert r1.status_code == 202 and r1.json()["duplicate"] is False
     assert r2.status_code == 202 and r2.json()["duplicate"] is True
-    n = steward.inbox._conn.execute("SELECT COUNT(*) FROM inbox WHERE id=?", (env_id,)).fetchone()[
-        0
-    ]
+    n = steward.inbox.conn.execute("SELECT COUNT(*) FROM inbox WHERE id=?", (env_id,)).fetchone()[0]
     assert n == 1
 
 
@@ -127,7 +125,7 @@ def test_post_forged_id_returns_400_and_never_reaches_db(server):
         headers={"Authorization": "Bearer tok-cli"},
     )
     assert r.status_code == 400
-    n = steward.inbox._conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0]
+    n = steward.inbox.conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0]
     assert n == 0, "伪造 id 绝不能入库"
 
 
@@ -165,9 +163,7 @@ def test_post_valid_hex_id_returns_202_and_stays_idempotent(server):
     assert r1.status_code == 202 and r1.json()["duplicate"] is False
     assert r1.json()["envelope_id"] == env_id
     assert r2.status_code == 202 and r2.json()["duplicate"] is True
-    n = steward.inbox._conn.execute("SELECT COUNT(*) FROM inbox WHERE id=?", (env_id,)).fetchone()[
-        0
-    ]
+    n = steward.inbox.conn.execute("SELECT COUNT(*) FROM inbox WHERE id=?", (env_id,)).fetchone()[0]
     assert n == 1
 
 
@@ -323,7 +319,7 @@ def test_ingest_post_maps_channel_from_ingest_token(server):
     )
     assert r.status_code == 202
     env_id = r.json()["envelope_id"]
-    row = steward.inbox._conn.execute("SELECT channel FROM inbox WHERE id=?", (env_id,)).fetchone()
+    row = steward.inbox.conn.execute("SELECT channel FROM inbox WHERE id=?", (env_id,)).fetchone()
     assert row["channel"] == "smsforwarder"
 
 

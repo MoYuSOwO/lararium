@@ -4,10 +4,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from lararium.config import Settings
+from lararium.db import transaction
 from lararium.envelope import Envelope
 from lararium.steward.assembler import Turn, assemble
 from lararium.steward.inbox import Inbox
-from lararium.steward.journal import Journal
+from lararium.steward.journal import Journal, estimate_tokens
 from lararium.steward.model import ModelCallError, ModelClient, format_cache_log
 from lararium.steward.outbox import Outbox
 from lararium.steward.ports import GatePort, LedgerPort
@@ -15,6 +16,10 @@ from lararium.steward.registry import Registry
 from lararium.steward.tools import BuiltinTools
 
 logger = logging.getLogger("lararium")
+
+# L0 预算里给"工具 schema + 输出窗口"的固定留白(token)。工具 schema 实测约
+# 500/请求;输出要占窗口,单用户交互给足 8000。M3-6 的低水位也要继承这个估算口径。
+L0_RESERVE = 8000
 
 
 @dataclass(frozen=True)
@@ -132,16 +137,12 @@ class Steward:
             # 重启 recover_stale 重排队重算 → **重复回复**。放进同一事务:
             # 要么都落、要么都不落;都不落 → 重启重排队重算(多花一次 API 但只回一次),
             # 回复绝不静默吞(D10 at-least-once)。
-            conn = self.inbox._conn
-            assert conn is self.outbox._conn, "组装根必须给 inbox/outbox 注入同一连接"
-            conn.execute("BEGIN")
-            try:
+            if self.inbox.conn is not self.outbox.conn:
+                # 用异常不用 assert:python -O 会吞 assert,异连接下事务会静默退回旧 bug。
+                raise RuntimeError("组装根必须给 inbox/outbox 注入同一连接——异连接下事务不成立")
+            with transaction(self.inbox.conn):
                 self.outbox.put(env.id, env.channel, reply.text, kind="reply")
                 self.inbox.complete(env.id)
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
             return TurnOutcome(kind="replied", text=reply.text)
 
         except ModelCallError as exc:
@@ -166,10 +167,24 @@ class Steward:
             self.inbox.fail(env.id, f"{type(exc).__name__}: {exc}")
             raise
 
+    def _prefix_text(self) -> str:
+        # 与 assemble 渲染前缀区用的同三样材料(persona+目录+账本),只用于估算
+        # "前缀占了多少预算"。组装时就在手上,不用重复构造。
+        return self.persona + self.registry.directory_lines() + self.ledger.read()
+
+    def _l0_token_budget(self) -> int:
+        # M3-1b:LARARIUM_L0_MAX_TOKENS 是**整个上下文预算**(200000=200k 窗口用满)。
+        # 先扣前缀区(persona+目录+账本)再减固定留白(工具 schema + 输出窗口),余额才归
+        # L0——这才是"200k 用满"的忠实实现,不是假装 L0 等于整个窗口。
+        return max(
+            0,
+            self.settings.l0_max_tokens - estimate_tokens(self._prefix_text()) - L0_RESERVE,
+        )
+
     def _recent_turns(self) -> list[Turn]:
-        # M3-1:L0 按 token 预算截断(默认 200k),l0_max_turns 只当轮数兜底。
+        # M3-1:L0 按整个上下文预算的余额截断,l0_max_turns 只当轮数兜底。
         rows = self.journal.recent_turns_within_budget(
-            max_tokens=self.settings.l0_max_tokens, max_turns=self.settings.l0_max_turns
+            max_tokens=self._l0_token_budget(), max_turns=self.settings.l0_max_turns
         )
         return [
             Turn(

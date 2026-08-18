@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 
 from lararium.db import connect
-from lararium.steward.journal import Journal
+from lararium.steward.journal import Journal, estimate_tokens
 
 
 @pytest.fixture
@@ -82,9 +82,13 @@ def test_recent_turns_returns_newest_last(journal):
     assert turns[0]["assistant"] == "回复一"
 
 
-def test_recent_turns_carries_provenance_fields(journal):
-    """P1-1:recent_turns 必须带回 source/channel/untrusted/ts,
-    否则 L0 无法给历史轮套上"外部数据"的包裹。"""
+def test_recent_turns_within_budget_carries_provenance_fields(journal):
+    """P1-1:recent_turns_within_budget 必须带回 source/channel/untrusted/ts,
+    否则 L0 无法给历史轮套上"外部数据"的包裹。
+
+    挂在这个方法上(而不是 recent_turns):recent_turns 已无生产调用,是准死代码,
+    回归测试跟着死代码走,哪天被顺手删掉,覆盖也一起没了。
+    """
     journal.append(
         "env-1",
         "envelope",
@@ -98,7 +102,7 @@ def test_recent_turns_carries_provenance_fields(journal):
     )
     journal.append("env-1", "reply", {"content": "收到"})
 
-    turns = journal.recent_turns(limit=1)
+    turns = journal.recent_turns_within_budget(max_tokens=10**9, max_turns=1)
     (t,) = turns
     assert t["source"] == "module_event"
     assert t["channel"] == "finance"
@@ -106,26 +110,35 @@ def test_recent_turns_carries_provenance_fields(journal):
     assert t["ts"] == "2026-08-17T13:00:00+00:00"
 
 
+def test_estimate_tokens_mixed_cjk_and_latin():
+    """M3-1b:估算器 CJK 每字 0.8 / 非 CJK 每字 0.3(2026-08-19 mimo-v2.5 实测校准),
+    中英混排各按各的,别一刀切。"""
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("你好世界") == int(4 * 0.8)  # 纯中文 0.8/字
+    assert estimate_tokens("hello") == int(5 * 0.3)  # 纯英文 0.3/字
+    assert estimate_tokens("你好hello") == int(2 * 0.8 + 5 * 0.3)  # 混排各按各的
+    # CJK 判定是区间:中文标点/假名这类不进 \u4e00-\u9fff 的按非 CJK 计
+    assert estimate_tokens("。") == int(1 * 0.3)
+
+
 def test_recent_turns_within_budget_stops_when_over(journal):
     """M3-1:从最新往回填,累计估算 token 超预算即停;返回时间正序(旧→新)。
 
-    各轮估算:env-0=25, env-1=45, env-2=85, env-3(newest)=105。
-    budget=200 → 最新 env-3 必进(105),env-2(85)=190 仍在预算内,env-1(45)再进就 235>200。
+    各轮估算(纯 CJK,0.8/字):env-0=40, env-1=80, env-2=160, env-3(newest)=240。
+    budget=400 → 最新 env-3 必进(240),env-2(160)=400 仍在预算内,env-1(80)再进就 480>400。
     """
-    for i, (u_len, a_len) in enumerate([(40, 10), (80, 10), (160, 10), (200, 10)]):
-        journal.append(f"env-{i}", "envelope", {"content": "u" * u_len})
-        journal.append(f"env-{i}", "reply", {"content": "a" * a_len})
+    for i, u_len in enumerate([50, 100, 200, 300]):
+        journal.append(f"env-{i}", "envelope", {"content": "用" * u_len})
 
-    turns = journal.recent_turns_within_budget(max_tokens=200)
+    turns = journal.recent_turns_within_budget(max_tokens=400)
     assert [t["envelope_id"] for t in turns] == ["env-2", "env-3"], "应只留最新两轮,时间正序"
 
 
 def test_recent_turns_within_budget_keeps_newest_even_if_over(journal):
     """单轮超预算也要返回最新一轮——宁可多塞一轮,别把"刚说的"丢了。"""
-    journal.append("env-0", "envelope", {"content": "u" * 40})
-    journal.append("env-0", "reply", {"content": "a" * 10})
-    journal.append("env-1", "envelope", {"content": "u" * 200})  # 单轮估算 105
-    journal.append("env-1", "reply", {"content": "a" * 10})
+    journal.append("env-0", "envelope", {"content": "用" * 50})
+    journal.append("env-1", "envelope", {"content": "用" * 300})  # 单轮估算 240 token
+    journal.append("env-1", "reply", {"content": "回" * 10})
 
     turns = journal.recent_turns_within_budget(max_tokens=10)
     assert [t["envelope_id"] for t in turns] == ["env-1"], "最新一轮即使超预算也要返回"

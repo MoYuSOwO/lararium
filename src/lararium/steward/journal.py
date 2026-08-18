@@ -7,6 +7,17 @@ from typing import Any
 SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 
 
+# CJK / 非 CJK 的每字 token 估算。2026-08-19 对 mimo-v2.5 实测校准——
+# `len(text)//2`(= 每字 0.5)低估 1.4~1.6 倍:
+#   重复样本 660 字 → 520 token = 0.788/字;日常 222 字 → 156 token = 0.703/字。
+# 所以 CJK 每字按 0.8、非 CJK 每字按 0.3(英文约 3~4 字符/token)。
+# 中英混排别一刀切:英文按 0.8 算会白扔一半预算。**换 provider / 换 tokenizer 要
+# 重新实测,这两个数不是普适常数。**
+def estimate_tokens(text: str) -> int:
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return int(cjk * 0.8 + (len(text) - cjk) * 0.3)
+
+
 @dataclass(frozen=True)
 class SearchHit:
     envelope_id: str
@@ -104,26 +115,43 @@ class Journal:
             for r in rows
         ]
 
-    def _turn(self, env_id: str) -> dict[str, Any]:
-        """取某一轮 (envelope → reply) 的对,带 provenance 字段(P1-1)。
+    def _turns_by_id(self, env_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """一条 SQL 取这批信封的 (envelope, reply),按 env_id 建索引。
 
-        两个 recent_* 共用同一份提取逻辑,不许各写一份——漂移会让两条路径渲染出的
-        历史轮不一致(P1-1 的教训)。
+        **不走 replay()**:replay 拉该信封**全部 kind**,含 prompt 事件——那里面装着
+        整份组装好的上下文。每组装一次 L0 就把最近 N 个信封的 prompt 全部 json.loads
+        一遍再扔掉,M3-1 把兜底提到 2000 后摊开了(实测 274ms → 14ms)。这里只取
+        envelope/reply 两种 kind,一次取完。replay() 本身保留——逐字重放整轮就该拿
+        全部 kind。
         """
-        events = self.replay(env_id)
-        env = next((e for e in events if e["kind"] == "envelope"), None)
-        assistant = next(
-            (e["payload"].get("content") for e in events if e["kind"] == "reply"), None
-        )
-        return {
-            "envelope_id": env_id,
-            "user": env["payload"].get("content") if env else None,
-            "assistant": assistant,
-            "source": env["payload"].get("source", "user") if env else "user",
-            "channel": env["payload"].get("channel", "cli") if env else "cli",
-            "untrusted": bool(env["payload"].get("meta", {}).get("untrusted")) if env else False,
-            "ts": env["payload"].get("ts") if env else None,
-        }
+        if not env_ids:
+            return {}
+        # IN 列表数量不定,S608 无法静态证明安全;qmarks 全是 ?、参数是内部 hex 信封
+        # id,无用户数据进 SQL 文本——所以 noqa 是安全的(G4 最小范围)。
+        qmarks = ",".join("?" * len(env_ids))
+        query = f"SELECT envelope_id, kind, payload FROM journal WHERE envelope_id IN ({qmarks}) AND kind IN ('envelope','reply') ORDER BY seq"  # noqa: S608
+        rows = self._conn.execute(query, env_ids).fetchall()
+        env: dict[str, dict[str, Any]] = {}
+        assistant: dict[str, str | None] = {}
+        for r in rows:
+            payload = json.loads(r["payload"])
+            if r["kind"] == "envelope":
+                env[r["envelope_id"]] = payload
+            else:
+                assistant[r["envelope_id"]] = payload.get("content")
+        out: dict[str, dict[str, Any]] = {}
+        for eid in env_ids:
+            e = env.get(eid)
+            out[eid] = {
+                "envelope_id": eid,
+                "user": e.get("content") if e else None,
+                "assistant": assistant.get(eid),
+                "source": e.get("source", "user") if e else "user",
+                "channel": e.get("channel", "cli") if e else "cli",
+                "untrusted": bool(e.get("meta", {}).get("untrusted")) if e else False,
+                "ts": e.get("ts") if e else None,
+            }
+        return out
 
     def recent_turns(self, limit: int) -> list[dict[str, Any]]:
         """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。
@@ -139,7 +167,8 @@ class Journal:
                 (limit,),
             ).fetchall()
         ][::-1]
-        return [self._turn(env_id) for env_id in ids]
+        by_id = self._turns_by_id(ids)
+        return [by_id[e] for e in ids]
 
     def recent_turns_within_budget(
         self, max_tokens: int, max_turns: int = 2000
@@ -147,9 +176,9 @@ class Journal:
         """M3-1:L0 按 token 预算截断。从最新往回填,累计估算 token 超预算即停;
         返回时间正序(旧→新)。
 
-        token 是 `len(文本)//2` 的中文粗估——**只是预算控制,不是精确计费**,注明
-        是估算。单轮即使超预算也**至少返回最新一轮**:宁可多塞一轮,也别把"刚说的"
-        丢了(截断发生在最旧端,最新一轮是对话接续的锚点)。
+        估算用 estimate_tokens(CJK 0.8 / 非 CJK 0.3,实测校准)——是预算控制不是
+        精确计费。单轮即使超预算也**至少返回最新一轮**:宁可多塞一轮,也别把
+        "刚说的"丢了(截断发生在最旧端,最新一轮是对话接续的锚点)。
         max_turns 是轮数兜底:预算再大也不超过它(L0 整段进上下文,不封顶会撑爆)。
         """
         ids = [
@@ -160,11 +189,12 @@ class Journal:
                 (max_turns,),
             ).fetchall()
         ]
+        by_id = self._turns_by_id(ids)
         turns: list[dict[str, Any]] = []
         used = 0
         for env_id in ids:
-            t = self._turn(env_id)
-            est = (len(t["user"] or "") + len(t["assistant"] or "")) // 2
+            t = by_id[env_id]
+            est = estimate_tokens(t["user"] or "") + estimate_tokens(t["assistant"] or "")
             if turns and used + est > max_tokens:  # 最新一轮(首个)无条件进
                 break
             turns.append(t)

@@ -117,7 +117,7 @@ async def test_poison_message_does_not_break_worker(worker_factory):
         # 毒消息 produce 不了回复,但后续消息必须照常处理——worker 没陪葬
         await wait_until(lambda: len(steward.outbox.take("cli", after=0)) == 1)
         assert steward.outbox.take("cli", after=0)[0].content == "好的后续"
-        row = steward.inbox._conn.execute(
+        row = steward.inbox.conn.execute(
             "SELECT state FROM inbox WHERE id=?", (poison.id,)
         ).fetchone()
         assert row["state"] == "failed"

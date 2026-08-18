@@ -1,4 +1,6 @@
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA = """
@@ -61,3 +63,20 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     return conn
+
+
+@contextmanager
+def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """显式事务:with 块内**同一连接**的语句原子化,异常自动回滚。
+
+    isolation_level=None 下每个 execute 各自自动提交,跨对象的"一起成、一起不成"
+    必须显式 BEGIN/COMMIT。调用方别再伸手拿各对象的 _conn 去拼(违反 S3),把
+    一个共享连接交给它即可。
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise

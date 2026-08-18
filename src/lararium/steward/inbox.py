@@ -13,6 +13,12 @@ class Inbox:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """只读暴露连接:组装根需要拿它开显式事务(如 投递+完成 原子化)时走这里,
+        别伸手够 _conn(S3)。"""
+        return self._conn
+
     def put(self, env: Envelope) -> None:
         self._conn.execute(
             "INSERT INTO inbox (id, source, channel, content, meta, ts) VALUES (?,?,?,?,?,?)",

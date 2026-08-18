@@ -195,7 +195,7 @@ async def test_reply_lands_in_outbox_before_envelope_completes(steward_factory):
     assert items[0].envelope_id == env.id
     assert items[0].content == "这是回复"
     # 信封已标记完成(complete 在 put 之后)
-    row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    row = steward.inbox.conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
     assert row["state"] == "done"
 
 
@@ -209,7 +209,7 @@ async def test_delivery_and_completion_are_atomic(steward_factory):
     两种崩法下事务都会把 put 一起回滚。
     """
     steward, _ = steward_factory([ModelReply(text="回复")])
-    conn = steward.inbox._conn
+    conn = steward.inbox.conn
     env = Envelope.new(source="user", channel="cli", content="你好")
     steward.submit(env)
 
@@ -235,6 +235,7 @@ async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
         def __init__(self, inner, conn):
             self._inner, self._conn = inner, conn
             self.state_at_put: str | None = None
+            self.conn = conn  # loop 的事务经 self.outbox.conn 判断同库,spy 也要有这个口
 
         def put(self, envelope_id, channel, content, kind="reply"):
             row = self._conn.execute(
@@ -244,7 +245,7 @@ async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
             return self._inner.put(envelope_id, channel, content, kind)
 
     steward, _ = steward_factory([ModelReply(text="回复")])
-    spy = SpyOutbox(steward.outbox, steward.inbox._conn)
+    spy = SpyOutbox(steward.outbox, steward.inbox.conn)
     steward.outbox = spy
     env = Envelope.new(source="user", channel="cli", content="你好")
     steward.submit(env)
@@ -269,7 +270,7 @@ async def test_retryable_model_error_releases_envelope_without_notice(steward_fa
     assert outcome.kind == "retry_later", "可重试错应标记 retry_later,让 worker 退避重试"
     assert outcome.attempts == 1
 
-    row = steward.inbox._conn.execute(
+    row = steward.inbox.conn.execute(
         "SELECT state, attempts FROM inbox WHERE id=?", (env.id,)
     ).fetchone()
     assert row["state"] == "pending", "可重试错应把信封放回 pending,而不是 failed"
@@ -300,7 +301,7 @@ async def test_retryable_failures_abandon_after_max_attempts_with_notice(steward
     assert (await steward.process_next()).kind == "retry_later"
     assert (await steward.process_next()).kind == "replied"  # 终态:发 notice,消费了槽位
 
-    row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    row = steward.inbox.conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
     assert row["state"] == "failed"
 
     items = steward.outbox.take(env.channel, after=0)
@@ -325,7 +326,7 @@ async def test_terminal_model_error_fails_immediately_with_notice(steward_factor
     # 终态:立即 failed + notice,kind=replied 表示"本轮消费了槽位走到终态"
     assert outcome.kind == "replied"
 
-    row = steward.inbox._conn.execute(
+    row = steward.inbox.conn.execute(
         "SELECT state, attempts FROM inbox WHERE id=?", (env.id,)
     ).fetchone()
     assert row["state"] == "failed"
@@ -375,7 +376,47 @@ async def test_non_model_error_still_bubbles_up(steward_factory):
     with pytest.raises(ValueError):
         await steward.process_next()
 
-    row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    row = steward.inbox.conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
     assert row["state"] == "failed"
     # 裸异常不是模型失败,不该出 notice——它会冒泡给 worker 处理
     assert steward.outbox.take(env.channel, after=0) == []
+
+
+def test_l0_budget_deducts_prefix(steward_factory):
+    """M3-1b:L0 的 token 预算是「整窗 - 前缀(人格+目录+账本)- 留白」的余额。
+
+    前缀越大,留给 L0 的越少——LARARIUM_L0_MAX_TOKENS 是整窗,不是假装 L0 等于整窗。
+    """
+    steward, _ = steward_factory()
+    small_prefix = steward._l0_token_budget()
+    steward.persona = "用" * 10000  # ≈8000 token 的人格
+    big_prefix_budget = steward._l0_token_budget()
+    assert big_prefix_budget < small_prefix, "人格越大,留给 L0 的预算越少"
+
+
+def test_l0_truncated_before_context_overflow(steward_factory, monkeypatch):
+    """M3-1b:整体预算扣前缀+留白后,L0 先截断,不让请求把上下文打到超窗。
+
+    塞 500 轮历史、把整窗预算压到只够一部分——最新一轮(接续锚点)必须在,最旧一轮被截掉。
+    """
+    monkeypatch.setenv("LARARIUM_L0_MAX_TOKENS", "30000")  # 整窗预算,前缀+留白吃掉一大块
+    steward, _ = steward_factory()
+    for i in range(500):  # user 长约 80 token(CJK),500 轮总 ~4 万 token,稳超 L0 余额
+        steward.journal.append(
+            f"env-{i}",
+            "envelope",
+            {
+                "content": "用" * 100,
+                "source": "user",
+                "channel": "cli",
+                "meta": {},
+                "ts": "2026-08-01T00:00:00+00:00",
+            },
+        )
+        steward.journal.append(f"env-{i}", "reply", {"content": f"回{i}"})
+
+    turns = steward._recent_turns()
+    assistants = [t.assistant for t in turns]
+    assert 0 < len(assistants) < 500, f"预算耗尽前必须截断 L0,实际保留了 {len(assistants)} 轮"
+    assert assistants[-1] == "回499", "最新一轮(对话接续锚点)必须在"
+    assert assistants[0] != "回0", "最旧一轮应被截掉(截断只发生在最旧端)"
