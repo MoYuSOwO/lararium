@@ -62,6 +62,37 @@ def _classify_retryable(exc: Exception) -> bool:
     return True
 
 
+# 服务商对"上下文超长"的报错措辞五花八门(market)。M3-1 识别这一类 400,
+# 把 notice 从 `status_code: 400` 换成说人话的「把 LARARIUM_L0_MAX_TOKENS 调小」。
+_CONTEXT_TOO_LONG_MARKERS = (
+    "maximum context length",
+    "context length exceeded",
+    "context_length_exceeded",
+    "prompt is too long",
+    "the prompt is too long",
+    "tokens exceeds the maximum",
+    "请求的上下文长度超过",
+    "上下文超长",
+)
+
+
+def _context_too_long(exc: Exception) -> bool:
+    """是不是"上下文超长"类 400——只有 400,且 body/消息里带超长措辞才认。"""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    if not isinstance(exc, ModelHTTPError) or exc.status_code != 400:
+        return False
+    blob = f"{exc.body or ''} {exc}".lower()
+    return any(m in blob for m in _CONTEXT_TOO_LONG_MARKERS)
+
+
+def _error_message(exc: Exception) -> str:
+    """把第三方异常翻译成给用户看的消息;上下文超长类给可操作的提示。"""
+    if _context_too_long(exc):
+        return "上下文超长:把 LARARIUM_L0_MAX_TOKENS 调小,或等压缩(L3 起)腾出空间。"
+    return f"{type(exc).__name__}: {exc}"
+
+
 def extract_cache_hit_tokens(usage: Any) -> int | None:
     details = getattr(usage, "details", None) or {}
     for key in _CACHE_HIT_KEYS:
@@ -156,10 +187,9 @@ class PydanticAIClient:
             result = await agent.run(ctx.messages[-1]["content"], message_history=history)
         except Exception as exc:
             # 把 pydantic-ai 的异常在这里分类成自家类型——loop 只认 ModelCallError,
-            # 不认第三方异常,这是隔离盒存在的理由(D2)。
-            raise ModelCallError(
-                f"{type(exc).__name__}: {exc}", retryable=_classify_retryable(exc)
-            ) from exc
+            # 不认第三方异常,这是隔离盒存在的理由(D2)。消息由 _error_message
+            # 翻译(上下文超长类说人话,M3-1)。
+            raise ModelCallError(_error_message(exc), retryable=_classify_retryable(exc)) from exc
         usage = result.usage
 
         tool_events: list[dict[str, Any]] = []

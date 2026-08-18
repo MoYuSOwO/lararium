@@ -30,6 +30,7 @@ class Settings:
     data_dir: Path
     timezone: str
     l0_max_turns: int
+    l0_max_tokens: int
     max_attempts: int
     bind_host: str
     bind_port: int
@@ -47,7 +48,9 @@ class Settings:
             model_name=os.environ.get("LARARIUM_MODEL", "deepseek-chat"),
             data_dir=Path(os.environ.get("LARARIUM_DATA_DIR", "./data")),
             timezone=os.environ.get("LARARIUM_TIMEZONE", "Asia/Shanghai"),
-            l0_max_turns=int(os.environ.get("LARARIUM_L0_MAX_TURNS", "30")),
+            # M3-1:L0 按 token 预算截断,l0_max_turns 只当轮数兜底(M3 前默认 30 太小)。
+            l0_max_turns=int(os.environ.get("LARARIUM_L0_MAX_TURNS", "2000")),
+            l0_max_tokens=int(os.environ.get("LARARIUM_L0_MAX_TOKENS", "200000")),
             max_attempts=int(os.environ.get("LARARIUM_MAX_ATTEMPTS", "3")),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),

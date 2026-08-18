@@ -199,6 +199,34 @@ async def test_reply_lands_in_outbox_before_envelope_completes(steward_factory):
     assert row["state"] == "done"
 
 
+async def test_delivery_and_completion_are_atomic(steward_factory):
+    """M3-1 Step0:outbox.put 与 inbox.complete 在同一事务。
+
+    M2-6 遗留:两个语句各自动提交,complete 崩了就留下「出件箱有回复、信封未完成」
+    的半态 → 重启 recover_stale 重排队重算 → **重复回复**。事务化后 complete 抛异常,
+    put 必须一起回滚——不给重复回复留半点机会。这里用「complete 抛异常」模拟崩在
+    put 之后;真实 SIGKILL 时信封停在 processing,活异常时走毒消息路径标 failed,
+    两种崩法下事务都会把 put 一起回滚。
+    """
+    steward, _ = steward_factory([ModelReply(text="回复")])
+    conn = steward.inbox._conn
+    env = Envelope.new(source="user", channel="cli", content="你好")
+    steward.submit(env)
+
+    def boom(env_id):
+        raise RuntimeError("模拟 complete 时崩溃")
+
+    steward.inbox.complete = boom
+
+    with pytest.raises(RuntimeError):
+        await steward.process_next()
+
+    n = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    assert n == 0, "complete 抛异常时 put 必须一起回滚(否则半态会让重启重复回复)"
+    row = conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    assert row["state"] != "done", "信封不能已完成——已完成的信封配上残留回复正是重复的来源"
+
+
 async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
     """钉住顺序本身:put 被调用的那一刻,信封必须还没 complete。
     反过来(先 complete 后 put)意味着:崩在两者之间 = 回复静默丢失,D10 白设计。"""
@@ -306,6 +334,30 @@ async def test_terminal_model_error_fails_immediately_with_notice(steward_factor
     notices = [i for i in steward.outbox.take(env.channel, after=0) if i.kind == "notice"]
     assert len(notices) == 1
     assert "认证失败" in notices[0].content
+
+
+async def test_context_too_long_notice_speaks_human(steward_factory):
+    """M3-1:上下文超长类终态错,notice 说人话,不甩 `status_code: 400`。"""
+
+    class TooLong:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ModelCallError(
+                "上下文超长:把 LARARIUM_L0_MAX_TOKENS 调小,或等压缩(L3 起)腾出空间。",
+                retryable=False,
+            )
+
+    steward, _ = steward_factory()
+    steward.model = TooLong()
+    env = Envelope.new(source="user", channel="cli", content="很长的输入")
+    steward.submit(env)
+
+    outcome = await steward.process_next()
+    assert outcome.kind == "replied"  # 终态:发 notice,消费了槽位
+    notices = [i for i in steward.outbox.take(env.channel, after=0) if i.kind == "notice"]
+    assert len(notices) == 1
+    assert "上下文超长" in notices[0].content
+    assert "LARARIUM_L0_MAX_TOKENS" in notices[0].content
+    assert "status_code" not in notices[0].content
 
 
 async def test_non_model_error_still_bubbles_up(steward_factory):

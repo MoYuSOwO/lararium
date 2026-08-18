@@ -13,7 +13,8 @@ def test_load_reads_env(monkeypatch, tmp_path):
     assert settings.model_name == "test-model"
     assert settings.data_dir == tmp_path
     assert settings.timezone == "Asia/Shanghai"  # 默认值
-    assert settings.l0_max_turns == 30  # 默认值
+    assert settings.l0_max_turns == 2000  # 默认值(M3-1:轮数兜底)
+    assert settings.l0_max_tokens == 200000  # 默认值(M3-1:L0 token 预算)
     assert settings.max_attempts == 3  # 默认值
     assert settings.bind_host == "127.0.0.1"  # 默认值(M2 只绑本机,不公网)
     assert settings.bind_port == 8420  # 默认值

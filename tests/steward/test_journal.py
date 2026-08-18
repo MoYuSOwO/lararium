@@ -104,3 +104,40 @@ def test_recent_turns_carries_provenance_fields(journal):
     assert t["channel"] == "finance"
     assert t["untrusted"] is True
     assert t["ts"] == "2026-08-17T13:00:00+00:00"
+
+
+def test_recent_turns_within_budget_stops_when_over(journal):
+    """M3-1:从最新往回填,累计估算 token 超预算即停;返回时间正序(旧→新)。
+
+    各轮估算:env-0=25, env-1=45, env-2=85, env-3(newest)=105。
+    budget=200 → 最新 env-3 必进(105),env-2(85)=190 仍在预算内,env-1(45)再进就 235>200。
+    """
+    for i, (u_len, a_len) in enumerate([(40, 10), (80, 10), (160, 10), (200, 10)]):
+        journal.append(f"env-{i}", "envelope", {"content": "u" * u_len})
+        journal.append(f"env-{i}", "reply", {"content": "a" * a_len})
+
+    turns = journal.recent_turns_within_budget(max_tokens=200)
+    assert [t["envelope_id"] for t in turns] == ["env-2", "env-3"], "应只留最新两轮,时间正序"
+
+
+def test_recent_turns_within_budget_keeps_newest_even_if_over(journal):
+    """单轮超预算也要返回最新一轮——宁可多塞一轮,别把"刚说的"丢了。"""
+    journal.append("env-0", "envelope", {"content": "u" * 40})
+    journal.append("env-0", "reply", {"content": "a" * 10})
+    journal.append("env-1", "envelope", {"content": "u" * 200})  # 单轮估算 105
+    journal.append("env-1", "reply", {"content": "a" * 10})
+
+    turns = journal.recent_turns_within_budget(max_tokens=10)
+    assert [t["envelope_id"] for t in turns] == ["env-1"], "最新一轮即使超预算也要返回"
+
+
+def test_recent_turns_within_budget_respects_turns_ceiling(journal):
+    """轮数上限是兜底:预算再大也不超过 max_turns 轮。"""
+    for i in range(5):
+        journal.append(f"env-{i}", "envelope", {"content": f"第{i}轮"})
+        journal.append(f"env-{i}", "reply", {"content": "回"})
+
+    turns = journal.recent_turns_within_budget(max_tokens=10**9, max_turns=2)
+    assert [t["envelope_id"] for t in turns] == ["env-3", "env-4"], (
+        "预算充足时被 max_turns 兜底截断"
+    )

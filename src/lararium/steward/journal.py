@@ -104,11 +104,33 @@ class Journal:
             for r in rows
         ]
 
+    def _turn(self, env_id: str) -> dict[str, Any]:
+        """取某一轮 (envelope → reply) 的对,带 provenance 字段(P1-1)。
+
+        两个 recent_* 共用同一份提取逻辑,不许各写一份——漂移会让两条路径渲染出的
+        历史轮不一致(P1-1 的教训)。
+        """
+        events = self.replay(env_id)
+        env = next((e for e in events if e["kind"] == "envelope"), None)
+        assistant = next(
+            (e["payload"].get("content") for e in events if e["kind"] == "reply"), None
+        )
+        return {
+            "envelope_id": env_id,
+            "user": env["payload"].get("content") if env else None,
+            "assistant": assistant,
+            "source": env["payload"].get("source", "user") if env else "user",
+            "channel": env["payload"].get("channel", "cli") if env else "cli",
+            "untrusted": bool(env["payload"].get("meta", {}).get("untrusted")) if env else False,
+            "ts": env["payload"].get("ts") if env else None,
+        }
+
     def recent_turns(self, limit: int) -> list[dict[str, Any]]:
         """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。
 
         每条带上 source / channel / untrusted / ts——L0 渲染要给历史轮套上
-        "外部数据"的包裹(P1-1),没有这些 provenance 字段就无从判断。"""
+        "外部数据"的包裹(P1-1),没有这些 provenance 字段就无从判断。
+        """
         ids = [
             r["envelope_id"]
             for r in self._conn.execute(
@@ -117,24 +139,34 @@ class Journal:
                 (limit,),
             ).fetchall()
         ][::-1]
-        turns = []
+        return [self._turn(env_id) for env_id in ids]
+
+    def recent_turns_within_budget(
+        self, max_tokens: int, max_turns: int = 2000
+    ) -> list[dict[str, Any]]:
+        """M3-1:L0 按 token 预算截断。从最新往回填,累计估算 token 超预算即停;
+        返回时间正序(旧→新)。
+
+        token 是 `len(文本)//2` 的中文粗估——**只是预算控制,不是精确计费**,注明
+        是估算。单轮即使超预算也**至少返回最新一轮**:宁可多塞一轮,也别把"刚说的"
+        丢了(截断发生在最旧端,最新一轮是对话接续的锚点)。
+        max_turns 是轮数兜底:预算再大也不超过它(L0 整段进上下文,不封顶会撑爆)。
+        """
+        ids = [
+            r["envelope_id"]
+            for r in self._conn.execute(
+                "SELECT envelope_id, MAX(seq) AS last_seq FROM journal "
+                "GROUP BY envelope_id ORDER BY last_seq DESC LIMIT ?",
+                (max_turns,),
+            ).fetchall()
+        ]
+        turns: list[dict[str, Any]] = []
+        used = 0
         for env_id in ids:
-            events = self.replay(env_id)
-            env = next((e for e in events if e["kind"] == "envelope"), None)
-            assistant = next(
-                (e["payload"].get("content") for e in events if e["kind"] == "reply"), None
-            )
-            turns.append(
-                {
-                    "envelope_id": env_id,
-                    "user": env["payload"].get("content") if env else None,
-                    "assistant": assistant,
-                    "source": env["payload"].get("source", "user") if env else "user",
-                    "channel": env["payload"].get("channel", "cli") if env else "cli",
-                    "untrusted": bool(env["payload"].get("meta", {}).get("untrusted"))
-                    if env
-                    else False,
-                    "ts": env["payload"].get("ts") if env else None,
-                }
-            )
-        return turns
+            t = self._turn(env_id)
+            est = (len(t["user"] or "") + len(t["assistant"] or "")) // 2
+            if turns and used + est > max_tokens:  # 最新一轮(首个)无条件进
+                break
+            turns.append(t)
+            used += est
+        return turns[::-1]

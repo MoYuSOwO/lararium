@@ -100,3 +100,41 @@ async def test_one_logical_failure_is_one_http_request(http_spy_factory):
     with pytest.raises(ModelCallError):
         await client.run(_ctx(), [], [])
     assert len(counted) == 1, f"一次逻辑失败应=1 个 HTTP 请求,实际 {len(counted)}"
+
+
+async def test_context_too_long_400_speaks_human(http_spy_factory):
+    """M3-1:上下文超长类 400 的 notice 说人话,别甩 `status_code: 400`。"""
+    body = {
+        "error": {
+            "message": (
+                "This model's maximum context length is 200000 tokens. "
+                "However, you requested about 210000 tokens (in the messages, ...)."
+            )
+        }
+    }
+
+    def handler(req):
+        return httpx.Response(400, json=body, request=req)
+
+    client = http_spy_factory(handler)
+    with pytest.raises(ModelCallError) as ei:
+        await client.run(_ctx(), [], [])
+    assert ei.value.retryable is False
+    text = str(ei.value)
+    assert "上下文超长" in text
+    assert "LARARIUM_L0_MAX_TOKENS" in text
+    assert "status_code: 400" not in text, "不许甩原始 status_code 给用户"
+
+
+async def test_plain_400_keeps_generic_message(http_spy_factory):
+    """非超长类 400(如非法请求)仍用通用消息,不被误判成"上下文超长"。"""
+
+    def handler(req):
+        return httpx.Response(
+            400, json={"error": {"message": "invalid request format"}}, request=req
+        )
+
+    client = http_spy_factory(handler)
+    with pytest.raises(ModelCallError) as ei:
+        await client.run(_ctx(), [], [])
+    assert "上下文超长" not in str(ei.value)

@@ -127,10 +127,21 @@ class Steward:
                 },
             )
             logger.info(format_cache_log(reply))
-            # 崩溃语义:回复先落出件箱,信封才算完成。中间崩了,重启后 recover_stale
-            # 重排队、重算一轮(多花一次 API 钱),但绝不静默吞回复——用户至少收到一次。
-            self.outbox.put(env.id, env.channel, reply.text, kind="reply")
-            self.inbox.complete(env.id)
+            # 崩溃语义:回复先落出件箱,信封才算完成。M3-1 Step0 收掉 M2-6 遗留——
+            # 两个语句各自动提交,崩在中间会留下「出件箱有回复、信封未完成」的半态,
+            # 重启 recover_stale 重排队重算 → **重复回复**。放进同一事务:
+            # 要么都落、要么都不落;都不落 → 重启重排队重算(多花一次 API 但只回一次),
+            # 回复绝不静默吞(D10 at-least-once)。
+            conn = self.inbox._conn
+            assert conn is self.outbox._conn, "组装根必须给 inbox/outbox 注入同一连接"
+            conn.execute("BEGIN")
+            try:
+                self.outbox.put(env.id, env.channel, reply.text, kind="reply")
+                self.inbox.complete(env.id)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
             return TurnOutcome(kind="replied", text=reply.text)
 
         except ModelCallError as exc:
@@ -156,7 +167,10 @@ class Steward:
             raise
 
     def _recent_turns(self) -> list[Turn]:
-        rows = self.journal.recent_turns(limit=self.settings.l0_max_turns)
+        # M3-1:L0 按 token 预算截断(默认 200k),l0_max_turns 只当轮数兜底。
+        rows = self.journal.recent_turns_within_budget(
+            max_tokens=self.settings.l0_max_tokens, max_turns=self.settings.l0_max_turns
+        )
         return [
             Turn(
                 user=r["user"],
