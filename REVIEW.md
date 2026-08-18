@@ -3556,3 +3556,122 @@ notice 透传友好文本。
 **全局约束核对**:
 - 三条 M3 全局约束第 1 条相关:本任务只动 L0(token 预算),话头(第 5 层)与 L1(压缩)未碰 ✓
   (话头在 M3-2/M3-3 才进场)。
+
+**验收结论**(Claude 填):**机制全对,预算的数字不对 —— 补做两项后通过。**
+
+门禁四关独立重跑全绿:ruff ☑ / ruff format ☑(48 files)/ mypy ☑(24 files)/
+import-linter ☑(**4 kept**)/ pytest ☑(**196 passed**)。
+
+### Step 0 我没采信异常测试,用真崩溃复验了
+
+程序员的原子性证明用的是「complete 抛异常」。异常能证回滚,证不了**进程直接没了**
+时 WAL 里有没有半条。我把 M2-6 那次抓到重复回复的探针原样重跑,崩点仍卡在 put 之后
+(`os._exit(9)`,不是异常):
+
+```
+[phase1] put 已执行,现在 os._exit(9) —— 模拟 kill -9
+[phase2] 崩溃后:出件箱 0 条,信封 state=processing      ← M2-6 时这里是 1 条
+[phase2] recover_stale:1 条重排队,0 条放弃
+[phase2] 重算后出件箱 1 条:seq=1 env=203b1301 '这是回复'
+判定:✅ 恰好一次
+```
+
+**M2-6 那个缺陷关闭。** D10 从"至多重复一次"变成真的"恰好一次投递"。
+
+### 缺陷 1(必须补,且是我计划写错的):token 估算低估 1.4~1.6 倍,预算还不含前缀
+
+`len(text)//2` = 每字 0.5 token。**这个数是我写进 PLAN 的,程序员照做没错,错的是我。**
+我拿项目实际在跑的 provider(mimo-v2.5)量了两次,只发合成文本:
+
+```
+重复样本   660 字 → 520 token = 每字 0.788   → len//2 低估 1.58 倍
+不重复日常 222 字 → 156 token = 每字 0.703   → len//2 低估 1.41 倍
+```
+
+预算写 200000,实际发出去约 **281k~315k token**,超 200k 窗口 40%~58%。而且预算只数
+了 L0 的 user+assistant 正文,**没算**前缀区(人格 996 字 + 目录 + 账本)、工具 schema
+(实测固定开销约 500 token/请求)、每轮渲染多出来的时间戳(`[2026-08-17T13:00:00+08:00] `
+每轮 28 字,兜底 2000 轮就是 4 万字),以及输出要占的窗口。误差全部朝同一个方向。
+
+后果不是慢一点,是**卡死**:超窗后每一轮都回同一条 400 notice,系统自己出不来,
+只能人改环境变量重启。更要紧的是 **M3-6 的低水位 150000 还要接着用这个估算器** ——
+常数错了,后面每一个预算判断都继承这个错。所以现在改,别等。
+
+补做:
+1. 估算器改成实测校准的:CJK 每字 0.8、非 CJK 每字 0.3(中英混排别一刀切,英文按 0.8
+   算会白扔一半预算),抽成 `journal.py` 里一个有名字的函数,注释里写清这两个数是
+   2026-08-19 对 mimo-v2.5 实测出来的、换 provider 要重量。
+2. `LARARIUM_L0_MAX_TOKENS` 的语义改成**整个上下文预算**(200000 就是 200k 窗口用满),
+   由 `loop._recent_turns` 先估出前缀区(persona+目录+账本,这三个字符串组装时就在手上)
+   再减掉一个固定留白(工具 schema + 输出,建议 8000),把余额传给 `recent_turns_within_budget`。
+   这才是"200k 用满"的忠实实现——不是假装 L0 等于整个窗口。
+
+### 缺陷 2(必须补):组装 L0 每轮把每个信封的 prompt 事件也解析一遍
+
+`_turn()` 走 `replay(env_id)`,而 `replay` 拉的是该信封**全部** kind —— 包括 `prompt`
+事件,那里面装着整份组装好的上下文。于是每组装一次 L0,就要把最近 N 个信封的历史
+prompt 全部 `json.loads` 一遍再扔掉。M1 时 `limit=30` 看不出来;M3-1 把兜底提到 2000,
+它就摊开了。同一个库实测:
+
+```
+800 轮 / 每轮 prompt 120KB(库 98.5MB)
+  现在(replay 每个信封):        273.9 ms
+  只查 envelope/reply 两种 kind:  14.3 ms   → 快 19×,取回轮数一致(800 vs 800)
+```
+
+上下文越大,单个 prompt 事件越大,这个浪费越涨——正好和 M3 的方向相反。
+
+补做:`_turn` 别走 `replay`,改成 `WHERE envelope_id IN (...) AND kind IN ('envelope','reply')`
+一条 SQL 取全部(N 次查询也一并收掉)。`replay()` 本身不动——逐字重放整轮是它的职责,
+那里就该拿全部 kind。
+
+### 顺带(不拦路,补做时一起收)
+
+- `loop.py` 伸手拿 `self.inbox._conn` / `self.outbox._conn`,违反 **S3**(带下划线的是
+  模块自己的事)。那句 `assert` 挡住了真风险,但 `python -O` 会把它抹掉,抹掉之后
+  两个连接不同就静默退回旧 bug。建议 `db.py` 加 `transaction(conn)` 上下文管理器,
+  `Inbox`/`Outbox` 暴露只读的 `conn` 属性。
+- `recent_turns()` 现在生产上没人调了(只剩测试),而 **P1-1 的 provenance 回归测试正挂
+  在它身上**。两条路共用 `_turn` 所以覆盖是传递到位的,但哪天有人顺手删死代码,
+  回归测试跟着一起没。把那条测试挪到 `recent_turns_within_budget` 上。
+- CHANGELOG 里程碑进度表还是错的:M2 那行仍写 ⬜ 未开始(M2-6 验收时就提过),
+  M3 那行还写着"状态卡"——那个方案在 M3 重排时已经废掉了。
+
+## M3-1b 补做(验收打回:预算数字 + 检索性能,待验收)
+
+**验收打回**:① `len//2` 估算低估 1.4~1.6 倍(验收方用 mimo-v2.5 实测:660 字→520 token=0.788/字,
+222 字→156 token=0.703/字);预算只数 L0 没数前缀区+工具 schema+输出,**200k 实际发 281k~315k**;
+超窗后每轮回同一条 400 notice,系统自己出不来。② `_turn` 走 replay 把每个信封的 prompt 事件
+(整份上下文)也 json.loads 一遍再扔掉,M3-1 兜底提到 2000 后摊开(实测 800 轮 274ms→14ms)。
+
+### 补 1 — 估算器实测定标 + 预算改成整窗
+
+- `journal.estimate_tokens`:CJK 每字 **0.8** / 非 CJK 每字 **0.3**(中英混排各按各的)。
+  注释写明两个数是 2026-08-19 对 mimo-v2.5 实测出来的,换 provider/tokenizer 要重测。
+- `LARARIUM_L0_MAX_TOKENS` 语义改成**整个上下文预算**:`loop._l0_token_budget()`
+  先估前缀区(人格+目录+账本,`_prefix_text()` 组装时就在手上)再减 `L0_RESERVE`(8000,
+  工具 schema+输出留白),余额传给 `recent_turns_within_budget`——"200k 用满"的忠实实现。
+
+钉测试:estimate_tokens 中英混排估值、(经 `_l0_token_budget`)**预算确实扣掉了前缀**
+(同预算下人格越大 L0 越少)、**超窗前先截断**(500 轮历史只留最新部分,最新一轮锚点在、
+最旧被截)。
+
+### 补 2 — _turns_by_id 一条 SQL,不走 replay
+
+`replay()` 保留(逐字重放该拿全部 kind);`recent_turns`/`recent_turns_within_budget`
+改用 `_turns_by_id(env_ids)`:一条 `WHERE envelope_id IN (...) AND kind IN ('envelope','reply')`
+取全部再建索引,按 seq 排序。IN 的 f-string 用 `# noqa: S608`(qmarks 全是 ?、参数是内部
+hex id,无用户数据进 SQL;G4 最小范围)。
+
+### 顺带收掉
+
+- `db.transaction(conn)` 上下文管理器;`Inbox`/`Outbox` 加只读 `conn` 属性。
+  loop 不再伸手 `_conn`(S3):异连接判断用 raise 不用 assert——`python -O` 会吞 assert,
+  吞掉后异连接静默退回旧 bug。
+- P1-1 provenance 回归测试从 `recent_turns`(准死代码)挪到 `recent_turns_within_budget`。
+- CHANGELOG 里程碑进度表:M2 行 ⬜→✅ 完成;M3 行去掉"状态卡",标"进行中(M3-1 已过)"。
+
+### 测试 / 门禁
+
+新增:estimate_tokens 混排 / 预算扣前缀 / 超窗前截断 /(provenance 迁移)。门禁
+**199 passed**(196 → +3),mypy 24 files,import-linter 4 kept,ruff/format 全绿。
