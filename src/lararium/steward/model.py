@@ -90,19 +90,33 @@ def format_cache_log(reply: ModelReply) -> str:
 class PydanticAIClient:
     """真实模型客户端。库 API 若有变动,只改这一个类。"""
 
-    def __init__(self, settings: Settings, model: Any | None = None) -> None:
+    def __init__(
+        self, settings: Settings, model: Any | None = None, *, http_client: Any | None = None
+    ) -> None:
         self._settings = settings
         # model 是给报文级测试留的注入口(FunctionModel),也是 M2 换服务商的接缝。
         # 隔离盒是唯一接触第三方语义的地方,必须留得下测试——P0-1 的教训。
         if model is not None:
             self._model = model
             return
+        from openai import AsyncOpenAI
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
 
+        # SDK 默认 max_retries=2,会和我们的持久重试叠乘(实测一次 429 底下打 3 个请求)。
+        # 重试策略只留我们这层:它在库里、有上限、跨重启有效、起居注可见;
+        # SDK 那层是内存里的、起居注看不见的、重启就丢的。http_client 是给
+        # 报文级测试留的传输注入口(MockTransport),生产不传。
         self._model = OpenAIChatModel(
             settings.model_name,
-            provider=OpenAIProvider(base_url=settings.api_base_url, api_key=settings.api_key),
+            provider=OpenAIProvider(
+                openai_client=AsyncOpenAI(
+                    base_url=settings.api_base_url,
+                    api_key=settings.api_key,
+                    http_client=http_client,
+                    max_retries=0,
+                )
+            ),
         )
 
     async def run(

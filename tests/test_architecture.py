@@ -24,23 +24,80 @@ def _source_files() -> list[Path]:
     return files
 
 
+def _writeoffense(path: Path, node: ast.AST, detail: str) -> str:
+    return f"{path}:{getattr(node, 'lineno', '?')} {detail}"
+
+
+def _open_mode_arg(call: ast.Call) -> str | None:
+    """从 open(...) 调用里取 mode 参数:位置第二参,或 mode= 关键字参。"""
+    if call.keywords:
+        for kw in call.keywords:
+            if (
+                kw.arg == "mode"
+                and isinstance(kw.value, ast.Constant)
+                and isinstance(kw.value.value, str)
+            ):
+                return kw.value.value
+    if (
+        len(call.args) >= 2
+        and isinstance(call.args[1], ast.Constant)
+        and isinstance(call.args[1].value, str)
+    ):
+        return call.args[1].value
+    return None
+
+
 def test_only_the_ledger_module_writes_files() -> None:
     """账本单写路径(DESIGN §6.3、宪法第一条)。
 
     账本的唯一合法写入者是 Gate.settle() → Ledger.write()。任何别处的文件写入
     都绕过了门控,等于给提示注入开了后门。这里用"整个源码树只有 ledger.py 能写文件"
     这条更粗但更结实的规则来守——本项目除账本外没有别的东西需要写文件。
+
+    用 AST 而非子串匹配:旧的子串检查拦不住 `open(p, "w").write(...)`。这里禁
+    `open(..., "w"/"a"/"x")`(含二进制/`+` 变体)、文件对象 `.write*`、Path 的
+    write 方法族、`os.replace` 与 `shutil` 写族。
     """
     allowed = {Path("bundles/memory/ledger.py")}
-    offenders = [
-        str(path)
-        for path in _source_files()
-        if path not in allowed
-        and any(
-            marker in path.read_text(encoding="utf-8")
-            for marker in (".write_text(", ".writelines(", ".write_bytes(")
-        )
-    ]
+    offenders: list[str] = []
+
+    for path in _source_files():
+        if path in allowed:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                # open(...) 带写模式
+                if isinstance(func, ast.Name) and func.id == "open":
+                    mode = _open_mode_arg(node)
+                    if mode is None or any(c in mode for c in "wax"):
+                        offenders.append(_writeoffense(path, node, f"open(mode={mode!r}) 写文件"))
+                # Path 便捷写方法 X.write_text(...) .write_bytes(...)(receiver 无关,
+                # write/writelines 则不要:文件对象的 .write 已被上面的 open(...,"w") 兜住,
+                # 而 Ledger.write() 是合法门控路径,泛泛地禁会误伤)
+                elif isinstance(func, ast.Attribute) and func.attr in (
+                    "write_text",
+                    "write_bytes",
+                ):
+                    offenders.append(_writeoffense(path, node, f".{func.attr}() 写文件"))
+                # os.replace / os.rename(原子改名=写)
+                elif (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "os"
+                    and func.attr in ("replace", "rename")
+                ):
+                    offenders.append(_writeoffense(path, node, f"os.{func.attr}() 写文件"))
+                # shutil 写族:copy/move/copyfile/copy2/copytree/rmtree(rmtree 其实是删,一并禁)
+                elif (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "shutil"
+                    and func.attr in ("copy", "copyfile", "copy2", "copytree", "move", "rmtree")
+                ):
+                    offenders.append(_writeoffense(path, node, f"shutil.{func.attr}() 写文件"))
+
     assert offenders == [], (
         f"这些文件在写文件,但账本的唯一写入路径必须是 Gate.settle():{offenders}。"
         "如果确实需要写别的文件(不是账本),把它加进本测试的 allowed 白名单并说明理由。"

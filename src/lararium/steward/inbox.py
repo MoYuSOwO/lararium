@@ -26,6 +26,26 @@ class Inbox:
             ),
         )
 
+    def put_idempotent(self, env: Envelope) -> bool:
+        """幂等入队:同 id 只处理一次,已存在则返回 False(重复)。
+
+        id 是主键,INSERT OR IGNORE 靠 rowcount 分辨首插/重复——HTTP 幂等的根基:
+        客户端重发同 id,消息只在库里留一行(DESIGN §9 ingress)。
+        """
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO inbox (id, source, channel, content, meta, ts) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                env.id,
+                env.source,
+                env.channel,
+                env.content,
+                json.dumps(env.meta, ensure_ascii=False),
+                env.ts.isoformat(),
+            ),
+        )
+        return cur.rowcount == 1
+
     def claim_next(self) -> Envelope | None:
         """严格串行:任一时刻最多一条 processing。"""
         self._conn.execute("BEGIN IMMEDIATE")

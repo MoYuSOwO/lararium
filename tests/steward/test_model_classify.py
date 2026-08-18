@@ -84,3 +84,19 @@ async def test_connection_error_is_retryable_via_unknown_default(http_spy_factor
     cause = ei.value.__cause__
     assert isinstance(cause, ModelAPIError)
     assert not isinstance(cause, ModelHTTPError), "连接错不该带 status code"
+
+
+async def test_one_logical_failure_is_one_http_request(http_spy_factory):
+    """SDK 的隐藏重试(max_retries=2)会和我们自己的持久重试叠乘:一次 429 逻辑失败
+    底下打 3 个 HTTP 请求(实测)。两套重试只留我们这层——它在库里、有上限、跨重启、
+    起居注可见;SDK 那层是内存的、看不见的、重启就丢的。关掉它(max_retries=0)。"""
+    counted: list[httpx.Request] = []
+
+    def handler(req):
+        counted.append(req)
+        return httpx.Response(429, json={"error": "rate limited"}, request=req)
+
+    client = http_spy_factory(handler)
+    with pytest.raises(ModelCallError):
+        await client.run(_ctx(), [], [])
+    assert len(counted) == 1, f"一次逻辑失败应=1 个 HTTP 请求,实际 {len(counted)}"

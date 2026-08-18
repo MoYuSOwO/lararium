@@ -81,22 +81,18 @@ def http_spy_factory(monkeypatch):
     报文级测试都要用真实 OpenAIChatModel + MockTransport 抓 body;把这层接线
     收进 conftest,用 fixture 注入而非 `from conftest import ...`——后者的路径
     依赖 tests/ 没有 __init__.py 才成立,是脆的。
+
+    走 `PydanticAIClient(settings, http_client=...)` 的**真实生产构造路径**:
+    AsyncOpenAI 带 max_retries=0(M2-4 Step0a),和线上同一段代码,不是测试专用的
+    平行构造——测的才真。
     """
     monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
 
-    from pydantic_ai.models.openai import OpenAIChatModel
-    from pydantic_ai.providers.openai import OpenAIProvider
-
     def factory(handler: Callable[[httpx.Request], httpx.Response]) -> PydanticAIClient:
         settings = Settings.load()
-        model = OpenAIChatModel(
-            settings.model_name,
-            provider=OpenAIProvider(
-                base_url=settings.api_base_url,
-                api_key=settings.api_key,
-                http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-            ),
+        return PydanticAIClient(
+            settings,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
         )
-        return PydanticAIClient(settings, model=model)
 
     return factory

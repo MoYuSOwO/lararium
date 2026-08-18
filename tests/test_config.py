@@ -1,6 +1,6 @@
 import pytest
 
-from lararium.config import Settings
+from lararium.config import Settings, parse_tokens
 
 
 def test_load_reads_env(monkeypatch, tmp_path):
@@ -15,6 +15,25 @@ def test_load_reads_env(monkeypatch, tmp_path):
     assert settings.timezone == "Asia/Shanghai"  # 默认值
     assert settings.l0_max_turns == 30  # 默认值
     assert settings.max_attempts == 3  # 默认值
+    assert settings.bind_host == "127.0.0.1"  # 默认值(M2 只绑本机,不公网)
+    assert settings.bind_port == 8420  # 默认值
+    assert settings.tokens == {}  # 默认值
+
+
+def test_parse_tokens_splits_channels(monkeypatch):
+    monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
+    assert parse_tokens("cli:tok-abc,web:tok-xyz") == {"cli": "tok-abc", "web": "tok-xyz"}
+
+
+def test_parse_tokens_ignores_blank_segments():
+    assert parse_tokens("cli:tok-abc,,, ") == {"cli": "tok-abc"}
+
+
+def test_parse_tokens_rejects_malformed():
+    with pytest.raises(ValueError, match="LARARIUM_TOKENS"):
+        parse_tokens("cli")  # 没有 : token
+    with pytest.raises(ValueError, match="LARARIUM_TOKENS"):
+        parse_tokens(":tok-abc")  # 空渠道名
 
 
 def test_load_rejects_missing_api_key(monkeypatch):
