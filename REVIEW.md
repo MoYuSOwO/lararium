@@ -3190,3 +3190,119 @@ server still alive -> pending: 200 无待审   ← /quit 不退服
 
 **门禁**:179 passed(174 → +5),mypy 24 files(+commands.py),import-linter 3 kept
 (41 deps,+commands.py:gateway 组装根仍合法 import bundles)。
+
+**验收结论**(Claude 填):**不通过。命令端点对所有 token 一视同仁,而它是门控的开关——
+数据面来源的 token 可以自己批准自己的提案。这是我冻结协议时的规格洞。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(24 files)/ import-linter ☑(3 kept)/ pytest ☑(**179 passed**,174 → +5)
+- `handle_command` 搬到 `gateway/commands.py`、CLI 与 HTTP 共用同一套分派——对。
+  D12 的绑定关系写进了模块和端点两处 docstring,写得也准。
+
+## 问题一(阻断):数据面 token 能按门控的开关
+
+我造了两个渠道的 token,`cli`(你的控制端)和 `smsforwarder`(模拟 M4/M5 的数据面来源),
+然后用**数据面那个 token** 去批准一条 `untrusted` 提案:
+
+```
+smsforwarder 的 token 调 /approve → 200 {'text': '已批准:允许免确认转账'}
+提案状态 = passed          ← 未经你点头,已进账本
+```
+
+完整攻击链,每一步都不需要攻破模型:
+
+1. 恶意短信 → SmsForwarder 用 `smsforwarder` token POST 进来(M4/M5 的正常路径)
+2. 内容标 untrusted → 模型 `propose(provenance="untrusted")` → 落 pending ← **门控在正常工作**
+3. **同一个 token** POST `/v1/commands {"line": "/approve <id>"}` → passed → 永久进账本
+
+第 1、2 步是门控在守;第 3 步把它整个溶掉。DESIGN §9 的"每源独立 token"是为了
+**泄了能单独吊销**,不是为了**限制能力**——现在每个 token 都是全能的。
+而 D12 刚写下"沙箱无网络,免得模型自己 POST 审批端点",那条推理默认了这个端点难以触达;
+实际上任何持有任意 token 的东西都能触达。
+
+**这是我冻结协议时的洞**:我写的契约只有 `Authorization: Bearer <token>` 和
+`tokens = {channel: token}`,没有能力分级。不怪实现。
+
+### 补做:token 分两类
+
+```
+LARARIUM_TOKENS         控制端(你):/v1/messages + /v1/outbox + /v1/commands + /v1/health
+LARARIUM_INGEST_TOKENS  数据面来源:只准 POST /v1/messages,其余一律 403
+```
+
+两个环境变量比在一个变量里塞能力后缀更难写错。数据面来源**也不该读出件箱**——
+短信转发器没有理由看你的回复,最小权限顺手就拿到了。
+
+测试三条:ingest token 调 `/v1/commands` → 403;调 `/v1/outbox` → 403;
+调 `/v1/messages` → 202 且 channel 正确。另加一条**回归**:
+用 ingest token 走完"注入内容 → 提案 pending → 试图 /approve"整条链,断言提案仍是 pending。
+
+## 问题二(小):HTTP 下 `/quit` 吞掉了结算失败
+
+实测:
+
+```
+/quit 前 未结算提案 = 1
+返回 {'text': '服务端无退出概念,请直接关客户端。'}
+/quit 后 未结算提案 = 0        ← 结算真的发生了,前缀已重建
+
+账本被挪走后再 /quit:
+返回 {'text': '服务端无退出概念,请直接关客户端。'}
+真实结果里本该有:「退出前结算失败…提案仍在库里,修好账本后重启会自动结算」
+```
+
+两个毛病叠在一起:**做了看不见的副作用**(一次结算 = 一次前缀缓存重建),
+**又把真实结果丢了**(结算失败被吞,E1)。
+
+**修法:HTTP 路径根本不要把 `/quit` 交给 `handle_command`**,直接返回那句提示、零副作用。
+理由:结算现在有它自己的时机——worker 空闲时自动结算(D11)、`/settle` 手动结算;
+一个客户端关闭窗口不是系统事件,不该触发缓存重建。这样吞错的问题也一并消失。
+
+## M2-5 补做:token 分能力两类 + /quit 零副作用(验收打回)
+
+**验收打回**:命令端点是门控开关,却对所有 token 一视同仁。实测数据面渠道的 token 能
+`/approve` 一条 untrusted 提案——恶意短信正常入站(提案 pending,门控在正常工作)后,
+同一个 token 自己批准自己,攻击链不需要攻破模型。这是我的协议规格洞。另:/quit 在 HTTP
+语境真的结算(看不见的前缀重建副作用),还把结算失败文本丢掉换无关提示。
+
+### 补(a)— token 分能力两类
+
+协议补一条(写入 .env.example 与 Settings):
+
+```
+LARARIUM_TOKENS         控制端(你):/v1/messages + /v1/outbox + /v1/commands + /v1/health
+LARARIUM_INGEST_TOKENS  数据面来源:只准 POST /v1/messages,其余一律 403
+```
+
+- `Settings.control_tokens` / `settings.ingest_tokens`(同一个 parse_tokens 解析两份 env)。
+- `create_app(control_tokens, ingest_tokens)`;`authenticate` 返回 `(scope, channel)`,
+  scope ∈ {"control","ingest"};`require_control` 对无/错 token → 401、有效但能力不足
+  (ingest)→ 403(不泄露 token 是否有效)。
+- POST /v1/messages 两个 scope 都放行(数据面消息照样走门控);outbox/health/commands
+  只认 control。
+- 数据面也不该读出件箱,顺手拿到最小权限。
+
+**整链回归**(test + 真实 HTTP 冒烟):
+
+```
+ingest inject: 202                     ← 数据面能注入
+pending proposal: 24fd736b state=pending  ← 模型提议 untrusted,门控正常工作
+ingest try approve: 403 {'error': '无权限'}
+proposal state after try: pending      ← 门控没被拨动
+ingest outbox: 403
+control approve: 200 state=passed      ← 对照:控制端能批准
+```
+
+### 补(b)— HTTP 路径 /quit 零副作用
+
+`post_command` 里 `line.strip() == "/quit"` 直接返回"服务端无退出概念,请直接关客户端。",
+**不交给 handle_command**——零结算副作用(不重建前缀缓存)、不吞错。结算有它自己的时机
+(worker 空闲 D11、/settle)。测试:`/quit` 前后 `unsettled_count()` 不变。
+
+### 测试 / 门禁
+
+新增:ingest 只准 messages(commands/outbox/health→403,messages→202)/ ingest 消息渠道
+=smsforwarder/ /quit 零副作用 / 整链回归(ingest 注入→pending→试图 approve→仍 pending)。
+config 新增:control 与 ingest 分开解析。
+
+**门禁**:184 passed(179 → +5),mypy 24 files,import-linter 3 kept(41 deps)。.env.example
+补 LARARIUM_INGEST_TOKENS。

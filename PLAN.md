@@ -5062,6 +5062,30 @@ TestClient 上下文进出触发 lifespan、处理函数 `async def h(request) -
 
 ## Task M2-6:CLI 客户端化 + M2 端到端验收
 
+**Step 0 — 先补 M2-5 的两处(验收记录见 REVIEW.md M2-5)**
+
+**(a) token 分能力两类。** 命令端点是门控的开关,而现在**任意 token 都能按它**——
+实测数据面渠道的 token 可以 `/approve` 一条 untrusted 提案,门控整个溶掉
+(攻击链不需要攻破模型:恶意短信 → 正常入站 → 提案 pending → 同一个 token 自己批准)。
+**这是我冻结协议时的规格洞。** 协议补一条:
+
+```
+LARARIUM_TOKENS         控制端(你):/v1/messages + /v1/outbox + /v1/commands + /v1/health
+LARARIUM_INGEST_TOKENS  数据面来源:只准 POST /v1/messages,其余一律 403
+```
+
+两个环境变量比在一个变量里塞能力后缀更难写错。数据面来源也不该读出件箱——
+短信转发器没理由看你的回复,最小权限顺手就拿到。
+
+测试:ingest token 调 `/v1/commands` → 403、调 `/v1/outbox` → 403、调 `/v1/messages` → 202;
+外加一条**整链回归**:ingest token 走完「注入内容 → 提案 pending → 试图 /approve」,
+断言提案仍是 pending。
+
+**(b) HTTP 路径的 `/quit` 不要交给 `handle_command`。** 现在它会真的结算
+(一次前缀缓存重建的看不见的副作用),然后**把结算失败的文本丢掉**换成一句无关的提示。
+直接返回"服务端无退出概念,请直接关客户端。"、零副作用即可——结算有它自己的时机
+(worker 空闲自动结算 D11、`/settle` 手动),客户端关窗口不是系统事件。
+
 **Step 1 — 改写 `cli.py` 为纯 HTTP 客户端**:
 
 - 不再 import bundles、不再组装 Steward——那些全在 server.py。**这一步之后
