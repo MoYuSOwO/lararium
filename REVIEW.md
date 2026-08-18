@@ -3508,3 +3508,51 @@ D10 接受"崩溃至多重算一轮",但没料到重算的产物会**并列出�
 
 **顺带**:CHANGELOG 里程碑进度表的 M2 那行还是 ⬜ 未开始,和上面「M2 · 前后端分离(已完成)」
 对不上,下次 docs 提交顺手改掉。
+
+## Task M3-1:L0 按 token 预算截断(200k,待验收)
+
+**执行记录**(程序员填)
+
+### Step 0 — 收掉 M2-6 遗留:投递+完成放进同一事务
+
+`loop.process_next` 成功分支的 `outbox.put` + `inbox.complete` 之前各自动提交,崩在
+中间留下「出件箱有回复、信封未完成」半态 → 重启 recover_stale 重排队重算 → **重复回复**。
+改成同一事务(now `inbox._conn` 与 `outbox._conn` 同一连接,加 assert 防组装漂移):
+
+```
+BEGIN → outbox.put → inbox.complete → COMMIT;异常 → ROLLBACK + raise
+```
+
+先红后绿:临时 stash 掉事务改动脉冲一遍 `test_delivery_and_completion_are_atomic`,
+`assert 1 == 0`(无事务时 put 已独立提交);恢复事务后绿。ROBUST 的原子性证明:
+`inbox.complete` 换成会抛异常的函数 → outbox 里没有残留行、信封不是 done。
+
+### Step 1-2 — recent_turns_within_budget + Settings
+
+- `Journal._turn(env_id)` 抽出共用提取(两个 recent_* 不各写一份,P1-1 教训);
+- `recent_turns_within_budget(max_tokens, max_turns=2000)`:从最新往回填,累计
+  `len(文本)//2` 中文粗估超预算即停,**最新一轮无条件进**(宁可多塞一轮,别丢"刚说的"),
+  `max_turns` 兜底;返回时间正序。
+- `_recent_turns` 改用预算方式。`Settings.l0_max_tokens`(env `LARARIUM_L0_MAX_TOKENS`,
+  默认 **200000**);`l0_max_turns` 默认 30→**2000**(M3 前太小,现在只当轮数兜底)。
+
+失败测试 3 条(超预算停/单轮超也返/轮数兜底),方法不存在时红,实现后绿。
+
+### Step 3 — 上下文超长 400 说人话
+
+`model.py` 加 `_context_too_long(exc)`(限 400 + body/消息带超长措辞)与 `_error_message`:
+超长类 400 的消息改成「上下文超长:把 LARARIUM_L0_MAX_TOKENS 调小,或等压缩(L3 起)腾出
+空间。」,不甩 `status_code: 400`;非超长 400 仍通用消息。测试 3 条:真实 400 超长 body →
+消息含"上下文超长/LARARIUM_L0_MAX_TOKENS"且无 status_code / 普通 400 不误判 / loop 的
+notice 透传友好文本。
+
+### Step 4 — .env.example
+
+补 `LARARIUM_L0_MAX_TOKENS=200000`、L0_MAX_TURNS 注释改"轮数兜底";`LARARIUM_MODEL`/
+`API_BASE_URL` 改成实际在跑的值(mimo-v2.5 / opencode.ai)。
+
+**门禁**:196 passed(189 → +7),mypy 24 files,import-linter 4 kept。
+
+**全局约束核对**:
+- 三条 M3 全局约束第 1 条相关:本任务只动 L0(token 预算),话头(第 5 层)与 L1(压缩)未碰 ✓
+  (话头在 M3-2/M3-3 才进场)。
