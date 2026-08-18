@@ -4901,6 +4901,36 @@ except ModelCallError as exc:
 
 ## Task M2-3:worker(事件驱动串行 + 空闲结算)
 
+**Step 0 — 先补 M2-2 欠下的两项(验收记录见 REVIEW.md M2-2)**
+
+**(a) 给分类器补测试。** M2-2 的四条测试都手工构造 `ModelCallError(retryable=...)`,
+证明的是"loop 对旗子反应正确",没有一条证明**旗子被正确竖起来**——`_classify_retryable`
+零覆盖。这是 P0-1 的形状(隔离盒是唯一接触第三方语义的地方,却没有测试)。
+用现成的 `http_spy_factory` 夹具:让 MockTransport 返回 429 / 401 / 抛 `httpx.ConnectError`,
+断言 `ModelCallError.retryable` 分别是 True / False / True。
+**注意网络类错误到达隔离盒时是 `ModelAPIError` 而不是 `ModelHTTPError`**(已实测),
+靠的是"认不出的默认可重试";这条也要有一条测试盯着,它是那条不对称规则的现场。
+
+**(b) 消除 `process_next` 返回值的一词多义。** 当前 `None` 同时表示"队列空"和
+"可重试释放,稍后再试"(实测:释放后 `pending_count=1` 但返回值同样是 `None`)。
+**这是我规格的问题**,而本任务的 worker 恰好是它的消费者,后果有两条:
+
+- 空闲结算会在队列不空时触发,D11 的全部理由("没人对话时才重建前缀")作废;
+- **退避形同虚设**:释放后 worker 以为空闲进入等待,而任何新消息 `wake.set()` 都会让它
+  立刻醒来重新认领那条被限流的消息——429 恰恰是最不该猛敲的场景,现在流量越大重试越快。
+
+改成显式结果:
+
+```python
+@dataclass(frozen=True)
+class TurnOutcome:
+    kind: Literal["replied", "empty", "retry_later"]
+    text: str | None = None
+```
+
+`process_next` 返回它;worker 按 kind 分流(见 Step 2);CLI 同步改(它现在会打印
+`Lararium > None`,同一个歧义的表现;M2-6 要重写,这里只需不难看)。
+
 **Step 1 — 失败的测试先行**(`tests/steward/test_worker.py`):
 
 - 投 3 条消息,worker 跑完 3 条,顺序与投递序一致

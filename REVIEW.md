@@ -2689,3 +2689,159 @@ httpx.ConnectError / ReadTimeout -> True RuntimeError(认不出) -> True
 - 隔离盒边界:loop.py 对 pydantic-ai **零 import**,只认自家 `ModelCallError` ✓
   (grep 证实 loop.py 无 `pydantic_ai`,仅 `from lararium.steward.model import ModelCallError`)。
 - 认不出的异常默认 retryable=True ✓;重试上限把持续失败转成终态(第 3 次尝试后 failed)。
+
+**验收结论**(Claude 填):**通过。P2-3 关闭。两项并入 M2-3 的 Step 0。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(21 files)/ import-linter ☑(3 kept)/ pytest ☑(**144 passed**,140 → +4)
+- 分类放在隔离盒里、loop 只认 `ModelCallError`——契约守住了(D2)。
+- **我在真实 HTTP 调用栈上验了分类**(MockTransport 造六种失败,不是手工构造异常):
+
+```
+429 限流     retryable=True  ✓   (ModelHTTPError)
+500 服务端   retryable=True  ✓   (ModelHTTPError)
+401 key 错   retryable=False ✓   (ModelHTTPError)
+400 请求非法 retryable=False ✓   (ModelHTTPError)
+网络断       retryable=True  ✓   (ModelAPIError ← 不是 ModelHTTPError,靠默认兜住)
+超时         retryable=True  ✓   (ModelAPIError)
+```
+
+网络类错误到达隔离盒时是 `ModelAPIError` 而非 `ModelHTTPError`,**恰好是"认不出的默认可重试"
+这条不对称规则接住的**——这条规则不是纸面保险,它在真实链路上每天都在生效。
+
+- **重试全周期我也跑了**(持续 429,max_attempts=3):
+
+```
+第1次 → state=pending attempts=1
+第2次 → state=pending attempts=2
+第3次 → state=failed  attempts=3 + 出件箱一条 notice
+第4次 → 不再重试
+```
+
+## 并入 M2-3 Step 0 的两项
+
+### (1) 分类器本身没有测试——覆盖缺口在隔离盒里
+
+四条新测试都是**手工构造** `ModelCallError(..., retryable=True/False)`,证明的是
+"loop 对旗子反应正确",**没有一条证明旗子被正确竖起来**。也就是说 `_classify_retryable`
+和 `_NON_RETRYABLE_STATUS` 目前零测试覆盖:有人改了状态码集合、或 pydantic-ai 升级换了
+异常类型,**没有任何东西会红**。
+
+这正是 P0-1 的形状(隔离盒无测试,而它是唯一接触第三方语义的地方)。我这次自己打了六种
+才敢签字——但下次没人会记得打。用现成的 `http_spy_factory` 夹具写成测试,十几行:
+造 429/401/网络断,断言 `ModelCallError.retryable`。
+
+### (2) `process_next` 的 `None` 一词多义——这是我规格的问题,M2-3 会被它咬
+
+实测:
+
+```
+可重试释放后:process_next → None,而 pending_count=1   ← 队列非空
+队列真正空时:process_next → None,  pending_count=0
+```
+
+两种情况返回值完全一样。而 M2-3 计划里的 worker 正是用 `reply is not None` 判忙闲,后果:
+
+1. **空闲结算会在队列不空时触发**——D11 的全部理由是"结算发生在没人对话的时刻",
+   一次 429 就能让它在错误的时刻重建前缀缓存;
+2. **退避实际不存在**:释放后 worker 以为空闲去 `wake.wait()`,而**任何新消息 `wake.set()`
+   都会让它立刻醒来重新认领那条被限流的消息**——429 正是最不该猛敲的场景,
+   现在却是流量越大重试越快。
+
+修法:让结果显式,别用 `None` 兼职三种含义。`process_next` 返回小结果对象
+(`TurnOutcome(kind="replied"|"empty"|"retry_later", text=...)` 之类),worker 按 kind 分流:
+`replied` → 继续;`retry_later` → 退避 `min(2**attempts, 60)` 秒,**不算空闲、不结算**;
+`empty` → 才是真空闲,结算 + 等唤醒。CLI 那边同步改(它现在会打印 `Lararium > None`,
+这是同一个歧义的表现,反正 M2-6 要重写)。
+
+## Task M2-3:worker(事件驱动串行 + 空闲结算),含并入的 Step 0(待验收)
+
+**执行记录**(程序员填)
+
+### Step 0 (a) — 分类器补测试(`tests/steward/test_model_classify.py`,5 条)
+
+用现成 `http_spy_factory`(真实 OpenAIChatModel + MockTransport)驱动 `PydanticAIClient.run`,
+让 pydantic-ai 在真实链路上抛异常,断言隔离盒竖起的旗子:
+
+```
+test_http_429_is_retryable                 PASSED  (ModelHTTPError ← RateLimitError)
+test_http_5xx_is_retryable                 PASSED  (503, ModelHTTPError)
+test_http_401_is_terminal                  PASSED  (ModelHTTPError ← AuthenticationError)
+test_http_422_is_terminal                  PASSED  (ModelHTTPError ← UnprocessableEntityError)
+test_connection_error_is_retryable_via_unknown_default PASSED
+    (链路:ModelCallError ← ModelAPIError ← APIConnectionError ← ConnectError)
+    + 断言 cause 是 ModelAPIError 且**不是** ModelHTTPError——钉住"网络错靠默认兜住"
+============================== 5 passed ================================
+```
+
+这正是验收方要的形状:不是手工构造异常再喂给 loop,而是旗子从真实 HTTP 栈上被竖起来。
+`_classify_retryable` 从零覆盖变为 5 条覆盖(429/5xx/401/422/ConnectError)。
+
+### Step 0 (b) — 消除 `process_next` 的 None 一词多义
+
+新类型(`loop.py`):
+
+```python
+@dataclass(frozen=True)
+class TurnOutcome:
+    kind: Literal["replied", "empty", "retry_later"]
+    text: str | None = None  # replied 且是成功回复时:回复正文
+    attempts: int = 0        # retry_later 时:本次失败已尝试次数(退避用)
+```
+
+`process_next` 返回 `TurnOutcome`:
+- 成功回复 → `replied(text=...)`;队列空 → `empty`;
+- 可重试失败 → `retry_later(attempts=...)`(信封已回 pending);
+- 终态失败(发 notice)→ `replied`(**"消费了槽位走到终态"**,worker 据此知道自己忙过,
+  队列排空才结算;不发 notice 的歧义也一并消除)。
+
+先红后绿:旧断言 `== "你好呀"` / `is None` 在只改调用方、不改实现时红;实现拆三支后全绿。
+
+CLI 同步改:不再打印 `Lararium > None`;`retry_later` 打印一句"(模型暂时不可用,将自动重试……)"。
+
+### Step 2 — worker 实现(`src/lararium/steward/worker.py`)
+
+```python
+class Worker:
+    """唯一的队列消费者。有活逐条干,没活歇着——严格串行的延续(D11)。
+    asyncio.Event 不跨进程:这套的前提是 HTTP 服务和 worker 在**同一进程**(M2-4 起 task)。"""
+    MAX_BACKOFF = 60.0
+    def __init__(self, steward, wake, *, sleep=asyncio.sleep): ...
+    async def run(self):  # 按 TurnOutcome.kind 分流
+```
+
+- `replied` → `busy=True` 继续;`empty` → 若 `busy` 则空闲结算 `settle_if_needed()`,再
+  `wake.clear()` + `wait_for(wake.wait(), 5)`(兜底防丢唤醒);
+- `retry_later` → `busy=True` + `await sleep(min(2**attempts, 60))`,然后继续认领——**绝不等
+  wake**,否则任何新消息都会立刻重锤被限流的消息(验收方指出的洪泛正是这一步防的);
+- 毒消息(裸异常冒泡)→ loop 已标记 failed,worker `logger.exception` 后继续,不陪葬。
+
+`wake` 公开(`self.wake`):M2-4 的入队端点要能唤它。
+
+### Step 1 — 失败的测试(`tests/steward/test_worker.py`,5 条,先红:模块不存在)
+
+```
+test_worker_processes_messages_in_fifo_order       PASSED  (3 条按投递序回复)
+test_worker_waits_idle_then_wakes_on_new_message   PASSED  (空时歇着,投 1 条 wake 后醒)
+test_poison_message_does_not_break_worker          PASSED  (毒消息 failed,后续照常回复)
+test_idle_settlement_fires_when_queue_drains       PASSED  (处理中 user_stated 提案,清空后自动结算)
+test_retryable_failure_backs_off_between_attempts  PASSED  (假 sleep 抓到 [2.0]=2**1;若当 empty 等 wake,sleeps 为空)
+============================== 5 passed ================================
+```
+
+**门禁**:154 passed(144 → +10:分类 5 + worker 5),mypy 22 files(+worker.py),
+import-linter 3 kept(33 deps,+worker.py)。
+
+**与计划的偏离**:
+- `TurnOutcome` 比计划草图多两个字段:`text`(CLI 打印回复要用,否则它打印 None)和
+  `attempts`(退避公式 `2**attempts` 需要已尝试次数,worker 拿它算时长,sleep 留在 worker,
+  不放进 loop——process_next 保持"一轮一结果"的纯职责)。计划允许"放 loop 或 worker 由
+  程序员定",选 worker 并写明理由。
+- 终态失败(发 notice)归入 `replied` 桶:三分法里它既不是 empty 也不是 retry_later,
+  "消费了槽位"与成功回复对 worker 的 busy 语义等价。docstring 与注释已写明,不再有
+  None 兼职歧义。
+- `wait_until` 助手参数名用 `budget` 而非 `timeout`(ruff ASYNC109 会拦字面 timeout)。
+
+**全局约束核对**:
+- D11 空闲结算只在 `empty` 分支、且 `busy` 为真时触发——可重试释放(`retry_later`)不会误触发 ✓。
+- 退避真实生效:worker 在退避期间被 `wake.set()` 也不会立刻重认领(`sleep` 阻塞串行循环)✓。
+- 毒消息不打死 worker,worker 记日志继续 ✓。
