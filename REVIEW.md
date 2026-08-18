@@ -2845,3 +2845,153 @@ import-linter 3 kept(33 deps,+worker.py)。
 - D11 空闲结算只在 `empty` 分支、且 `busy` 为真时触发——可重试释放(`retry_later`)不会误触发 ✓。
 - 退避真实生效:worker 在退避期间被 `wake.set()` 也不会立刻重认领(`sleep` 阻塞串行循环)✓。
 - 毒消息不打死 worker,worker 记日志继续 ✓。
+
+**验收结论**(Claude 填):**通过。M2-3 的三个目标我逐条对抗性验过了。另发现一处
+既有问题(SDK 内部重试),并入 M2-4 Step 0。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(22 files)/ import-linter ☑(3 kept)/ pytest ☑(**154 passed**,144 → +10)
+
+### 我提的两条后果,造最恶劣的场景验的
+
+不看你的测试,自己造了「一条消息持续 429,同时外部消息洪水般涌入不停 `wake.set()`」——
+这正是修之前"流量越大敲得越狠"的场景。**100 次唤醒**下:
+
+```
+模型被调用次数 = 5        (max_attempts=5,不是上百次)   ✓ 洪水没有放大重试
+退避时长序列 = [2,4,8,16]  (指数退避,不是 0)             ✓ 退避真的生效
+结算 1 次,发生时 pending_count = [0]                    ✓ 只在真空闲结算,D11 保住
+```
+
+`retry_later` 分支走 `sleep` 后 `continue`、**绝不去等 wake**,这是修对的关键——
+注释也把理由写清楚了。`TurnOutcome` 拆三支消除了 `None` 的一词多义,签名比我给的更好
+(多带了 `attempts`,退避参数从结果里来,worker 不用回头查库)。
+
+### Step 0 的分类器测试,我把它弄坏了两次验咬合
+
+```
+把 401 从终态集合拿掉  → FAILED test_http_401_is_terminal(仅此一条)
+把"认不出默认可重试"翻成 False → FAILED test_connection_error_is_retryable_via_unknown_default(仅此一条)
+还原 → 5 passed
+```
+
+精确变红,不牵连。隔离盒终于有守卫了。
+
+## 新发现:OpenAI SDK 自己还有一层重试,我们看不见
+
+分类测试里**可重试用例慢(1–2 秒)、终态用例瞬时**,这个不对称有原因。数了一下真实请求:
+
+```
+429 限流    我们看到 1 次失败,实际打出 3 个 HTTP 请求,1.38s
+500 服务端  我们看到 1 次失败,实际打出 3 个 HTTP 请求,1.32s
+401 key错   我们看到 1 次失败,实际打出 1 个 HTTP 请求,0.01s
+（max_retries=0 后:429 → 1 个请求,0.01s）
+```
+
+OpenAI SDK 默认 `max_retries=2`。于是**两层重试在叠乘**:
+
+1. **请求放大**:我们 `max_attempts=3` × SDK 3 次 = 一条消息 **9 个请求**砸向一个正在限流的
+   端点。429 恰恰是最该少发请求的时候。
+2. **可观测性失真**:起居注记 3 条 error,真实发生 9 次调用。将来查限流账单会对不上。
+3. **队头阻塞比设计的长**:每次尝试额外占着串行槽位约 1.4 秒的隐藏退避,而严格串行意味着
+   这段时间整个队列停摆。
+4. **两套重试策略互不知情**:我们这套是**持久的**(在库里、有上限、跨重启有效、起居注可见),
+   SDK 那套是内存里的、不可见的。留着弱的那套只会污染强的那套。
+
+**这不是本任务引入的**(Task 10 建 client 时就在),是本任务的测试把它照出来了。
+
+**并入 M2-4 Step 0**:`PydanticAIClient` 显式传 `max_retries=0`,重试策略只保留我们自己这层;
+加一条测试断言「一次逻辑失败 = 一个 HTTP 请求」。附带好处是门禁快约 7 秒
+(9.5s → 2.5s)——慢门禁是没人跑的门禁。
+
+## Task M2-4:HTTP 服务(待验收)
+
+**执行记录**(程序员填)
+
+### Step 0a — 关掉 SDK 的隐藏重试
+
+先写计数测试断言「一次逻辑失败 = 一个 HTTP 请求」,跑当前代码确认是 **3**(红):
+
+```
+$ uv run pytest tests/steward/test_model_classify.py::test_one_logical_failure_is_one_http_request -v
+E   AssertionError: 一次逻辑失败应=1 个 HTTP 请求,实际 3
+E   assert 3 == 1
+1 failed in 2.42s     ← 429 一次逻辑失败打了 3 个请求,且慢 2.4s
+```
+
+改 `PydanticAIClient.__init__`:自建 `AsyncOpenAI(..., max_retries=0)`(注入口 `model=`
+路径保持不动)。改完变 **1**,且整文件从 6.8s 掉到 0.87s:
+
+```
+test_one_logical_failure_is_one_http_request PASSED  (1 请求)
+============================== 6 passed in 0.87s ================================
+```
+
+门禁随之从约 9.5s 回到约 **2.5s**(验收方预测命中:慢门禁是没人跑的门禁)。
+
+**一个实现细节偏离**:计划让 `http_spy_factory` 继续走 `model=` 注入口,但那会绕过
+`__init__` 里新建 AsyncOpenAI 的代码——测试就测不到了。所以给 `PydanticAIClient`
+加了个 `http_client=` 传输注入口,`http_spy_factory` 改成走 `PydanticAIClient(settings,
+http_client=MockTransport)`,即**真实生产构造路径**(带 max_retries=0)同一条代码。
+`model=` 注入口仍在(M2 换服务商用)。
+
+### Step 0 — 先加固,再开网络面
+
+- `test_only_the_ledger_module_writes_files` 从子串匹配改 **AST**。旧规则漏 `open(p,"w").write(...)`
+  (已用独立样例证明:旧子串匹配 Miss,新 AST 命中)。新规则禁:`open` 带 `w/a/x` 模式(含二进制
+  与 `+` 变体)、Path 便捷写 `.write_text`/`.write_bytes`、`os.replace`/`os.rename`、`shutil`
+  写族。白名单不变(只剩 `bundles/memory/ledger.py`)。
+  - 过程中误伤一次:`Gate.settle()` 调 `ledger.write()`(合法门控路径)被泛泛的 `.write` 抓到,
+    已把通用 `.write`/`.writelines` 从直接检测里去掉——文件对象的 `.write` 已被
+    `open(...,"w")`(rule 1)兜住,`Ledger.write` 是唯一该豁免的。
+- `pyproject.toml`:`pydantic-ai>=2.31`;`httpx>=0.28`/`starlette>=1.6`/`uvicorn>=0.52`
+  从传递依赖转显式声明(CLI 客户端与服务器直接 import,CONVENTIONS D)。
+
+### Step 1 — 失败的测试先行(`tests/gateway/test_server.py`,8 条,先红:模块不存在)
+
+```
+test_no_token_or_wrong_token_returns_generic_401                 PASSED
+test_post_message_maps_token_to_channel_and_ignores_forged_channel PASSED (伪造 channel 字段无效)
+test_duplicate_post_same_id_only_processed_once                  PASSED (同 id → duplicate:true,inbox 仍一行)
+test_post_oversized_content_returns_413                          PASSED (17KB → 413)
+test_post_non_json_or_missing_content_returns_400                PASSED
+test_outbox_scopes_to_channel_and_respects_after                 PASSED (只本渠道 + after 过滤)
+test_health_returns_counts                                       PASSED
+test_every_http_handler_is_an_async_function                     PASSED (全局约束第 1 条机械地守)
+============================== 8 passed ================================
+```
+
+### Step 2 — 实现 `src/lararium/gateway/server.py`(新组装根)
+
+`create_app(steward, ledger, gate, tokens, wake)` 纯组装;lifespan 里 `recover_stale()` +
+`create_task(worker.run())`,退出时 cancel + 最后一次 `settle_if_needed()`。端点:
+POST /v1/messages(token 定 channel、`inbox.put_idempotent`、`wake.set()`、202)、
+GET /v1/outbox(长轮询,`after` 过滤)、GET /v1/health。`main()` 复用 `cli.build_steward`
+组装(server 是与 cli 并列的组装根)。`Inbox` 加 `put_idempotent`(INSERT OR IGNORE 靠主键幂等);
+`Settings` 加 `bind_host`/`bind_port`/`tokens`(含 `parse_tokens`)。
+
+**长轮询实现偏离**:计划建议 outbox.put 时 set 事件驱动 long-poll;但 `create_app` 签名没带
+outbox_event,且 8 条验收测试都不测 wait 时序。M2-4 用轮询(≤0.2s 间隔、吞掉 wait 预算)
+实现长轮询语义,单用户规模足够;事件驱动留到 M2-6 CLI 真正需要喂 whenue 时再上。
+已在 REVIEW 记下,不悄悄改。
+
+**冒烟(lifespan+worker 真链路,非单元测试)**:
+
+```
+401 no-token: 401
+POST: 202 {'envelope_id': '6548d896...', 'duplicate': False}
+OUTBOX items: [('reply', '好的,收到了')]     ← worker 真处理了消息
+HEALTH: {'pending': 0, 'unsettled': 0}
+```
+
+### Step 3 — .env.example
+
+补 `LARARIUM_MAX_ATTEMPTS` / `LARARIUM_BIND_HOST`(默认 127.0.0.1)/ `LARARIUM_BIND_PORT`
+(默认 8420)/ `LARARIUM_TOKENS`,注释写明"token 决定渠道"。
+
+**门禁**:166 passed(154 → +12:server 8 + config 4),mypy 23 files(+server.py),
+import-linter 3 kept(39 deps)。门禁耗时约 3.4s(Step0a 的附带收益)。
+
+**与计划的偏离汇总**:
+- `http_spy_factory` 改走真实生产构造(带 max_retries=0),见 Step 0a。
+- 长轮询用轮询而非事件驱动,见 Step 2。
+- 泛 `object` 标注的 ledger/gate 参数改为 `Any`(组装根适配接口,mypy 拦 `object.unsettled_count`)。

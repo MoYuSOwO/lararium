@@ -4978,6 +4978,34 @@ HTTP 服务和 worker 在**同一进程**(M2-4 的 lifespan 里起 task)——�
 
 ## Task M2-4:HTTP 服务
 
+**Step 0a — 关掉 SDK 的隐藏重试**(M2-3 验收发现,详见 REVIEW.md)
+
+OpenAI SDK 默认 `max_retries=2`,于是我们的重试和它的重试在叠乘:实测一次 429
+逻辑失败底下打了 **3 个** HTTP 请求,配上 `max_attempts=3` 就是一条消息 **9 次**砸向
+正在限流的端点。而且 SDK 那层是内存里的、起居注看不见的、重启就丢的——
+我们这层是持久的、有上限的、可观测的。**两套重试留强的那套。**
+
+`PydanticAIClient.__init__` 里自建 client 传 `max_retries=0`:
+
+```python
+from openai import AsyncOpenAI
+# SDK 默认 max_retries=2,会和我们的持久重试叠乘(实测一次 429 底下打 3 个请求)。
+# 重试策略只留我们这层:它在库里、有上限、跨重启有效、起居注可见。
+self._model = OpenAIChatModel(
+    settings.model_name,
+    provider=OpenAIProvider(
+        openai_client=AsyncOpenAI(
+            base_url=settings.api_base_url, api_key=settings.api_key, max_retries=0
+        )
+    ),
+)
+```
+
+(注意:注入口 `model=` 那条路径保持不变,测试仍可传自己的 model。)
+
+测试:用 MockTransport 数请求数,断言**一次逻辑失败 = 一个 HTTP 请求**。
+先跑确认它现在是 3 → 改完变 1。附带:门禁从 9.5s 回到约 2.5s。
+
 **Step 0 — 先加固,再开网络面**(M1 审计 P3-1 / P3-2 在此关闭):
 
 - `test_only_the_ledger_module_writes_files` 从子串匹配改 AST:禁 `open(..., "w"/"a"/"x")`
