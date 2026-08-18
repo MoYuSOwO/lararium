@@ -39,7 +39,7 @@ def system(tmp_path, monkeypatch):
 
 
 def test_rollback_with_bad_argument_returns_text_not_exception(system):
-    from lararium.gateway.cli import CommandResult, handle_command
+    from lararium.gateway.commands import CommandResult, handle_command
 
     steward, ledger, gate = system
     result = handle_command("/rollback abc", steward=steward, ledger=ledger, gate=gate)
@@ -49,7 +49,7 @@ def test_rollback_with_bad_argument_returns_text_not_exception(system):
 
 
 def test_rollback_with_unknown_snapshot_returns_text_not_exception(system):
-    from lararium.gateway.cli import CommandResult, handle_command
+    from lararium.gateway.commands import CommandResult, handle_command
 
     steward, ledger, gate = system
     result = handle_command("/rollback 999", steward=steward, ledger=ledger, gate=gate)
@@ -58,7 +58,7 @@ def test_rollback_with_unknown_snapshot_returns_text_not_exception(system):
 
 
 def test_misspelled_command_is_unknown(system):
-    from lararium.gateway.cli import handle_command
+    from lararium.gateway.commands import handle_command
 
     steward, ledger, gate = system
     result = handle_command("/aprove x", steward=steward, ledger=ledger, gate=gate)
@@ -66,7 +66,7 @@ def test_misspelled_command_is_unknown(system):
 
 
 def test_approve_with_unknown_prefix_reports_zero_matches(system):
-    from lararium.gateway.cli import handle_command
+    from lararium.gateway.commands import handle_command
 
     steward, ledger, gate = system
     result = handle_command("/approve nope", steward=steward, ledger=ledger, gate=gate)
@@ -74,7 +74,7 @@ def test_approve_with_unknown_prefix_reports_zero_matches(system):
 
 
 def test_quit_flag_and_settles_passed_proposals(system):
-    from lararium.gateway.cli import handle_command
+    from lararium.gateway.commands import handle_command
 
     steward, ledger, gate = system
     # 一条已通过未结算的提案
@@ -92,7 +92,7 @@ def test_quit_flag_and_settles_passed_proposals(system):
 
 
 def test_pending_reports_empty(system):
-    from lararium.gateway.cli import handle_command
+    from lararium.gateway.commands import handle_command
 
     steward, ledger, gate = system
     result = handle_command("/pending", steward=steward, ledger=ledger, gate=gate)
@@ -105,7 +105,7 @@ def test_quit_still_exits_when_settlement_fails():
     结算失败要报告,但 should_quit 必须仍然为真——否则 EOF 会把它变成死循环
     (EOF 永久为真 → 每轮重新映射成 /quit → 每轮再抛一次)。
     """
-    from lararium.gateway.cli import handle_command
+    from lararium.gateway.commands import handle_command
 
     class BoomSteward:
         def settle_if_needed(self):

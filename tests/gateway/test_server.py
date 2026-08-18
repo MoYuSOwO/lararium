@@ -223,3 +223,65 @@ def test_every_http_handler_is_an_async_function(server):
             assert inspect.iscoroutinefunction(ep), (
                 f"{getattr(route, 'path', '?')} 的 handler 不是协程函数(async def)"
             )
+
+
+def test_post_command_dispatches_to_handle_command(server):
+    app, _ = server
+    client = TestClient(app)
+    r = client.post(
+        "/v1/commands", json={"line": "/pending"}, headers={"Authorization": "Bearer tok-cli"}
+    )
+    assert r.status_code == 200
+    assert "无待审" in r.json()["text"]
+
+
+def test_post_command_approve_truly_resolves_proposal(server):
+    """命令端点不只是回话——/approve 经它批准,提案真的变成 passed。"""
+    app, steward = server
+    p = steward.gate.propose(
+        kind="add",
+        content="外部来的事实",
+        provenance="untrusted",
+        origin="test",
+        section="长期偏好",
+    )
+    client = TestClient(app)
+    r = client.post(
+        "/v1/commands",
+        json={"line": f"/approve {p.id[:8]}"},
+        headers={"Authorization": "Bearer tok-cli"},
+    )
+    assert r.status_code == 200
+    assert "批准" in r.json()["text"]
+    assert steward.gate.get(p.id).state == "passed"
+    assert p.id not in [q.id for q in steward.gate.pending()]
+
+
+def test_post_command_quit_responds_but_server_stays_up(server):
+    """/quit 在 HTTP 语境只翻译成提示,服务不退——下一条命令照常响应。"""
+    app, _ = server
+    client = TestClient(app)
+    h = {"Authorization": "Bearer tok-cli"}
+    r = client.post("/v1/commands", json={"line": "/quit"}, headers=h)
+    assert r.status_code == 200
+    assert "退出" in r.json()["text"]
+    # 服务仍然活着
+    r2 = client.post("/v1/commands", json={"line": "/pending"}, headers=h)
+    assert r2.status_code == 200
+
+
+def test_post_command_unknown_command(server):
+    app, _ = server
+    client = TestClient(app)
+    r = client.post(
+        "/v1/commands", json={"line": "/aprove x"}, headers={"Authorization": "Bearer tok-cli"}
+    )
+    assert r.status_code == 200
+    assert "未知命令" in r.json()["text"]
+
+
+def test_post_command_without_token_returns_401(server):
+    app, _ = server
+    client = TestClient(app)
+    r = client.post("/v1/commands", json={"line": "/pending"})
+    assert r.status_code == 401

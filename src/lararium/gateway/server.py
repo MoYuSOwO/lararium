@@ -24,6 +24,7 @@ from starlette.routing import Route
 from lararium.config import Settings
 from lararium.db import connect
 from lararium.envelope import Envelope
+from lararium.gateway.commands import handle_command
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
@@ -193,10 +194,40 @@ def create_app(
             status_code=200,
         )
 
+    async def post_command(request: Request) -> JSONResponse:
+        """命令端点——**这个端点从此就是门控的开关(D12)**。
+
+        /approve /settle /rollback 都从这里直通 Gate,不经模型。M5 做 python_sandbox
+        时,"沙箱无网络"就是防它被**模型自己 POST** 到这里的墙——两条约束是绑定的,
+        谁也不许单独放松:沙箱一旦联网,被注入的模型就能自己 /approve 把恶意事实
+        永久写进账本。
+        """
+        channel = authenticate(request)
+        if channel is None:
+            return _UNAUTHORIZED
+        try:
+            payload = await request.json()
+        except Exception:
+            return JSONResponse({"error": "body 必须是 JSON"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"error": "body 必须是 JSON 对象"}, status_code=400)
+        line = payload.get("line")
+        if not isinstance(line, str) or not line.strip():
+            return JSONResponse({"error": "缺 line 字段"}, status_code=400)
+
+        result = handle_command(line, steward=steward, ledger=ledger, gate=gate)
+        text = (
+            # /quit 在 HTTP 语境无退出概念:结算已在 handle_command 里执行(副作用),
+            # 只把 should_quit 翻译成一句提示,服务不退。
+            "服务端无退出概念,请直接关客户端。" if result.should_quit else result.text
+        )
+        return JSONResponse({"text": text}, status_code=200)
+
     routes = [
         Route("/v1/messages", endpoint=post_message, methods=["POST"]),
         Route("/v1/outbox", endpoint=get_outbox, methods=["GET"]),
         Route("/v1/health", endpoint=get_health, methods=["GET"]),
+        Route("/v1/commands", endpoint=post_command, methods=["POST"]),
     ]
     return Starlette(routes=routes, lifespan=lifespan)
 
