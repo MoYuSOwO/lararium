@@ -43,6 +43,7 @@
 目标:Steward 变常驻 HTTP 服务,所有前端走同一协议;消息入队立返,worker 逐条干;CLI 降级为普通客户端。协议契约冻结(token 定 channel、/v1/messages、/v1/outbox 长轮询、/v1/commands、/v1/health)。
 
 - **M2-1** 出件箱落地:`Outbox` 独立于起居注(起居注逐字 append-only,投递要 UPDATE),回复先落箱、信封才算完成——崩溃重算多花一次 API 但绝不静默吞回复;seq 全局递增、客户端按 seq 去重(at-least-once);`take` 观测性标记 delivered_at 不阻止再取
+- **M2-2** 错误分类与重试(P2-3 关闭):隔离盒 `model.py` 把 pydantic-ai 异常分类成自家 `ModelCallError(retryable=...)`(429/5xx/连接/超时/认不出→可重试,400/401/403/404/422→终态,不对称是有意的),loop 只认它;可重试回 pending 重试(退避上限封顶 3 次),超限/终态 → failed + 出件箱 notice 含原文前 50 字;`Settings.max_attempts`(默认 3)
 
 ---
 
