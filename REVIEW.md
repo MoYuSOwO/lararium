@@ -3306,3 +3306,139 @@ config 新增:control 与 ingest 分开解析。
 
 **门禁**:184 passed(179 → +5),mypy 24 files,import-linter 3 kept(41 deps)。.env.example
 补 LARARIUM_INGEST_TOKENS。
+
+**验收结论**(Claude 填,M2-5 补做):**通过。M2-5 关闭,只剩 M2-6。**
+
+- 门禁四关独立重跑全绿:ruff ☑ / mypy ☑(24 files)/ import-linter ☑(3 kept)/ pytest ☑(**184 passed**,179 → +5)
+
+### 上次那条攻击链,我原样重打了一遍
+
+```
+ingest token 调 /approve → 403
+提案状态 = pending          ← 没被批准
+账本里有没有混进去 → 没有 ✓
+```
+
+### 各端点 × 各 scope,我逐格打了一遍
+
+```
+                        control   ingest   无token
+/v1/messages   POST       202       202      401     ← 数据面唯一能做的事
+/v1/outbox     GET        200       403      401     ← 短信转发器看不到你的回复
+/v1/commands   POST       200       403      401     ← 门控开关够不着
+/v1/health     GET        200       403      401
+```
+
+`401`(不知道你是谁)与 `403`(知道你是谁但你不配)分得对,而且 403 不泄露 token 是否有效。
+ingest 入站的 channel 也正确归属到 `smsforwarder`。几个绕法都试了:
+小写 `bearer` → 401、尾部空字节 → 401;多余空格 → 200(`.strip()` 的正常容错,不是洞)。
+
+### `/quit` 零副作用也验了
+
+```
+/quit 前未结算=1 → 后=1     返回「服务端无退出概念,请直接关客户端。」
+/settle 仍能正常结算 → 未结算=0
+```
+
+看不见的前缀重建消失了,而结算该有的入口一个没少。
+
+### 那条整链回归测试写得好
+
+`test_ingest_token_cannot_self_approve_full_chain` **起了真的 lifespan、真的 worker**,
+用一个"被诱导的模型"产出 untrusted 提案,再让同一个 ingest token 去批准。
+这是把攻击者的完整路径走了一遍,不是断言某个函数返回 403——**它守的是那条链,
+而不是那行代码**,以后有人换实现也照样咬得住。
+
+**M2 进度**:M2-1 ✅ / M2-2 ✅ / M2-3 ✅ / M2-4 ✅ / M2-5 ✅ ——只剩 **M2-6**。
+提醒:M2-6 的真正门槛不是代码,是 **Step 2 那六项双终端端到端冒烟**,
+尤其第 3 项(处理中途 `kill -9` → 重启 → 回复最终送达),它验的是 D10 那套崩溃语义
+在真实进程上成不成立。单元测试到这里为止都替代不了它。
+
+## Task M2-6:CLI 客户端化 + M2 端到端验收(待验收)
+
+**执行记录**(程序员填)
+
+### Step 1 — cli.py 改为纯 HTTP 客户端
+
+重写 `src/lararium/gateway/cli.py`:`Client` 类(httpx,同步就够)+ REPL。
+聊天 → POST /v1/messages 拿 envelope_id → 长轮询 GET /v1/outbox 等回复(路过 notice 顺手
+打印);`/` 开头 → POST /v1/commands;Ctrl-C/Ctrl-D 直接退出(结算归 worker)。after 游标
+持久化到 `~/.lararium/cli.seq`(`LARARIUM_CLIENT_STATE`),重启续传。配置 `LARARIUM_SERVER_URL`
+(默认 127.0.0.1:8420)/ `LARARIUM_CLIENT_TOKEN`。`.importlinter` 新增「CLI 是纯客户端,
+不得 import bundles/steward」契约(4 kept)。
+
+客户端测试(`tests/gateway/test_cli_client.py`,5 条)用**真实 uvicorn(后台线程)+ FakeModel**
+跑完整往返:chat 往返 / command / after 游标防重拉 / 错 token 403 / quit 提示后仍可用。
+
+为持久化 after 游标,cli.py 是第二个允许写文件的模块(自己 ~/.lararium 的状态文件,不是
+服务端数据也不是账本)——已按架构测试自己的逃生通道加进 allowed 白名单并写明理由。
+
+门禁:ruff ☑ / mypy ☑(24 files)/ import-linter ☑(**4 kept**) / pytest ☑(**189 passed**)。
+
+### Step 2 — 六项端到端冒烟(真实 API,双终端),全过
+
+环境:`.env` 真实 key(base_url=opencode.ai/zen/go/v1, model=mimo-v2.5),服务跑 127.0.0.1:8420,
+数据目录 /tmp/lar-data。控制端 token=cli:tok-cli,数据面 token=smsforwarder:tok-ingest。
+
+**① 聊天往返 + 服务端 [cache] 行**:
+```
+$ printf '你好,简单说一句话\n' | CLI
+Lararium > 你好！
+$ grep '\[cache\]' /tmp/lar_server.log
+[cache] 本轮命中 0/1253 (0.0%) · completion=221 · 1 请求   ← [cache] 行在
+```
+
+**② 账本流程 + 空闲结算 + 审批经 HTTP 生效**:
+```
+$ printf '我对芒果过敏,帮我记一下\n' | CLI
+Lararium > 已记下:对芒果过敏。
+$ grep '空闲结算' /tmp/lar_server.log
+空闲结算 1 条提案                                        ← worker 空闲自动结算(D11)
+$ cat /tmp/lar-data/memory/ledger.md → ## 长期偏好\n- 对芒果过敏     ← 已落盘
+未trusted 提案(脚本造) → /pending → 748c32c5 [add] 喜欢喝美式咖啡
+→ /approve → 已批准:喜欢喝美式咖啡
+→ /settle   → 已结算 1 条
+→ /ledger   → 长期偏好下出现 - 喜欢喝美式咖啡                ← 审批经 HTTP 真生效
+```
+
+**③ kill -9 中途杀服务 → 重启 → 重新处理 → 回复最终送达(D10)**:
+```
+POST /v1/messages(写一首五行诗…) → 202 → sleep 0.35 → kill -9 <python pid>
+崩溃瞬间日志:只有 "202 Accepted",没有模型调用行        ← 消息扔在处理中途(processing)
+重启后日志:
+  上次有未处理完的消息:1 条已重新排队,0 条已放弃      ← recover_stale 把 processing 重排队
+轮询出件箱:该 envelope 有条 reply(seq=4,上海五行诗全文)   ← 重算后最终送达
+```
+
+**④ 错 token → 401;同 id POST 两次 → duplicate**:
+```
+$ curl 错 token POST        → {"error":"未授权"}  HTTP 401
+$ curl 同 id POST 第一次     → {"envelope_id":"0123…","duplicate":false}  202
+$ curl 同 id POST 第二次     → {"envelope_id":"0123…","duplicate":true}   202
+```
+
+**⑤ 假 base_url → 模型错误 → notice 而非永久沉默(P2-3)**:
+```
+$ (LARARIUM_API_BASE_URL=http://127.0.0.1:9/v1 重启服务后) POST 一条消息
+出件箱出现 notice:
+  kind=notice content=这条消息处理失败(ModelAPIError: Connection error.),已放弃:…
+   ← 连接拒绝 → retryable → 3 次耗尽 → 发 notice,客户端不会永久沉默
+```
+
+**⑥ CLI 杀掉重开,after 用上次 seq → 不丢不重**:
+```
+第 1 次 CLI:聊『第一条消息』→ "在呢。"  游标文件 = 7
+(CLI 退出 = 重启)
+第 2 次 CLI:聊『第二条消息』→ "在。"    游标文件 = 8
+验证:第 2 次输出**没有重打**"在呢。"(不重),新回复"在。"正常打印(不丢)
+```
+
+### Step 3 — 收尾
+
+- AGENTS.md「命令」改为双进程跑法(终端 A 服务 / 终端 B 客户端,注明 token 分能力)。
+- CHANGELOG M2 六条齐全,里程碑标「已完成」。
+- `git tag -a m2`(提交后打)。
+
+**六项全过。第 3 项(kill -9 / D10)对 M2 最要紧:崩溃语义在真实进程上成立,不是注释。
+
+**M2 进度**:M2-1 ✅ M2-2 ✅ M2-3 ✅ M2-4 ✅ M2-5 ✅ M2-6(待验收)。

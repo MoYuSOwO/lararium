@@ -38,12 +38,16 @@
 
 ---
 
-## M2 · 前后端分离(进行中)
+## M2 · 前后端分离(已完成)
 
 目标:Steward 变常驻 HTTP 服务,所有前端走同一协议;消息入队立返,worker 逐条干;CLI 降级为普通客户端。协议契约冻结(token 定 channel、/v1/messages、/v1/outbox 长轮询、/v1/commands、/v1/health)。
 
 - **M2-1** 出件箱落地:`Outbox` 独立于起居注(起居注逐字 append-only,投递要 UPDATE),回复先落箱、信封才算完成——崩溃重算多花一次 API 但绝不静默吞回复;seq 全局递增、客户端按 seq 去重(at-least-once);`take` 观测性标记 delivered_at 不阻止再取
 - **M2-2** 错误分类与重试(P2-3 关闭):隔离盒 `model.py` 把 pydantic-ai 异常分类成自家 `ModelCallError(retryable=...)`(429/5xx/连接/超时/认不出→可重试,400/401/403/404/422→终态,不对称是有意的),loop 只认它;可重试回 pending 重试(退避上限封顶 3 次),超限/终态 → failed + 出件箱 notice 含原文前 50 字;`Settings.max_attempts`(默认 3)
+- **M2-3** worker 事件驱动串行(D11):`TurnOutcome` 拆三支(replied/empty/retry_later)消除 `process_next` 返回 None 的一词多义;单消费者空闲时结算、`retry_later` 指数退避(2**attempts 封顶 60s,绝不等 wake——否则任何新消息都立刻重锤被限流的消息)、毒消息吞异常继续,不陪葬
+- **M2-4** HTTP 服务 + Step0a 关 SDK 隐藏重试(max_retries=0,否则与持久重试叠乘:一条 429 打 3 个请求×max_attempts=9,且 SDK 层在内存、起居注看不见、重启就丢——两套留强的那套);`Envelope.id` 加 32-hex pattern + validate_assignment(伪造 id 曾被 search_history 渲染在围栏外,是 P1-4 换字段);AST 写禁升级;`Settings` 加 bind/tokens
+- **M2-5** 命令端点 `POST /v1/commands`:handle_command 搬到 `gateway/commands`,门控开关(D12)经 HTTP 直通;**token 分能力两类**——控制端(全权)与数据面 ingest(只准入站,命令/出件箱/健康一律 403,堵住"恶意短信自己批准自己"的整链攻击);HTTP `/quit` 零副作用
+- **M2-6** CLI 降级为纯 HTTP 客户端(httpx + after 游标持久化,重启不丢不重),`.importlinter` 新增"cli 是纯客户端"契约;六项真实 API 双终端冒烟全过——含 **kill -9 中途杀服务→重启→recover_stale 重排队→回复最终送达**,D10 崩溃语义在真实进程上成立
 
 ---
 

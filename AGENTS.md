@@ -45,11 +45,25 @@ uv run pytest tests/steward/test_inbox.py -v
 uv sync && uv run pre-commit install
 ```
 
-跑起来(Task 11 之后可用,需要先照 `.env.example` 配好 `.env`):
+跑起来(M2 起是双进程:常驻服务 + 普通客户端,都需要先照 `.env.example` 配好 `.env`):
+
+终端 A——起服务(worker 在同一进程,lifespan 里起 task):
 
 ```bash
-set -a && source .env && set +a && uv run python -m lararium.gateway.cli
+set -a && source .env && set +a \
+  && LARARIUM_TOKENS=cli:tok-dev LARARIUM_INGEST_TOKENS= \
+  && uv run python -m lararium.gateway.server
 ```
+
+终端 B——起 CLI 客户端(纯 HTTP,零特殊地位):
+
+```bash
+export LARARIUM_SERVER_URL=http://127.0.0.1:8420 LARARIUM_CLIENT_TOKEN=tok-dev
+uv run python -m lararium.gateway.cli
+```
+
+注:`LARARIUM_TOKENS` 是控制端(全权:消息/出件箱/命令/健康),`LARARIUM_INGEST_TOKENS`
+是数据面(只准入站;命令端点是门控开关,数据面不许碰)。冒烟(真实 API)见 REVIEW M2-6。
 
 ## 不可协商
 
