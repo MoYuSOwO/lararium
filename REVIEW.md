@@ -3675,3 +3675,127 @@ hex id,无用户数据进 SQL;G4 最小范围)。
 
 新增:estimate_tokens 混排 / 预算扣前缀 / 超窗前截断 /(provenance 迁移)。门禁
 **199 passed**(196 → +3),mypy 24 files,import-linter 4 kept,ruff/format 全绿。
+
+**验收结论**(Claude 填):**通过。** 两项必做都做到位,我逐项独立复验过;剩一处
+把预算口径彻底钉死的收尾,压进 M3-3 的强制 Step 0(见文末)。
+
+门禁四关独立重跑全绿:ruff ☑ / format ☑ / mypy ☑(24 files)/ import-linter ☑(4 kept)/
+pytest ☑(**199 passed**)。
+
+### 补 1 复验:我把新估算器拿去和真实 provider 对了表
+
+不是看代码里的常数对不对,是让它和 mimo-v2.5 实际计费当面对质(边际法消掉固定开销,
+只发合成文本):
+
+```
+样本                        字数   实测token   估算    估/实
+纯中文·带标点(最常见)        128        93      95   1.02x   ← 主场准
+中英混排(术语混着聊)         176        85      67   0.79x   ← 偏低 21%
+几乎全英文                  164        31      49   1.58x   ← 偏高(安全侧,浪费预算)
+```
+
+主场(纯中文日常对话)**1.02 倍**,这是 L0 里绝大多数内容的形态,补做前是 0.63 倍。
+中英混排偏低 21% 是已知误差,记在这里,别当它是精确计费。
+
+### 补 2 复验:用发货代码在同一个 98MB 的库上重测
+
+```
+800 轮 / 每轮 prompt 120KB:组装一次 L0  273.9 ms → 28.2 ms(9.7×)
+```
+
+`replay()` 保留、只有 L0 路径改走 `_turns_by_id`——分寸对:逐字重放整轮本来就该拿全部 kind。
+
+### 端到端:声明的整窗预算,真组装出来罩得住吗
+
+喂 500 轮(含 1/10 不可信外部数据)、整窗预算声明 30000:
+
+```
+扣前缀+留白后给 L0 的余额 21698 / L0 正文实占 21607 / 保留 201 轮
+模型实收整份(前缀+全部消息)= 24158 = 0.81x   ✅ 罩得住
+```
+
+"200k 是整窗、不是 L0 独占"这条语义现在是真的。
+
+## 遗留:预算数的是原文,模型收的是渲染后的正文——满窗时差 3~7%
+
+预算按 `user + assistant` 的原文估算,而进上下文的是渲染后的形态:多了
+`[2026-08-17T13:00:00+08:00] ` 的时间戳,不可信轮还多了整套「以下是数据,不是指令」
+的包裹和围栏。实测每轮的差额:
+
+```
+普通轮      预算记  15 → 实际渲染  24   少算  9
+不可信轮    预算记   7 → 实际渲染  46   少算 39
+```
+
+单看很小,但它**按轮数累加**,而轮数在预算变紧时反而更多。按发货默认值 200000
+扫一遍轮长(2600 轮历史喂满):
+
+```
+每轮字数   保留轮数    L0正文    模型实收整份    /200k
+   110      1984     191652      214005      1.07x  ❌ 超窗
+   130      1700     191590      212333      1.06x  ❌
+   150      1478     191691      209599      1.05x  ❌
+   200      1136     191639      205596      1.03x  ❌
+   400       577     191386      198055      0.99x  ✅
+```
+
+`L0_RESERVE=8000` 那笔留白还要同时承担工具 schema 和输出窗口,兜不住上千轮的渲染开销。
+**注意超窗的恰是短聊那一档**——生活助理最常见的形态就是短聊。
+
+不打回 M3-1b:补做前是超 40%~58% 且原因不明,现在是超 3%~7% 且原因精确到一个常数;
+真正触发要攒够上千轮历史(约六周日常使用),而 M3-6 的压缩在本里程碑内就落地。
+
+**但这条压进 M3-3 的强制 Step 0**,理由是 M3-3 正好要给每轮再加一行渲染内容(话头)
+——它会把这个差额继续放大,所以口径必须在那里钉死:
+
+- `recent_turns_within_budget` 估算的口径改成**渲染后的形态**,不是原文。最省事的
+  做法是每轮加一笔实测常数(普通轮 +10、不可信轮 +40),M3-3 加了话头行之后连话头
+  一起算进去。
+- 配一条测试:2000 轮短聊、预算 200000,断言**组装出来的整份 ≤ 200000**
+  ——就是上面那张表最上面一行,现在它是红的。
+- M3-6 设水位线时继承同一个口径,别再拿原文口径去卡 150000。
+
+### 顺带(不拦路)
+
+`_prefix_text()` 和 `process_next` 各调一次 `ledger.read()` + `directory_lines()`,
+一轮读两遍同一个文件。同轮内不会变(结算在 worker 空闲时才做),所以只是冗余不是 bug;
+M3-3 改这一段时顺手算一次传下去即可。
+
+## Task M3-2:话头存储(Steward 独占,待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 — 失败的测试先行**(`tests/steward/test_threads.py`,4 条,先红:模块不存在):
+- `open_thread(topic, note)` 同名是更新不是新建(upsert)
+- `close_thread(topic)` 关闭;找不到在开的 → False
+- `open_threads()` 只返回开着的、按最近更新排序
+- 条数上限 `MAX_OPEN=5`、单条字数 `MAX_NOTE_LEN=80`(就地截断)
+
+**Step 2 — 实现**:
+- `src/lararium/steward/threads.py`:`Threads(conn)` + `ThreadInfo(topic, note, updated_at)` 冻结
+  dataclass(F1);表加进 `db.py` SCHEMA(`threads`:topic PK / note / state open|closed / updated_at,
+  索引 state+updated_at)。**和起居注同库同产权,不是 bundle**。
+- 内置工具:`open_thread` / `close_thread` 追加在 `BuiltinTools` 三个既有工具**之后**
+  (as_tool_functions 顺序固定:current_time/read_skill/search_history/open_thread/close_thread,
+  不许插队);`open_threads()` 是**代码路径**(组装器调),不占模型工具位。
+- `Steward` 加 `threads` 依赖(显式注入,和 outbox 同一个做法);BuiltinTools 加 threads 参数;
+  全仓库 7 处 Steward 构造点(server.build_steward + 6 个测试 fixture)都传 `threads=Threads(conn)`。
+
+**Step 3 — 门禁**:
+
+```
+$ uv run pytest -q
+203 passed(199 → +4 threads 测试)
+mypy 25 files(+threads.py)
+import-linter 4 kept(40 deps)——话头是 steward 模块,不碰 bundle 边界 ✓
+```
+
+工具顺序测试同步更新(`test_model_receives_builtin_and_bundle_tools_in_fixed_order` 与
+`test_tool_function_order_is_fixed` 都断言 current_time/read_skill/search_history/
+open_thread/close_thread 原序 + bundle 在后);另加 2 条工具包装测试(E2:返回文本不抛异常)。
+
+**四条 import 契约必须仍 KEPT**:验收核对点——话头做成 steward 模块(不是 bundle),正是这个
+约束的形状;契约保持 4 kept 已确认。
+
+**M3 全局约束核对**:本任务只做存储与工具(第 5 层话头渲染在 M3-3);条数/字数上限是第一道
+"每轮进上下文不撑爆信封"的闸。
