@@ -7,7 +7,7 @@ from lararium.envelope import Envelope
 from lararium.steward.assembler import Turn, assemble
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
-from lararium.steward.model import ModelClient, format_cache_log
+from lararium.steward.model import ModelCallError, ModelClient, format_cache_log
 from lararium.steward.outbox import Outbox
 from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
@@ -115,7 +115,23 @@ class Steward:
             self.inbox.complete(env.id)
             return reply.text
 
+        except ModelCallError as exc:
+            # 隔离盒已经把 pydantic-ai 的异常分类成自家类型,这里只认 retryable。
+            self.journal.append(env.id, "error", {"content": str(exc)})
+            if exc.retryable and self.inbox.attempts(env.id) < self.settings.max_attempts:
+                self.inbox.release(env.id)  # 回 pending,attempts 已在 claim 时 +1
+            else:
+                self.inbox.fail(env.id, str(exc))
+                self.outbox.put(
+                    env.id,
+                    env.channel,
+                    f"这条消息处理失败({exc}),已放弃:{env.content[:50]}",
+                    kind="notice",
+                )
+            return None
+
         except Exception as exc:
+            # 非模型错误 = 代码 bug:留痕、标记 failed、向上冒泡(毒消息范式,worker 会接)。
             self.journal.append(env.id, "error", {"content": f"{type(exc).__name__}: {exc}"})
             self.inbox.fail(env.id, f"{type(exc).__name__}: {exc}")
             raise

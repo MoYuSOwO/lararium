@@ -11,6 +11,7 @@ class Settings:
     data_dir: Path
     timezone: str
     l0_max_turns: int
+    max_attempts: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -24,4 +25,5 @@ class Settings:
             data_dir=Path(os.environ.get("LARARIUM_DATA_DIR", "./data")),
             timezone=os.environ.get("LARARIUM_TIMEZONE", "Asia/Shanghai"),
             l0_max_turns=int(os.environ.get("LARARIUM_L0_MAX_TURNS", "30")),
+            max_attempts=int(os.environ.get("LARARIUM_MAX_ATTEMPTS", "3")),
         )

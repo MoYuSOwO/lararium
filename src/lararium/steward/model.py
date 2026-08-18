@@ -36,6 +36,32 @@ class ModelClient(Protocol):
     ) -> ModelReply: ...
 
 
+# 模型调用错误的二分类(P2-3)。HTTP 状态下:429/5xx 是临时性失败,重试有意义;
+# 4xx 里只有明确的"这个请求本身没戏"(key 错、上下文超长、请求非法)才算终态。
+# 其余一律按可重试——重试上限会把持续失败转成终态,而把可重试误判成终态
+# 是消息永久丢失,这个不对称是有意的,不许为了"保守"反过来写。
+_NON_RETRYABLE_STATUS = frozenset({400, 401, 403, 404, 422})
+
+
+class ModelCallError(Exception):
+    """模型调用失败。retryable 是 loop 决定「重试」还是「终态」的唯一依据。"""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _classify_retryable(exc: Exception) -> bool:
+    """第三方异常的形状只有隔离盒知道——分类必须在这里做完,loop 只认自家类型。"""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    if isinstance(exc, ModelHTTPError):
+        # 拿得到 status_code 就按白名单判终态;429/5xx/未知码一律可重试。
+        return exc.status_code not in _NON_RETRYABLE_STATUS
+    # 连接错误、超时、UnexpectedModelBehavior 及一切认不出的:默认可重试。
+    return True
+
+
 def extract_cache_hit_tokens(usage: Any) -> int | None:
     details = getattr(usage, "details", None) or {}
     for key in _CACHE_HIT_KEYS:
@@ -112,7 +138,14 @@ class PydanticAIClient:
         else:
             history.insert(0, ModelRequest(parts=[prefix]))
 
-        result = await agent.run(ctx.messages[-1]["content"], message_history=history)
+        try:
+            result = await agent.run(ctx.messages[-1]["content"], message_history=history)
+        except Exception as exc:
+            # 把 pydantic-ai 的异常在这里分类成自家类型——loop 只认 ModelCallError,
+            # 不认第三方异常,这是隔离盒存在的理由(D2)。
+            raise ModelCallError(
+                f"{type(exc).__name__}: {exc}", retryable=_classify_retryable(exc)
+            ) from exc
         usage = result.usage
 
         tool_events: list[dict[str, Any]] = []

@@ -10,7 +10,7 @@ from lararium.steward.assembler import AssembledContext
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
-from lararium.steward.model import ModelReply
+from lararium.steward.model import ModelCallError, ModelReply
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
 
@@ -221,3 +221,103 @@ async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
     await steward.process_next()
 
     assert spy.state_at_put == "processing", "put 时信封已 complete——顺序反了,崩溃会吞回复"
+
+
+async def test_retryable_model_error_releases_envelope_without_notice(steward_factory):
+    """可重试错(429):信封回 pending 可再认领,起居注留 error,但不发终态 notice。"""
+
+    class RateLimited:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ModelCallError("status_code: 429, rate limited", retryable=True)
+
+    steward, _ = steward_factory()
+    steward.model = RateLimited()
+    env = Envelope.new(source="user", channel="cli", content="试试看")
+    steward.submit(env)
+
+    assert await steward.process_next() is None
+
+    row = steward.inbox._conn.execute(
+        "SELECT state, attempts FROM inbox WHERE id=?", (env.id,)
+    ).fetchone()
+    assert row["state"] == "pending", "可重试错应把信封放回 pending,而不是 failed"
+    assert row["attempts"] == 1  # claim 时已 +1
+
+    errors = [e for e in steward.journal.replay(env.id) if e["kind"] == "error"]
+    assert len(errors) == 1
+    assert "429" in errors[0]["payload"]["content"]
+
+    # 可重试不该发 notice——还会重试,通知留给真正放弃之后
+    assert steward.outbox.take(env.channel, after=0) == []
+
+
+async def test_retryable_failures_abandon_after_max_attempts_with_notice(steward_factory):
+    """连抛超过 max_attempts(默认 3):信封 failed,出件箱出现 notice,含原文前 50 字。"""
+
+    class KeepsFailing:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ModelCallError("status_code: 500, boom", retryable=True)
+
+    steward, _ = steward_factory()
+    steward.model = KeepsFailing()
+    env = Envelope.new(source="user", channel="cli", content="一直失败的消息")
+    steward.submit(env)
+
+    # attempts 在 claim 时逐次 +1:1, 2, 3。第 3 次 3 < 3 不成立 → failed
+    assert await steward.process_next() is None
+    assert await steward.process_next() is None
+    assert await steward.process_next() is None
+
+    row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    assert row["state"] == "failed"
+
+    items = steward.outbox.take(env.channel, after=0)
+    notices = [i for i in items if i.kind == "notice"]
+    assert len(notices) == 1
+    assert "一直失败" in notices[0].content  # 原文前 50 字进了通知,用户知道丢了什么
+
+
+async def test_terminal_model_error_fails_immediately_with_notice(steward_factory):
+    """终态错(401):第一次就 failed + notice,不重试——key 错了重试一万次也没用。"""
+
+    class AuthRejected:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ModelCallError("status_code: 401, unauthorized", retryable=False)
+
+    steward, _ = steward_factory()
+    steward.model = AuthRejected()
+    env = Envelope.new(source="user", channel="cli", content="认证失败")
+    steward.submit(env)
+
+    assert await steward.process_next() is None
+
+    row = steward.inbox._conn.execute(
+        "SELECT state, attempts FROM inbox WHERE id=?", (env.id,)
+    ).fetchone()
+    assert row["state"] == "failed"
+    assert row["attempts"] == 1  # 只试了一次
+
+    notices = [i for i in steward.outbox.take(env.channel, after=0) if i.kind == "notice"]
+    assert len(notices) == 1
+    assert "认证失败" in notices[0].content
+
+
+async def test_non_model_error_still_bubbles_up(steward_factory):
+    """非模型错误(裸异常=代码 bug)维持现状:failed + 冒泡,毒消息范式交给 worker。"""
+
+    class PureBug:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ValueError("代码 bug,不是模型问题")
+
+    steward, _ = steward_factory()
+    steward.model = PureBug()
+    env = Envelope.new(source="user", channel="cli", content="会崩")
+    steward.submit(env)
+
+    with pytest.raises(ValueError):
+        await steward.process_next()
+
+    row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
+    assert row["state"] == "failed"
+    # 裸异常不是模型失败,不该出 notice——它会冒泡给 worker 处理
+    assert steward.outbox.take(env.channel, after=0) == []

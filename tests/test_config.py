@@ -14,6 +14,7 @@ def test_load_reads_env(monkeypatch, tmp_path):
     assert settings.data_dir == tmp_path
     assert settings.timezone == "Asia/Shanghai"  # 默认值
     assert settings.l0_max_turns == 30  # 默认值
+    assert settings.max_attempts == 3  # 默认值
 
 
 def test_load_rejects_missing_api_key(monkeypatch):

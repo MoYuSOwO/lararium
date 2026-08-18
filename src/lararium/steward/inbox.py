@@ -70,6 +70,20 @@ class Inbox:
             (error, _now(), env_id),
         )
 
+    def release(self, env_id: str) -> None:
+        """可重试失败后把信封放回 pending 供再次认领。
+
+        不清 attempts:它在 claim 时 +1,是重试上限的计数依据。清了就等于
+        每次都从头算,毒消息会无限重试。
+        """
+        self._conn.execute(
+            "UPDATE inbox SET state='pending', claimed_at=NULL WHERE id=?", (env_id,)
+        )
+
+    def attempts(self, env_id: str) -> int:
+        row = self._conn.execute("SELECT attempts FROM inbox WHERE id=?", (env_id,)).fetchone()
+        return int(row["attempts"]) if row else 0
+
     def pending_count(self) -> int:
         return int(
             self._conn.execute("SELECT COUNT(*) FROM inbox WHERE state='pending'").fetchone()[0]
