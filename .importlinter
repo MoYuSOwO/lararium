@@ -29,3 +29,12 @@ name = bundle 之间互不依赖(跨领域流量一律过主控)
 type = independence
 modules =
     bundles.memory
+
+[importlinter:contract:cli-is-pure-client]
+name = CLI 是纯 HTTP 客户端,不得 import bundles/steward(M2-6 客户端化后与 IM 适配器同级)
+type = forbidden
+source_modules =
+    lararium.gateway.cli
+forbidden_modules =
+    bundles
+    lararium.steward

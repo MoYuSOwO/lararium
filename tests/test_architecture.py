@@ -58,7 +58,13 @@ def test_only_the_ledger_module_writes_files() -> None:
     `open(..., "w"/"a"/"x")`(含二进制/`+` 变体)、文件对象 `.write*`、Path 的
     write 方法族、`os.replace` 与 `shutil` 写族。
     """
-    allowed = {Path("bundles/memory/ledger.py")}
+    allowed = {
+        Path("bundles/memory/ledger.py"),
+        # CLI 客户端(M2-6)要持久化自己的 after 游标(~/.lararium/cli.seq),让
+        # "杀掉重开 after 用上次 seq → 不丢不重"。这是**客户端自己的状态文件**,
+        # 不在服务端 data_dir、也不碰账本;cli.py 是纯 HTTP 客户端,拿不到 ledger。
+        Path("src/lararium/gateway/cli.py"),
+    }
     offenders: list[str] = []
 
     for path in _source_files():
