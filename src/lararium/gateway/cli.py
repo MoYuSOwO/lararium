@@ -150,13 +150,17 @@ async def main() -> None:
 
         steward.submit(Envelope.new(source="user", channel="cli", content=line))
         try:
-            reply = await steward.process_next()
+            outcome = await steward.process_next()
         except Exception as exc:
             # 一次 API 错误(限流/网络抖动/401)不能打死 CLI——它要"随时可用"。
             # loop.py 已记 error 事件并标记信封 failed,这里只需接住不让它冒泡。
             print(f"处理出错(不影响后续):{type(exc).__name__}: {exc}")
             continue
-        print(f"\nLararium > {reply}")
+        if outcome.kind == "replied" and outcome.text:
+            print(f"\nLararium > {outcome.text}")
+        elif outcome.kind == "retry_later":
+            # M2-3 起重试归 worker 管(指数退避);CLI 这只是告知,下轮会先重跑这条。
+            print("\n(模型暂时不可用,将自动重试……)")
 
 
 def run_cli() -> None:

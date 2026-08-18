@@ -58,12 +58,14 @@ def steward_factory(tmp_path, monkeypatch):
 async def test_process_next_returns_reply_text(steward_factory):
     steward, _ = steward_factory([ModelReply(text="你好呀")])
     steward.submit(Envelope.new(source="user", channel="cli", content="你好"))
-    assert await steward.process_next() == "你好呀"
+    outcome = await steward.process_next()
+    assert outcome.kind == "replied"
+    assert outcome.text == "你好呀"
 
 
 async def test_process_next_returns_none_when_inbox_empty(steward_factory):
     steward, _ = steward_factory()
-    assert await steward.process_next() is None
+    assert (await steward.process_next()).kind == "empty"
 
 
 async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_factory):
@@ -235,7 +237,9 @@ async def test_retryable_model_error_releases_envelope_without_notice(steward_fa
     env = Envelope.new(source="user", channel="cli", content="试试看")
     steward.submit(env)
 
-    assert await steward.process_next() is None
+    outcome = await steward.process_next()
+    assert outcome.kind == "retry_later", "可重试错应标记 retry_later,让 worker 退避重试"
+    assert outcome.attempts == 1
 
     row = steward.inbox._conn.execute(
         "SELECT state, attempts FROM inbox WHERE id=?", (env.id,)
@@ -263,10 +267,10 @@ async def test_retryable_failures_abandon_after_max_attempts_with_notice(steward
     env = Envelope.new(source="user", channel="cli", content="一直失败的消息")
     steward.submit(env)
 
-    # attempts 在 claim 时逐次 +1:1, 2, 3。第 3 次 3 < 3 不成立 → failed
-    assert await steward.process_next() is None
-    assert await steward.process_next() is None
-    assert await steward.process_next() is None
+    # attempts 在 claim 时逐次 +1:1, 2, 3。第 3 次 3 < 3 不成立 → 终态(发 notice)
+    assert (await steward.process_next()).kind == "retry_later"
+    assert (await steward.process_next()).kind == "retry_later"
+    assert (await steward.process_next()).kind == "replied"  # 终态:发 notice,消费了槽位
 
     row = steward.inbox._conn.execute("SELECT state FROM inbox WHERE id=?", (env.id,)).fetchone()
     assert row["state"] == "failed"
@@ -289,7 +293,9 @@ async def test_terminal_model_error_fails_immediately_with_notice(steward_factor
     env = Envelope.new(source="user", channel="cli", content="认证失败")
     steward.submit(env)
 
-    assert await steward.process_next() is None
+    outcome = await steward.process_next()
+    # 终态:立即 failed + notice,kind=replied 表示"本轮消费了槽位走到终态"
+    assert outcome.kind == "replied"
 
     row = steward.inbox._conn.execute(
         "SELECT state, attempts FROM inbox WHERE id=?", (env.id,)

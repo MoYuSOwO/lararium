@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Callable
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from lararium.config import Settings
 from lararium.envelope import Envelope
@@ -14,6 +15,23 @@ from lararium.steward.registry import Registry
 from lararium.steward.tools import BuiltinTools
 
 logger = logging.getLogger("lararium")
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """process_next 的结果,让 worker 按 kind 分流——避免 None 一词多义(队列空 vs 可重试)。
+
+    - replied:本轮消费了一个信封走到终态(成功回复,或终态失败发了 notice)。
+      worker 据此知道自己"忙过",队列排空时该触发空闲结算。
+    - empty:收件箱空,null 之外的明确信号。
+    - retry_later:可重试失败,信封已放回 pending。attempts 是本次失败时的已尝试次数,
+      worker 用它做指数退避(2**attempts,封顶 60s)——绝不等 wake,否则任何新消息
+      都会立刻重锤那条被限流的消息。
+    """
+
+    kind: Literal["replied", "empty", "retry_later"]
+    text: str | None = None  # replied 且是成功回复时:回复正文
+    attempts: int = 0  # retry_later 时:本次失败已尝试次数(退避用)
 
 
 class Steward:
@@ -56,10 +74,10 @@ class Steward:
         """把已通过的提案批量落盘。落盘会改前缀,所以只在明确的时机调用。"""
         return self.gate.settle()
 
-    async def process_next(self) -> str | None:
+    async def process_next(self) -> TurnOutcome:
         env = self.inbox.claim_next()
         if env is None:
-            return None
+            return TurnOutcome(kind="empty")
 
         self.journal.append(
             env.id,
@@ -113,22 +131,23 @@ class Steward:
             # 重排队、重算一轮(多花一次 API 钱),但绝不静默吞回复——用户至少收到一次。
             self.outbox.put(env.id, env.channel, reply.text, kind="reply")
             self.inbox.complete(env.id)
-            return reply.text
+            return TurnOutcome(kind="replied", text=reply.text)
 
         except ModelCallError as exc:
             # 隔离盒已经把 pydantic-ai 的异常分类成自家类型,这里只认 retryable。
             self.journal.append(env.id, "error", {"content": str(exc)})
-            if exc.retryable and self.inbox.attempts(env.id) < self.settings.max_attempts:
+            attempts = self.inbox.attempts(env.id)
+            if exc.retryable and attempts < self.settings.max_attempts:
                 self.inbox.release(env.id)  # 回 pending,attempts 已在 claim 时 +1
-            else:
-                self.inbox.fail(env.id, str(exc))
-                self.outbox.put(
-                    env.id,
-                    env.channel,
-                    f"这条消息处理失败({exc}),已放弃:{env.content[:50]}",
-                    kind="notice",
-                )
-            return None
+                return TurnOutcome(kind="retry_later", attempts=attempts)
+            self.inbox.fail(env.id, str(exc))
+            self.outbox.put(
+                env.id,
+                env.channel,
+                f"这条消息处理失败({exc}),已放弃:{env.content[:50]}",
+                kind="notice",
+            )
+            return TurnOutcome(kind="replied")  # 终态:发 notice,消费了槽位
 
         except Exception as exc:
             # 非模型错误 = 代码 bug:留痕、标记 failed、向上冒泡(毒消息范式,worker 会接)。
