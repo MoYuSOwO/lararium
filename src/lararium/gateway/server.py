@@ -31,6 +31,7 @@ from lararium.steward.loop import Steward
 from lararium.steward.model import PydanticAIClient
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 from lararium.steward.worker import Worker
 
 logger = logging.getLogger("lararium")
@@ -60,6 +61,7 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
         model=PydanticAIClient(settings),
         persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
         outbox=Outbox(conn),
+        threads=Threads(conn),
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
         bundle_tools=memory_tool_functions(gate),
     )

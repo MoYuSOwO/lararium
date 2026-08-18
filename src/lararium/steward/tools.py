@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, neutralize_fence
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 
 # 检索结果条数的硬上限。limit 是模型可控参数,不封顶的话:
 #   limit=10000 → 一次工具调用返回约 5.6 万 token,撑爆 L0 并逼出一次压缩
@@ -48,9 +49,12 @@ def _render_hit(hit: SearchHit) -> str:
 
 
 class BuiltinTools:
-    def __init__(self, journal: Journal, registry: Registry, timezone: str) -> None:
+    def __init__(
+        self, journal: Journal, registry: Registry, timezone: str, threads: Threads
+    ) -> None:
         self.journal = journal
         self.registry = registry
+        self.threads = threads
         self._tz = ZoneInfo(timezone)
 
     def current_time(self) -> str:
@@ -83,6 +87,28 @@ class BuiltinTools:
             lines.append(f"- [{h.ts[:10]}] ({h.envelope_id}) {_render_hit(h)}")
         return "\n".join(lines)
 
+    def open_thread(self, topic: str, note: str) -> str:
+        """开一个话头:还有件没聊完的事,记个名字和一句状态。
+        同名再次调用 = 更新这句状态,不是另开一个。"""
+        t = self.threads.open_thread(topic, note)
+        return f"话头已开:{t.topic} —— {t.note}"
+
+    def close_thread(self, topic: str) -> str:
+        """关掉一个话头:这件事聊完了,不用再惦记。"""
+        if self.threads.close_thread(topic):
+            return f"话头已关闭:{topic}"
+        return f"没有在开的「{topic}」话头"
+
     def as_tool_functions(self) -> list[Callable]:
-        """顺序固定——工具 schema 是前缀第0层,顺序变了缓存全毁。"""
-        return [self.current_time, self.read_skill, self.search_history]
+        """顺序固定——工具 schema 是前缀第0层,顺序变了缓存全毁。
+
+        M3-2:open_thread/close_thread **追加在既有工具之后**,不许插队——插进
+        中间等于每轮毁一次缓存。open_threads() 不在这(是代码路径,组装器调)。
+        """
+        return [
+            self.current_time,
+            self.read_skill,
+            self.search_history,
+            self.open_thread,
+            self.close_thread,
+        ]

@@ -13,6 +13,7 @@ from lararium.steward.loop import Steward
 from lararium.steward.model import ModelCallError, ModelReply
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 
 
 class FakeModel:
@@ -48,6 +49,7 @@ def steward_factory(tmp_path, monkeypatch):
             model=model,
             persona="你是 Lararium。",
             outbox=Outbox(conn),
+            threads=Threads(conn),
             bundle_tools=memory_tool_functions(gate),
         )
         return steward, model
@@ -79,6 +81,10 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         "current_time",
         "read_skill",
         "search_history",
+        # M3-2:open_thread/close_thread 追加在既有内置之后,不许插队(工具 schema 是
+        # 前缀第0层,插队 = 每轮毁缓存);open_threads() 不在——它是代码路径,组装器调。
+        "open_thread",
+        "close_thread",
         "propose_fact",
         "list_pending",
     ]

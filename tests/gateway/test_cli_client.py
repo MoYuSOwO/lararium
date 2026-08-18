@@ -23,6 +23,7 @@ from lararium.steward.loop import Steward
 from lararium.steward.model import ModelReply
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 
 
 class FakeModel:
@@ -71,6 +72,7 @@ def live_url(tmp_path, monkeypatch):
         model=FakeModel(),
         persona="你是 Lararium。",
         outbox=Outbox(conn),
+        threads=Threads(conn),
         bundle_tools=memory_tool_functions(gate),
     )
     app = create_app(

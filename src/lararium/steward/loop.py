@@ -13,6 +13,7 @@ from lararium.steward.model import ModelCallError, ModelClient, format_cache_log
 from lararium.steward.outbox import Outbox
 from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 from lararium.steward.tools import BuiltinTools
 
 logger = logging.getLogger("lararium")
@@ -52,6 +53,7 @@ class Steward:
         model: ModelClient,
         persona: str,
         outbox: Outbox,
+        threads: Threads,
         bundle_tools: list[Callable] | None = None,
         mcp_servers: list[Any] | None = None,
     ) -> None:
@@ -64,9 +66,10 @@ class Steward:
         self.model = model
         self.persona = persona
         self.outbox = outbox
+        self.threads = threads
         self.bundle_tools = bundle_tools or []
         self.mcp_servers = mcp_servers or []
-        self.tools = BuiltinTools(journal, registry, settings.timezone)
+        self.tools = BuiltinTools(journal, registry, settings.timezone, threads)
 
     def all_tools(self) -> list[Callable]:
         """内置工具在前、bundle 工具在后,顺序固定——工具 schema 是前缀第0层。"""

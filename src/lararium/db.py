@@ -45,6 +45,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS journal_fts USING fts5(
     seq UNINDEXED,
     tokenize='trigram'
 );
+
+CREATE TABLE IF NOT EXISTS threads (
+    topic      TEXT PRIMARY KEY,
+    note       TEXT NOT NULL,
+    state      TEXT NOT NULL DEFAULT 'open',   -- open | closed
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_threads_open ON threads(state, updated_at);
 """
 
 

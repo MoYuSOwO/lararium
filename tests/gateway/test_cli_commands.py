@@ -10,6 +10,7 @@ from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 
 
 class _StubModel:
@@ -34,6 +35,7 @@ def system(tmp_path, monkeypatch):
         model=_StubModel(),
         persona="P",
         outbox=Outbox(conn),
+        threads=Threads(conn),
     )
     return steward, ledger, gate
 

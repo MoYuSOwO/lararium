@@ -5,13 +5,19 @@ import pytest
 from lararium.db import connect
 from lararium.steward.journal import Journal
 from lararium.steward.registry import Registry
+from lararium.steward.threads import Threads
 from lararium.steward.tools import BuiltinTools
 
 
 @pytest.fixture
 def tools(tmp_path):
-    journal = Journal(connect(tmp_path / "steward.sqlite"))
-    return BuiltinTools(journal, Registry.load(Path("bundles")), timezone="Asia/Shanghai")
+    conn = connect(tmp_path / "steward.sqlite")
+    return BuiltinTools(
+        Journal(conn),
+        Registry.load(Path("bundles")),
+        timezone="Asia/Shanghai",
+        threads=Threads(conn),
+    )
 
 
 def test_current_time_returns_iso_with_configured_zone(tools):
@@ -42,9 +48,16 @@ def test_search_history_reports_no_match_clearly(tools):
 
 
 def test_tool_function_order_is_fixed(tools):
-    """工具 schema 顺序必须稳定,否则每次启动都毁前缀缓存。"""
+    """工具 schema 顺序必须稳定,否则每次启动都毁前缀缓存。
+    M3-2:open_thread/close_thread 追加在既有内置之后,不许插队。"""
     names = [f.__name__ for f in tools.as_tool_functions()]
-    assert names == ["current_time", "read_skill", "search_history"]
+    assert names == [
+        "current_time",
+        "read_skill",
+        "search_history",
+        "open_thread",
+        "close_thread",
+    ]
 
 
 def test_search_history_caps_the_result_count(tools):
@@ -140,3 +153,16 @@ def test_untrusted_hit_cannot_close_the_fence_early(tools):
     )
     out = tools.search_history("转账")
     assert out.count(">>>") == 1, f"检索围栏可被提前闭合:\n{out}"
+
+
+def test_open_thread_tool_returns_confirmation(tools):
+    """话头工具走 E2:返回人话文本,不抛异常。"""
+    result = tools.open_thread("租房", "在等房东回复")
+    assert "话头已开" in result
+    assert "租房" in result
+
+
+def test_close_thread_tool_confirms_or_says_not_found(tools):
+    tools.open_thread("租房", "在等房东回复")
+    assert "话头已关闭" in tools.close_thread("租房")
+    assert "没有在开" in tools.close_thread("租房")

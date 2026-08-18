@@ -51,6 +51,14 @@
 
 ---
 
+## M3 · 陪伴与记忆(进行中)
+
+目标:记得住、接得上、说话像个熟人。200k 预算用满;话头归 Steward(对话自身状态,不是生活领域),压缩只产索引行不产状态卡。
+
+- **M3-1** L0 按 token 预算截断(200k)+ 收掉 M2-6 遗留:`outbox.put`+`inbox.complete` 同一事务(崩在中间不再重复回复,D10 真·恰好一次);`recent_turns_within_budget` 从最新往回填、预算耗尽即停、最新一轮无条件在;上下文超长类 400 的 notice 说人话(不甩 status_code: 400)。补做:M3-1b 把估算器实测定标(CJK 0.8/非 CJK 0.3,原 len//2 低估 1.4~1.6 倍)、预算改为整窗口径(读前缀-8000 留白,余额归 L0)、`_turns_by_id` 一条 SQL 不走 replay(800 轮 274ms→28ms)、`db.transaction(conn)` + `Inbox/Outbox.conn` 属性
+
+---
+
 ## M0 · 立项与工程基建(已完成)
 
 - 架构设计 v2.0([DESIGN.md](DESIGN.md)):单 agent + plugin bundle。推翻了 v0.1 的多 agent + handoff 方案——多个脑子之间传话必丢、交接必漏,那是结构性故障不是实现问题
