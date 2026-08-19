@@ -96,3 +96,18 @@ class Threads:
             )
             for r in rows
         ]
+
+    def all_open_threads(self) -> list[ThreadInfo]:
+        """**全部** open 话头(不分页、不截前 5)。
+
+        open_threads() 只给上下文用(每轮进信封,5 条是"撑爆信封"的闸);
+        归拢(M3-5)要能看到**掉出前 5 名的那批**——它们还是 open,模型看不见也就
+        关不掉(实测 22 条 open 只露 5 条),没这条门就漏了。M3-5 夜间归拢专治这个。
+        """
+        rows = self._conn.execute(
+            "SELECT topic, note, updated_at FROM threads WHERE state='open' "
+            "ORDER BY updated_at DESC, topic"
+        ).fetchall()
+        return [
+            ThreadInfo(topic=r["topic"], note=r["note"], updated_at=r["updated_at"]) for r in rows
+        ]

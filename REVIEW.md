@@ -4176,3 +4176,61 @@ M4 打进镜像能消掉十分钟那一档,但"第一轮对话付加载成本"�
 ### 门禁
 
 224 passed(222 → +2:扩展降级 boot + 工具提示),mypy 26 files,import-linter 4 kept(46 deps)。
+
+**验收结论**(Claude 填):**通过。M3-4 结掉。** 打回时那个探针原样重跑:
+
+```
+[log] sqlite-vec 扩展加载失败(模拟:扩展装不上):语义检索不可用,词法检索照常
+connect 成功 ✓  VEC_AVAILABLE = False
+起居注照写 2 条 ✓ / journal_vec 表不存在(对)/ 其它 11 张表照常 ✓
+词法路 ✓
+语义路 → "语义检索暂不可用:本地 embedding 模型或 sqlite-vec 扩展没就绪…"
+```
+
+**扩展没了只丢语义检索,系统照跑。** 那条纪律(第三方挂了不能打崩主循环)现在两半都全了。
+
+happy path 没被这道新闸误伤,我另起一个库回归过:`VEC_AVAILABLE=True`,四条凭印象查询
+语义路 4/4、向量行 5 条齐。
+
+预热放在 `lifespan` 且走 `asyncio.to_thread`——位置对:启动期慢是诚实的,而且不占事件循环。
+
+门禁四关独立重跑全绿:ruff ☑ / format ☑ / mypy ☑(26 files)/ import-linter ☑(4 kept)/
+pytest ☑(**224 passed**)。
+
+### 顺带记一笔(不用改)
+
+`VEC_AVAILABLE` 是模块级全局,每次 `connect()` 重设。生产只有一个连接,所以现在是对的;
+但它描述的其实是**某个连接**的能力。将来要是有第二个连接(只读副本、迁移脚本),
+"最后一次 connect 说了算"就会变成错的。到那天再改成挂在连接/Journal 上,别现在动。
+
+## Task M3-5:夜间归拢(sweep,待验收)
+
+**执行记录**(程序员填)
+
+**Step 1 — 失败的测试先行**(`tests/steward/test_sweep.py`,6 条,核心是验收方三条盯点):
+- 归拢能关掉**掉出 open_threads 前 5 名**但仍 open 的话头(prompt 给全部 open,不只第 5 名)
+- **只改话头 + 提 pending 提案,账本一行不动**(gate.propose provenance="untrusted";ledger.read() 前后相同、unsettled_count 不变)
+- **模型输入/输出逐字落起居注**(sweep 事件 phase=input/output;input == 真给模型的那份)
+- 同一区间幂等(模型只调一次、不重复提案)
+- 模型调用失败不破主循环(input 已入账、可重试)
+- 非 JSON 输出是 no-op
+
+**Step 2 — 实现**(`src/lararium/steward/sweep.py`):
+- `Sweeper(journal, threads, gate, run_model, instructions)`:只读起居注的
+  `events_in_range` → 构造 prompt(全部 open 话头 + 对话窗口)→ 落 input → 调模型
+  (廉价模型 `LARARIUM_SWEEP_MODEL`,空则主模型)→ 落 output → 解析 JSON → open/close
+  话头 + `gate.propose(provenance="untrusted", origin="sweep")` → mark swept。
+- **gate 是真实 Gate(组装根注入),不是 Steward 的 GatePort**——Port 故意不放 propose
+  (把"单写者"编进类型),归拢正需要 propose,直接绕过 Port 接真 Gate,也不动 Port。
+- 幂等:`sweep_runs` 表 `(range_id="since|until")` 主键,同区间只归拢一次。
+- `/sweep` 端点:server post_command 里 /quit 同级 special-case,扫过去 24h。
+- `Threads.all_open_threads()`(全量,不截前 5)——M3-4 记的那笔"掉出前 5 模型看不见",
+  归拢就是收它的地方。
+- 指令在 `prompts/sweep.md`(L1:给模型读的进文件)。
+
+**Step 3 — 门禁**:230 passed(224 → +6),mypy 27 files(+sweep.py),import-linter 4 kept(49 deps)。
+
+**验收方三条核对**:
+1. 账本单写者:归拢只 propose 进 pending,绝不直接写账本(测试:ledger unchanged + unsettled==0)✓
+2. 可见即入账:sweep 的 input/output 逐字落起居注,后台任务不走后门 ✓
+3. 处理全部 open:all_open_threads 把掉出前 5 的那批也喂给模型 ✓

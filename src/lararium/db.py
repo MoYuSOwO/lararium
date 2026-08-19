@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS threads (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_threads_open ON threads(state, updated_at);
+
+CREATE TABLE IF NOT EXISTS sweep_runs (
+    range_id TEXT PRIMARY KEY,   -- "since|until"——同一区间只归拢一次(幂等)
+    ran_at   TEXT NOT NULL
+);
 """
 
 # M3-4 语义检索:嵌入向量(256 维,L2 归一化后入库)与起居注同库。

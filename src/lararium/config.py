@@ -33,6 +33,7 @@ class Settings:
     l0_max_tokens: int
     max_attempts: int
     recall_min_similarity: float
+    sweep_model: str
     bind_host: str
     bind_port: int
     control_tokens: dict[str, str]
@@ -56,6 +57,9 @@ class Settings:
             # M3-4:语义检索相似度阈值。0.35 是猜的初值(2026-08-18 实测命中 0.44~0.58、
             # 未命中 0.35),真机跑几天要按实际分布调。
             recall_min_similarity=float(os.environ.get("LARARIUM_RECALL_MIN_SIMILARITY", "0.35")),
+            # M3-5 夜间归拢(sweep)的廉价模型,单配;空则用主模型。归拢是扫历史做剪枝,
+            # 不需要主模型那么强,便宜够用就行。
+            sweep_model=os.environ.get("LARARIUM_SWEEP_MODEL", ""),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
             # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。

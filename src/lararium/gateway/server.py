@@ -260,6 +260,22 @@ def create_app(
             # 客户端关窗口不是系统事件,不该触发前缀缓存重建,也不该吞掉任何错误。
             return JSONResponse({"text": "服务端无退出概念,请直接关客户端。"}, status_code=200)
 
+        if line.strip() == "/sweep":
+            # M3-5 夜间归拢:手动命令(占时,需要模型)。归拢**只写话头和 pending 提案**,
+            # 账本写入永远走 Gate.settle;模型输入输出都落起居注(sweep.sweep 内部做)。
+            from datetime import UTC as _UTC
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
+
+            from lararium.steward.sweep import make_sweeper
+
+            now = _dt.now(_UTC)
+            sweeper = make_sweeper(steward.settings, steward.journal, steward.threads, gate)
+            sweep_result = await sweeper.run(
+                since=(now - _td(hours=24)).isoformat(), until=now.isoformat()
+            )
+            return JSONResponse({"text": sweep_result.summary}, status_code=200)
+
         result = handle_command(line, steward=steward, ledger=ledger, gate=gate)
         return JSONResponse({"text": result.text}, status_code=200)
 
