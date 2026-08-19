@@ -71,20 +71,28 @@ class Journal:
     def append(self, envelope_id: str, kind: str, payload: dict[str, Any]) -> int:
         ts = datetime.now(UTC).isoformat()
         text = _searchable_text(payload) if kind in SEARCHABLE_KINDS else None
-        cur = self._conn.execute(
-            "INSERT INTO journal (envelope_id, kind, payload, search_text, ts) VALUES (?,?,?,?,?)",
-            (envelope_id, kind, json.dumps(payload, ensure_ascii=False), text, ts),
-        )
-        # AUTOINCREMENT 主键的 INSERT 必有 lastrowid;typeshed 标为 int|None,这里收窄
-        assert cur.lastrowid is not None
-        seq = int(cur.lastrowid)
-        if text is not None:
-            self._conn.execute("INSERT INTO journal_fts (text, seq) VALUES (?,?)", (text, seq))
-            # M3-4:embedding 在**数据面**算(不进前缀、不碰缓存)。语义检索没它就没法跑;
-            # 模型不可用(embed 返回 None)或扩展不可用(_db.VEC_AVAILABLE False)就不建
-            # 向量行——词法路照常,不能打崩 append(E2)。
-            if _db.VEC_AVAILABLE:
+        # M3-4:embedding 在**数据面**算(不进前缀、不碰缓存)。向量先算好(纯函数不写库),
+        # 事务里只做快而可靠的 INSERT;模型不可用/失败 → vec=None,跳过向量行,词法照常(E2)。
+        vec = None
+        if text is not None and _db.VEC_AVAILABLE:
+            try:
                 vec = embed(text)
+            except Exception:
+                vec = None
+        # journal / journal_fts / journal_vec 在**一个事务**里写齐:崩在中途整个回滚,
+        # 不留「有 journal 无 fts / 无 vec」的半套——缺行会让词法 3 字以上/语义永久召不回
+        # (审计复现:'鮨一的套餐' 2 字 LIKE 还活着、3 字 FTS 缺行、vec 缺行)。
+        with _db.transaction(self._conn):
+            cur = self._conn.execute(
+                "INSERT INTO journal (envelope_id, kind, payload, search_text, ts) "
+                "VALUES (?,?,?,?,?)",
+                (envelope_id, kind, json.dumps(payload, ensure_ascii=False), text, ts),
+            )
+            # AUTOINCREMENT 主键的 INSERT 必有 lastrowid;typeshed 标为 int|None,这里收窄
+            assert cur.lastrowid is not None
+            seq = int(cur.lastrowid)
+            if text is not None:
+                self._conn.execute("INSERT INTO journal_fts (text, seq) VALUES (?,?)", (text, seq))
                 if vec is not None:
                     self._conn.execute(
                         "INSERT INTO journal_vec (seq, embedding) VALUES (?,?)",

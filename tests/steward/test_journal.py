@@ -204,3 +204,64 @@ def test_db_boots_and_lexical_works_without_vec(tmp_path, monkeypatch):
     monkeypatch.undo()
     connect(tmp_path / "s2.sqlite")
     assert db_mod.VEC_AVAILABLE is True
+
+
+def test_journal_search_finds_3char_after_append(tmp_path):
+    """验收复现:append '鮨一的套餐' 后,3 字以上走 FTS 必须能找到(不会因缺行召不回);
+    2 字 LIKE 也还在。三表写齐是搜索正确性的前提,不许有「有 journal 无 fts」。"""
+    conn = connect(tmp_path / "s.sqlite")
+    j = Journal(conn)
+    j.append("env-1", "envelope", {"content": "去吃了鮨一的套餐"})
+    total, hits = j.search("鮨一的套餐")
+    assert total == 1 and len(hits) == 1, "3 字以上走 FTS5,行必须在"
+    total2, _ = j.search("鮨一")
+    assert total2 == 1, "2 字走 LIKE 回退,也必须在"
+
+
+def test_append_is_atomic_rolls_back_all_tables_on_mid_crash(tmp_path, monkeypatch):
+    """崩在写 FTS 前/写 vec 前:一次事务整个回滚,绝不留「有 journal 无 fts/vec」的半套。"""
+
+    class ExplodingConn:
+        """包一层,让"写 FTS"这条语句抛异常,模拟崩在写 FTS 前。"""
+
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args):
+            if "INSERT INTO journal_fts" in str(sql):
+                raise RuntimeError("崩在写 FTS 前")
+            return self._real.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    conn = connect(tmp_path / "s.sqlite")
+    j = Journal(ExplodingConn(conn))
+    with pytest.raises(RuntimeError):
+        j.append("env-1", "envelope", {"content": "鮨一的套餐"})
+    # 整个 append 回滚:三个表都是 0 行(不留「有 journal 无 fts」的半套)
+    assert conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM journal_fts").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM journal_vec").fetchone()[0] == 0
+
+
+def test_append_tables_written_consistently(tmp_path, monkeypatch):
+    """正常 append:searchable 三表各一行;不可检索 kind 只落 journal;embed 例外不伤 journal。"""
+    import lararium.steward.journal as jmod
+
+    conn = connect(tmp_path / "s.sqlite")
+    j = Journal(conn)
+    monkeypatch.setattr(jmod, "embed", lambda t: [0.1] * 256)  # 256 维(vec0 FLOAT[256] 必须满维)
+    j.append("env-a", "envelope", {"content": "可检索内容"})
+
+    def c(t):
+        return conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+
+    assert c("journal") == 1 and c("journal_fts") == 1 and c("journal_vec") == 1, "三表一致写齐"
+    # 不可检索内部事件(prompt/sweep 等)只落 journal,不建 fts/vec
+    j.append("env-a", "prompt", {"messages": []})
+    assert c("journal") == 2 and c("journal_fts") == 1 and c("journal_vec") == 1
+    # embed 失败(返回 None)→ journal/fts 照落,vec 跳过
+    monkeypatch.setattr(jmod, "embed", lambda t: None)
+    j.append("env-b", "envelope", {"content": "模型不在向量也不建"})
+    assert c("journal") == 3 and c("journal_fts") == 2 and c("journal_vec") == 1
