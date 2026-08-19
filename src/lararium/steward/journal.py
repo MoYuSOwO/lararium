@@ -210,14 +210,15 @@ class Journal:
         return total, hits
 
     def events_in_range(self, since: str, until: str, limit: int = 2000) -> list[dict[str, Any]]:
-        """取 [since, until] 时间窗内的对话事件(envelope/reply/tool_result),时间正序。
+        """取 [since, until] 时间窗内的对话事件(envelope/reply),时间正序。
 
-        给夜间归拢(sweep)扫:它只读起居注、只看这段时间聊了什么。ts 是 ISO 8601,
-        同一种 offset 下字符串比较就是时间比较。
+        给夜间归拢(sweep)扫:它只读起居注、只看这段时间聊了什么。只取这两种 kind——
+        prompt/tool_result 是内部结构,归拢用不上,白 json.loads 一遍还费。
+        ts 是 ISO 8601,同一种 offset 下字符串比较就是时间比较。
         """
         rows = self._conn.execute(
             "SELECT envelope_id, kind, payload, ts FROM journal "
-            "WHERE ts >= ? AND ts <= ? AND kind IN ('envelope','reply','tool_result') "
+            "WHERE ts >= ? AND ts <= ? AND kind IN ('envelope','reply') "
             "ORDER BY seq LIMIT ?",
             (since, until, limit),
         ).fetchall()

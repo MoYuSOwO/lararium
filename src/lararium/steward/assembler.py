@@ -50,11 +50,13 @@ def neutralize_fence(text: str) -> str:
     return text.replace(FENCE_OPEN, "＜＜＜").replace(FENCE_CLOSE, "＞＞＞")  # noqa: RUF001
 
 
-def _fold(text: str) -> str:
+def fold_text(text: str) -> str:
     """把任何空白(含换行/制表)折成一个空格。
 
-    话头正文是模型写的、会转述短信/模块事件里的内容,note 里的换行原样保留就是
-    P1-2"多行内容撑开列表"的形状——渲染时必须折掉,不能让一条话头伪造出列表项。
+    话头正文/归拢 prompt 等都是**模型写的、会转述不可信来源内容**的文本,换行原样
+    保留就是 P1-2"多行内容撑开列表/伪造成新的结构"的形状——任何**新拼一段要喂给
+    模型的文本**的地方都要过这一刀,不管它叫工具、组装器还是后台任务(M3-5 教训,
+    M3-6 切段 prompt 是下一个)。
     """
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -73,8 +75,8 @@ def render_open_threads(open_threads: list[dict[str, Any]] | None) -> str | None
         return None
     parts = []
     for t in open_threads:
-        topic = neutralize_fence(_fold(t.get("topic") or ""))
-        note = neutralize_fence(_fold(t.get("note") or ""))
+        topic = neutralize_fence(fold_text(t.get("topic") or ""))
+        note = neutralize_fence(fold_text(t.get("note") or ""))
         parts.append(f"{topic}({note})" if note else topic)
     return "还在忙的事:" + "、".join(parts)
 

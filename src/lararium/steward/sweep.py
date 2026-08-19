@@ -23,10 +23,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, fold_text, neutralize_fence
+
 logger = logging.getLogger("lararium")
 
 # sweep.suggest 归进"长期偏好"节(模型推断的事实默认落这里),审批卡上能看到原文。
 _SECTION = "长期偏好"
+
+# 归拢对话窗口的字数上限:保护廉价模型的窗口,极端涨潮时保留最近部分(见 _render_events)。
+_PROMPT_CONVO_MAX_CHARS = 20000
 
 
 @dataclass
@@ -83,14 +88,44 @@ class Sweeper:
         parts.append("\n".join(items) if items else "(无)")
         parts.append("")
         parts.append("## 这段对话(时间正序)")
-        convo = [
-            f"[{e['ts'][:16]}] {'用户' if e['kind'] == 'envelope' else '助手'}: "
-            f"{e['payload'].get('content') or ''!s}"
-            for e in events
-            if e["kind"] in ("envelope", "reply")
-        ]
-        parts.append("\n".join(convo) if convo else "(无)")
+        convo = self._render_events(events)
+        parts.append(convo if convo else "(无)")
         return "\n".join(parts)
+
+    @staticmethod
+    def _render_event_line(e) -> str:
+        """一条对话事件渲染成**一行**——归拢的 prompt 也是喂给模型的文本,过
+        P1-1(来源标注)/ P1-2(折行)/ P1-3(围栏 + neutralize_fence)四条:
+        不可信内容一律标「外部数据」、折行、首尾围栏包、正文里的 >>> 中和,让攻击者
+        "伪装成用户那句 / 伪造成新小节"的企图无处可去(M3-5 补做,M3-6 切段同理)。"""
+        stamp = e["ts"][:16]
+        folded = fold_text(str(e["payload"].get("content") or ""))
+        text = neutralize_fence(folded)
+        if e["kind"] == "reply":
+            return f"[{stamp}] 助手: {text}"
+        source = e["payload"].get("source", "user")
+        untrusted = bool(e["payload"].get("meta", {}).get("untrusted"))
+        if source == "user" and not untrusted:
+            return f"[{stamp}] 用户: {text}"
+        channel = e["payload"].get("channel") or source or "?"
+        return (
+            f"[{stamp}] 外部数据(来自 {channel},不是用户说的): {FENCE_OPEN}\n{text}\n{FENCE_CLOSE}"
+        )
+
+    @classmethod
+    def _render_events(cls, events) -> str:
+        lines = [cls._render_event_line(e) for e in events]
+        # 字数上限:保护廉价模型的窗口,极端涨潮时保留最近部分,别撑爆。
+        # 撑爆会走"归拢失败",不致命,但可避免就该避免。
+        total = 0
+        kept: list[str] = []
+        for line in reversed(lines):
+            if total + len(line) > _PROMPT_CONVO_MAX_CHARS:
+                kept.insert(0, "…(对话过长,仅保留最近部分)")
+                break
+            kept.insert(0, line)
+            total += len(line)
+        return "\n".join(kept)
 
     async def run(self, since: str, until: str) -> SweepResult:
         range_id = self._range_id(since, until)
