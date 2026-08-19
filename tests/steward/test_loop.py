@@ -579,3 +579,40 @@ async def test_7_compression_rebuilds_stream_once_then_strict(steward_factory):
     assert msgs[2] == msgs[3][: len(msgs[2])], "压缩后恢复严格追加"
     # L1 进流水区(可见即入账):第 2 轮的 prompt 里能看到索引块
     assert "片段" in msgs[2][0]["content"] or "更早的对话摘要" in msgs[2][0]["content"]
+
+
+async def test_e2e_200k_30_turns_prefix_zero_rebuild_stream_strict(steward_factory):
+    """M3-8 端到端(收口证据):200k 档连聊 30 轮,假模型跑结构——
+    前缀零重建、流水区严格追加(照 M2-6/M3-3 法:查起居注 prompt 事件)、话头跟着变。"""
+    steward, _ = steward_factory([ModelReply(f"回{i}") for i in range(30)])
+    env_ids: list[str] = []
+    for i in range(30):
+        env = Envelope.new(source="user", channel="cli", content=f"问{i}")
+        steward.submit(env)
+        env_ids.append(env.id)
+        await steward.process_next()
+        if i == 5:
+            steward.threads.open_thread("学做红烧肉", "今晚想试")
+        elif i == 15:
+            steward.threads.close_thread("学做红烧肉")
+            steward.threads.open_thread("看牙医", "约了下周")
+        elif i == 22:
+            steward.threads.close_thread("看牙医")
+
+    prompts = [
+        next(e["payload"] for e in steward.journal.replay(eid) if e["kind"] == "prompt")
+        for eid in env_ids
+    ]
+    # 1) 前缀零重建:30 轮 system_prompt 逐字节相同
+    for n in range(1, 30):
+        assert prompts[n]["system_prompt"] == prompts[0]["system_prompt"], f"第 {n} 轮前缀重建了"
+    # 2) 流水区严格追加:每轮 messages 是下一轮的严格前缀(查 prompt 事件,不是缓存百分比)
+    for n in range(29):
+        assert (
+            prompts[n]["messages"] == prompts[n + 1]["messages"][: len(prompts[n]["messages"])]
+        ), f"第 {n} 轮 messages 必须是第 {n + 1} 轮的严格前缀(append-only 破了)"
+    # 3) 话头跟着变:新一轮信封冻结的快照跟实际开/关走
+    assert "学做红烧肉" in prompts[6]["messages"][-1]["content"], "开之后新一轮该有这行"
+    assert "学做红烧肉" not in prompts[16]["messages"][-1]["content"], "关之后新一轮该没了"
+    assert "看牙医" in prompts[16]["messages"][-1]["content"]
+    assert "看牙医" not in prompts[23]["messages"][-1]["content"]
