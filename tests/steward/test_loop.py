@@ -518,6 +518,7 @@ def _fake_compactor(steward):
         "切段指令",
         sweeper,
         steward.settings.compact_index_days,
+        steward.settings.timezone,
     )
 
 

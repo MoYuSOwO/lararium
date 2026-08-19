@@ -20,8 +20,10 @@ import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from lararium.steward.sweep import build_sweep_runner, make_sweeper, render_event_line
 
@@ -60,6 +62,7 @@ class Compactor:
         cut_instructions: str,
         sweeper,
         index_days: int,
+        timezone: str,
     ) -> None:
         self._journal = journal
         self._gate = gate
@@ -67,6 +70,18 @@ class Compactor:
         self._instructions = cut_instructions
         self._sweeper = sweeper
         self._index_days = index_days
+        self._tz = ZoneInfo(timezone)
+
+    def _local_date(self, ts: str) -> str:
+        """起居注 ts 是 UTC;索引行的日期必须走配置时区(L1 时间戳同 L0 的规矩)。
+
+        凌晨对话:UTC 17:40 在 Asia/Shanghai 是次日 01:40,直接取 UTC 前 10 位会差一天
+        (M1 Task 9 那个坑换了个地方)。
+        """
+        try:
+            return datetime.fromisoformat(ts).astimezone(self._tz).date().isoformat()
+        except ValueError:
+            return ts[:10]
 
     def _pending_count(self) -> int:
         try:
@@ -135,10 +150,11 @@ class Compactor:
     async def _cut(
         self, ids: list[str], ts_by_id: dict[str, str], window_events: list[Any]
     ) -> list[Segment]:
-        """切段:窗口对话按话题切成几段(topic + conclusion),钩子信封由代码按顺序分。"""
-        prompt = (
-            self._instructions + "\n\n" + "\n".join(render_event_line(e) for e in window_events)
-        )
+        """切段:窗口对话按话题切成几段。每行带信封 id(内部 id,不是用户数据),
+        模型每段回 envelope_ids 或 start;代码校验 id 在本窗口内——认不出的丢掉、
+        缺的退回按位置分;日期取该段真正钩子所在日的本地日期。"""
+        lines = [f"[{e['envelope_id']}] {render_event_line(e)}" for e in window_events]
+        prompt = self._instructions + "\n\n" + "\n".join(lines)
         cut_id = f"cut-{uuid.uuid4().hex}"
         self._journal.append(cut_id, "sweep", {"phase": "input", "content": prompt, "kind": "cut"})
         try:
@@ -162,17 +178,29 @@ class Compactor:
         except Exception:
             logger.warning("compact: 切段输出不是 JSON,按一段整块处理")
             raw = [{"topic": "对话片段", "conclusion": "这一段对话(详见起居注)"}]
-        # 按顺序把未分配的信封分给各段做钩子,日期取钩子信封的日期
-        remaining = list(ids)
+
+        valid = set(ids)
+        used: set[str] = set()
+        remaining = list(ids)  # 回退:按位置给还没用过的窗口信封
         segments: list[Segment] = []
         for item in raw:
             if not isinstance(item, dict):
                 continue
-            hook = remaining.pop(0) if remaining else (ids[0] if ids else "")
-            date = (ts_by_id.get(hook) or "")[:10]
+            claimed = item.get("envelope_ids") or ([item["start"]] if item.get("start") else [])
+            # 认得出的、还没给过的钩子优先
+            good = [c for c in claimed if isinstance(c, str) and c in valid and c not in used]
+            if good:
+                hook = good[0]
+            else:
+                while remaining and remaining[0] in used:
+                    remaining.pop(0)
+                hook = remaining.pop(0) if remaining else ""
+            if not hook:
+                continue
+            used.add(hook)
             segments.append(
                 Segment(
-                    date=date,
+                    date=self._local_date(ts_by_id.get(hook) or ""),
                     topic=str(item.get("topic") or "片段"),
                     conclusion=str(item.get("conclusion") or "见起居注"),
                     envelope_id=hook,
@@ -186,4 +214,12 @@ def make_compactor(settings: Any, journal: Any, gate: Any, threads: Any) -> Comp
     cut_instructions = Path("prompts/cut.md").read_text(encoding="utf-8")
     runner = build_sweep_runner(settings)
     sweeper = make_sweeper(settings, journal, threads, gate)
-    return Compactor(journal, gate, runner, cut_instructions, sweeper, settings.compact_index_days)
+    return Compactor(
+        journal,
+        gate,
+        runner,
+        cut_instructions,
+        sweeper,
+        settings.compact_index_days,
+        settings.timezone,
+    )

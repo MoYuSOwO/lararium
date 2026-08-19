@@ -18,6 +18,9 @@ def test_load_reads_env(monkeypatch, tmp_path):
     assert settings.max_attempts == 3  # 默认值
     assert settings.recall_min_similarity == 0.35  # 默认值(M3-4 语义检索阈值,猜的初值)
     assert settings.sweep_model == ""  # 默认值(M3-5 归拢廉价模型,空 = 用主模型)
+    assert settings.compact == "on"  # 默认值(M3-6 压缩,off 退回纯截断)
+    assert settings.compact_low_water == 150000  # 默认值(M3-6 压到低水位)
+    assert settings.compact_index_days == 90  # 默认值(M3-6 索引保留)
     assert settings.bind_host == "127.0.0.1"  # 默认值(M2 只绑本机,不公网)
     assert settings.bind_port == 8420  # 默认值
     assert settings.control_tokens == {}  # 默认值

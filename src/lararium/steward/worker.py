@@ -1,7 +1,9 @@
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from lararium.steward.loop import Steward
 
@@ -17,6 +19,9 @@ class Worker:
 
     # 退避上限:指数退避 2**attempts,封顶 60 秒。
     MAX_BACKOFF = 60.0
+    # 空闲压缩的最小间隔:maybe_compact 未顶满是 no-op,但每次要算 l1+前缀+预算,
+    # 别每次队列排空就全算一遍——5 分钟一次足够(M3-6 补做)。
+    COMPACT_MIN_INTERVAL = 300.0
 
     def __init__(
         self,
@@ -24,12 +29,30 @@ class Worker:
         wake: asyncio.Event,
         *,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        compactor: Any | None = None,
     ) -> None:
         self._steward = steward
         # wake 公开:server(lifespan)和新消息入队端点都要能唤醒它。
         self.wake = wake
         # 可注入的 sleep:退避时长测试用假 sleep 验证,不注入就用真 asyncio.sleep。
         self._sleep = sleep or asyncio.sleep
+        # M3-6:空闲时触发的压缩器(组装根用真 Gate 造好传入;None = 关掉自动触发)。
+        self._compactor = compactor
+        self._last_compact_check = 0.0
+
+    async def _maybe_compact(self) -> None:
+        if self._compactor is None:
+            return
+        if time.monotonic() - self._last_compact_check < self.COMPACT_MIN_INTERVAL:
+            return
+        self._last_compact_check = time.monotonic()
+        try:
+            summary = await self._steward.maybe_compact(self._compactor)
+            if summary:
+                logger.info("空闲压缩 %s", summary)
+        except Exception:
+            # 压缩失败不拦主循环(和毒消息同一个道理:别让后台杂活打崩对话)。
+            logger.exception("worker: 空闲压缩失败,继续")
 
     async def run(self) -> None:
         busy = False
@@ -58,6 +81,8 @@ class Worker:
                 settled = self._steward.settle_if_needed()
                 if settled:
                     logger.info("空闲结算 %d 条提案", settled)
+                # M3-6:同一批空闲时刻顺带查一次压缩(上下文顶满才动手,D设计 §7 触发)。
+                await self._maybe_compact()
                 busy = False
             self.wake.clear()
             # 兜底防丢唤醒:就算 clear 与 wake.set() 赛跑丢了唤醒,5 秒后也会再 poll。

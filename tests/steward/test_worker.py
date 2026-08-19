@@ -175,3 +175,43 @@ async def test_retryable_failure_backs_off_between_attempts(worker_factory):
         assert steward.outbox.take("cli", after=0)[0].content == "终于好了"
         # 第一次失败 attempts=1 → 退避 2**1=2 秒;若把它当 empty 等 wake,sleeps 为空
         assert sleeps == [2.0]
+
+
+async def test_worker_auto_compacts_on_idle_with_min_interval():
+    """M3-6 补做:worker 在队列排空后的空闲时刻自动查压缩(和结算同挂点);
+    没顶满时 maybe_compact no-op;最小间隔内不重查(别每次排空都算 l1+前缀+预算)。"""
+    from lararium.steward.loop import TurnOutcome
+
+    class StubSteward:
+        def __init__(self):
+            self.phase = "work"
+            self.compact_checks = 0
+
+        async def process_next(self):
+            if self.phase == "work":
+                self.phase = "idle"
+                return TurnOutcome(kind="replied", text="ok")
+            return TurnOutcome(kind="empty")
+
+        def settle_if_needed(self):
+            return 0
+
+        async def maybe_compact(self, compactor):
+            self.compact_checks += 1
+            return None  # 没顶满 → no-op,compactor 不前跑
+
+    stub = StubSteward()
+    wake = asyncio.Event()
+    worker = Worker(stub, wake, compactor=object())
+    task = asyncio.create_task(worker.run())
+    try:
+        await asyncio.sleep(0.1)
+        assert stub.compact_checks == 1, "队列排空的空闲时刻应自动查一次压缩"
+        stub.phase = "work"
+        wake.set()
+        await asyncio.sleep(0.1)
+        assert stub.compact_checks == 1, "最小间隔内不该重查(别每次排空都算一遍预算)"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

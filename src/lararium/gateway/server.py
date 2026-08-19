@@ -131,7 +131,11 @@ def create_app(
             logger.warning(
                 "embedding 模型未就绪:recall_similar 将提示暂不可用。首次需下载权重(约 10 分钟,M4 打进镜像)"
             )
-        worker = Worker(steward, wake)
+        # M3-6:空闲自动压缩——compactor 用真 Gate 造好(Steward 的 GatePort 不放 propose)。
+        from lararium.steward.compact import make_compactor
+
+        compactor = make_compactor(steward.settings, steward.journal, gate, steward.threads)
+        worker = Worker(steward, wake, compactor=compactor)
         task = asyncio.create_task(worker.run())
         try:
             yield

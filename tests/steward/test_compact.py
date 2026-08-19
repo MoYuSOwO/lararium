@@ -23,7 +23,7 @@ def compact_factory(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_jm, "embed", lambda t: None)  # 压缩用不到语义向量,别拉模型
 
-    def make(cut_model, sweep_model=None, index_days=90):
+    def make(cut_model, sweep_model=None, index_days=90, timezone="Asia/Shanghai"):
         conn = connect(tmp_path / "steward.sqlite")
         ledger, gate = build_memory_components(tmp_path)
         journal = Journal(conn)
@@ -33,7 +33,9 @@ def compact_factory(tmp_path, monkeypatch):
             return '{"open": [], "close": [], "suggest": []}'
 
         sweeper = Sweeper(journal, threads, gate, sweep_model or _noop_sweep, "测试归拢指令")
-        compactor = Compactor(journal, gate, cut_model, "测试切段指令", sweeper, index_days)
+        compactor = Compactor(
+            journal, gate, cut_model, "测试切段指令", sweeper, index_days, timezone
+        )
         return compactor, conn, journal, threads, gate, ledger
 
     return make
@@ -190,3 +192,76 @@ async def test_8_does_not_recompress(compact_factory):
     assert r1.index_count == 1
     assert r2.stopped and "没有未压缩" in r2.summary, "第二次同区间应无窗可压"
     assert journal.l1_block(90).count("env-1") == 1, "索引行只有一份,没重复"
+
+
+def _raw_insert(conn, eid, kind, content, ts):
+    """测试用:直接给起居注插一条带指定 ts 的事件(append 会用 now,这里要控日期)。"""
+    payload = json.dumps({"content": content, "source": "user", "channel": "cli", "meta": {}})
+    conn.execute(
+        "INSERT INTO journal (envelope_id, kind, payload, search_text, ts) VALUES (?,?,?,?,?)",
+        (eid, kind, payload, content, ts),
+    )
+
+
+async def test_hooks_and_dates_follow_segments_with_local_tz(compact_factory):
+    """M3-6 补做:钩子/日期来自模型切段(id 校验),日期走配置时区——凌晨不差一天。"""
+
+    async def cut(p):
+        return json.dumps(
+            {
+                "segments": [
+                    {"topic": "账", "conclusion": "花超", "envelope_ids": ["env-a"]},
+                    {"topic": "装修", "conclusion": "在比价", "envelope_ids": ["env-b"]},
+                    {"topic": "运动", "conclusion": "膝盖酸", "envelope_ids": ["env-c"]},
+                ]
+            }
+        )
+
+    compactor, conn, journal, _, _, _ = compact_factory(cut, timezone="Asia/Shanghai")
+    days = [
+        ("env-a", "2026-08-18T09:00:00+00:00", "记了笔账"),  # 上海 17:00 → 08-18
+        ("env-b", "2026-08-19T08:00:00+00:00", "聊了装修"),  # 上海 16:00 → 08-19
+        ("env-c", "2026-08-19T17:40:00+00:00", "跑了步"),  # 上海 08-20 01:40 → 次日
+    ]
+    for eid, ts, content in days:
+        _raw_insert(conn, eid, "envelope", content, ts)
+        _raw_insert(conn, eid, "reply", "收到", ts)
+    await compactor.run("2026-08-18T00:00:00+00:00", "2026-08-21T00:00:00+00:00")
+
+    lines = [ln for ln in journal.l1_block(90).splitlines() if ln.strip()]
+    assert len(lines) == 3, lines
+    assert "2026-08-18 · 账" in lines[0] and "env-a" in lines[0], lines
+    assert "2026-08-19 · 装修" in lines[1] and "env-b" in lines[1], lines
+    assert "2026-08-20 · 运动" in lines[2] and "env-c" in lines[2], (
+        f"UTC 17:40 在 Asia/Shanghai 应是次日 08-20,不是 UTC 的 08-19:\n{lines}"
+    )
+
+
+async def test_hooks_fallback_when_model_gives_bad_id(compact_factory):
+    """模型给不在窗口里的 id → 丢掉,该段退回按位置拿一个没分过的;id 不重复。"""
+
+    async def cut(p):
+        return json.dumps(
+            {
+                "segments": [
+                    {"topic": "A", "conclusion": "c1", "envelope_ids": ["env-a"]},
+                    {"topic": "B", "conclusion": "c2", "envelope_ids": ["ghost-id"]},  # 认不出
+                    {
+                        "topic": "C",
+                        "conclusion": "c3",
+                        "envelope_ids": ["env-b"],
+                    },  # env-b 被 B 占了
+                ]
+            }
+        )
+
+    compactor, conn, journal, _, _, _ = compact_factory(cut, timezone="Asia/Shanghai")
+    for i in range(3):
+        _raw_insert(conn, f"env-{'abc'[i]}", "envelope", "内容", f"2026-08-19T0{i}:00:00+00:00")
+    await compactor.run("2026-08-19T00:00:00+00:00", "2026-08-19T23:59:00+00:00")
+
+    l1 = journal.l1_block(90)
+    assert "ghost-id" not in l1, "认不出的 id 必须被丢"
+    assert l1.count("env-") == 3, f"三段各拿一个窗口内的 id:\n{l1}"
+    for eid in ("env-a", "env-b", "env-c"):
+        assert eid in l1, eid
