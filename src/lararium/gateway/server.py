@@ -121,6 +121,16 @@ def create_app(
         requeued, abandoned = steward.inbox.recover_stale()
         if requeued or abandoned:
             logger.info("上次有未处理完的消息:%d 条已重新排队,%d 条已放弃", requeued, abandoned)
+        # M3-4 补做:启动期预热 embedding,失败只记日志不拦启动。
+        # embed() 本是在第一次 journal.append(process_next 里,同步)时才懒加载;
+        # 没缓存时是十分钟,那十分钟事件循环整个卡住,/health 和 /messages 一起没反应。
+        # 慢启动是诚实的,聊到一半卡住不是。
+        from lararium.steward.embeddings import embedding_available
+
+        if not await asyncio.to_thread(embedding_available):
+            logger.warning(
+                "embedding 模型未就绪:recall_similar 将提示暂不可用。首次需下载权重(约 10 分钟,M4 打进镜像)"
+            )
         worker = Worker(steward, wake)
         task = asyncio.create_task(worker.run())
         try:

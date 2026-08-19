@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from lararium import db as _db
 from lararium.steward.assembler import render_open_threads
 from lararium.steward.embeddings import embed
 
@@ -80,14 +81,15 @@ class Journal:
         if text is not None:
             self._conn.execute("INSERT INTO journal_fts (text, seq) VALUES (?,?)", (text, seq))
             # M3-4:embedding 在**数据面**算(不进前缀、不碰缓存)。语义检索没它就没法跑;
-            # 模型不可用(embed 返回 None)就不建向量行——词法路照常。sqlite-vec 的
-            # INSERT 向量参数收 JSON 数组文本 / numpy。模型不可用不能打崩 append(E2)。
-            vec = embed(text)
-            if vec is not None:
-                self._conn.execute(
-                    "INSERT INTO journal_vec (seq, embedding) VALUES (?,?)",
-                    (seq, json.dumps(vec)),
-                )
+            # 模型不可用(embed 返回 None)或扩展不可用(_db.VEC_AVAILABLE False)就不建
+            # 向量行——词法路照常,不能打崩 append(E2)。
+            if _db.VEC_AVAILABLE:
+                vec = embed(text)
+                if vec is not None:
+                    self._conn.execute(
+                        "INSERT INTO journal_vec (seq, embedding) VALUES (?,?)",
+                        (seq, json.dumps(vec)),
+                    )
         return seq
 
     def replay(self, envelope_id: str) -> list[dict[str, Any]]:
@@ -174,7 +176,7 @@ class Journal:
         翻到第 7 页才发现后面全是噪音。embedding 不可用(模型没加载)返回 (0, [])。
         """
         vec = embed(query)
-        if vec is None:
+        if not _db.VEC_AVAILABLE or vec is None:
             return 0, []
         rows = self._conn.execute(
             "SELECT seq, distance FROM journal_vec WHERE embedding MATCH ? AND k=?",

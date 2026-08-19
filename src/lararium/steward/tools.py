@@ -134,10 +134,11 @@ class BuiltinTools:
         返回「找到 N 条,第 X/Y 页」;低于相似度阈值的不计入总数。
         **换另一个工具再试是正常操作,不是失败**——词法 vs 语义,看你在找什么。
         模型不可用时返回可读提示而不是报错(E2)。"""
+        from lararium import db as _db
         from lararium.steward.embeddings import embedding_available
 
-        if not embedding_available():
-            return "语义检索暂不可用:本地 embedding 模型没加载成功。先用 search_history 按字面搜,修好模型再试。"
+        if not embedding_available() or not _db.VEC_AVAILABLE:
+            return "语义检索暂不可用:本地 embedding 模型或 sqlite-vec 扩展没就绪。先用 search_history 按字面搜,修好再试。"
         total, hits, cur_page, total_pages = _paged_search(
             self._recall_similar_page, query, MAX_SEARCH_HITS, page
         )

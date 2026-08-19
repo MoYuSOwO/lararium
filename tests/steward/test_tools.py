@@ -267,3 +267,15 @@ def test_recall_similar_returns_hint_when_embedding_unavailable(tools, monkeypat
     out = tools.recall_similar("装修多少钱")
     assert "暂不可用" in out
     assert "search_history" in out  # 给一条出路
+
+
+def test_recall_returns_hint_when_vec_unavailable(tools, monkeypatch):
+    """M3-4 补做:扩展不可用但模型在 → recall_similar 复用同一句 E2 提示,不抛。"""
+    import lararium.db as db_mod
+    import lararium.steward.embeddings as em
+
+    monkeypatch.setattr(db_mod, "VEC_AVAILABLE", False)
+    monkeypatch.setattr(em, "embedding_available", lambda: True)
+    out = tools.recall_similar("装修")
+    assert "暂不可用" in out
+    assert "search_history" in out

@@ -185,3 +185,22 @@ def test_search_similar_counts_only_above_threshold(journal, monkeypatch):
     total, hits = journal.search_similar("装修多少钱", min_similarity=0.35)
     assert total == 2, f"低于阈值的不计入总数,实际 {total}"
     assert [h.envelope_id for h in hits] == ["env-A", "env-B"], "按相似度降序,最相似在前"
+
+
+def test_db_boots_and_lexical_works_without_vec(tmp_path, monkeypatch):
+    """M3-4 补做:sqlite-vec 扩展加载不了,系统不起不来——connect 成功、
+    词法检索照常、append 不炸、语义返回空。"""
+    import lararium.db as db_mod
+
+    monkeypatch.setattr(db_mod, "sqlite_vec", None)  # 模拟冷门架构没 wheel
+    conn = connect(tmp_path / "s.sqlite")
+    assert db_mod.VEC_AVAILABLE is False, "扩展没就绪,标志必须翻 False"
+    j = Journal(conn)
+    j.append("env-1", "envelope", {"content": "日料店真不错"})  # 不炸,vec 行跳过
+    total, hits = j.search("日料")
+    assert total == 1 and len(hits) == 1, "词法检索照常"
+    assert j.search_similar("日料", 0.35) == (0, []), "语义路无扩展 → 空"
+    # 扩展在的常规库不受影响(标志被 connect 重置)
+    monkeypatch.undo()
+    connect(tmp_path / "s2.sqlite")
+    assert db_mod.VEC_AVAILABLE is True
