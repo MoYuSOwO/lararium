@@ -1,3 +1,4 @@
+import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -69,6 +70,8 @@ class Steward:
         self.threads = threads
         self.bundle_tools = bundle_tools or []
         self.mcp_servers = mcp_servers or []
+        # P0-1 纵深:本轮信封是否不可信(认领时定格);不可信轮任何 propose 强制降档。
+        self._active_untrusted = False
         self.tools = BuiltinTools(
             journal,
             registry,
@@ -78,8 +81,33 @@ class Steward:
         )
 
     def all_tools(self) -> list[Callable]:
-        """内置工具在前、bundle 工具在后,顺序固定——工具 schema 是前缀第0层。"""
-        return self.tools.as_tool_functions() + self.bundle_tools
+        """内置工具在前、bundle 工具在后,顺序固定——工具 schema 是前缀第0层。
+
+        P0-1 纵深:propose_fact 包一层,本轮信封不可信时把模型传的 provenance 强制降档
+        untrusted(`user_stated` 自动放行,不可信轮绝不能自动放行)。
+        """
+        tools = list(self.tools.as_tool_functions())
+        for t in self.bundle_tools:
+            if getattr(t, "__name__", "") == "propose_fact":
+                tools.append(self._guard_propose_fact(t))
+            else:
+                tools.append(t)
+        return tools
+
+    def _guard_propose_fact(self, original: Callable[..., str]) -> Callable[..., str]:
+        @functools.wraps(original)
+        def guarded(
+            kind: str,
+            content: str,
+            provenance: str,
+            section: str | None = None,
+            old_text: str | None = None,
+        ) -> str:
+            if self._active_untrusted:
+                provenance = "untrusted"  # 不可信轮:模型传什么都没用,一律降档待审
+            return original(kind, content, provenance, section=section, old_text=old_text)
+
+        return guarded
 
     def submit(self, envelope: Envelope) -> None:
         self.inbox.put(envelope)
@@ -92,6 +120,11 @@ class Steward:
         env = self.inbox.claim_next()
         if env is None:
             return TurnOutcome(kind="empty")
+
+        # P0-1 纵深:本轮信封的信任度在认领时定格。不可信轮里模型传什么 provenance
+        # 都会被降档成 untrusted(门控不建立在"渲染永远不出错"的假设上——这次就是
+        # 渲染没被走到才出的安全洞)。
+        self._active_untrusted = bool(env.meta.get("untrusted", False))
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。

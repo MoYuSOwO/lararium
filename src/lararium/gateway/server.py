@@ -11,7 +11,7 @@ import hmac
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from bundles.memory.server import build_memory_components, memory_tool_functions
@@ -153,7 +153,7 @@ def create_app(
         auth = authenticate(request)
         if auth is None:
             return _UNAUTHORIZED
-        _, channel = auth
+        scope, channel = auth
         try:
             payload = await request.json()
         except Exception:
@@ -166,12 +166,22 @@ def create_app(
         if len(content) > MAX_CONTENT:
             return JSONResponse({"error": "content 超出 16KB 上限"}, status_code=413)
 
+        # P0-1 安全洞:入口按 token scope 定信封形状。数据面(短信/邮件转发)投进来的
+        # 内容是不可信来源——信封必须带 untrusted,否则被当用户亲口说渲染、被自动放行。
+        # **不许从请求体读 meta**:让投递方自己声明自己可信等于没有防线。
+        if scope == "control":
+            source: Literal["user", "module_event"] = "user"
+            meta: dict[str, Any] = {}
+        else:  # ingest 数据面
+            source = "module_event"
+            meta = {"untrusted": True}
+
         try:
             env = Envelope.new(
-                source="user",
+                source=source,
                 channel=channel,
                 content=content,
-                meta={},
+                meta=meta,
                 id=payload.get("id"),  # None → 服务端生成;给了就构造时带上,让信封自己把关
             )
         except ValidationError:
