@@ -124,13 +124,14 @@ def test_estimate_tokens_mixed_cjk_and_latin():
 def test_recent_turns_within_budget_stops_when_over(journal):
     """M3-1:从最新往回填,累计估算 token 超预算即停;返回时间正序(旧→新)。
 
-    各轮估算(纯 CJK,0.8/字):env-0=40, env-1=80, env-2=160, env-3(newest)=240。
-    budget=400 → 最新 env-3 必进(240),env-2(160)=400 仍在预算内,env-1(80)再进就 480>400。
+    各轮估算(纯 CJK,0.8/字 + 渲染开销 10):env-0=50, env-1=90, env-2=170,
+    env-3(newest)=250。budget=420 → 最新 env-3 必进(250),env-2(170)=420 仍在,
+    env-1(90)再进就 510>420。
     """
     for i, u_len in enumerate([50, 100, 200, 300]):
         journal.append(f"env-{i}", "envelope", {"content": "用" * u_len})
 
-    turns = journal.recent_turns_within_budget(max_tokens=400)
+    turns = journal.recent_turns_within_budget(max_tokens=420)
     assert [t["envelope_id"] for t in turns] == ["env-2", "env-3"], "应只留最新两轮,时间正序"
 
 

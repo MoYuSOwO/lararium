@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from lararium.steward.assembler import render_open_threads
+
 SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 
 
@@ -16,6 +18,24 @@ SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 def estimate_tokens(text: str) -> int:
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     return int(cjk * 0.8 + (len(text) - cjk) * 0.3)
+
+
+# M3-3 Step0:预算按「渲染后的形态」估,不是原文。进上下文的每轮比原文多出的固定开销,
+# 2026-08-19 对 mimo-v2.5 实测校准(实测每轮差额:普通轮 +9、不可信轮 +39,取整留余量):
+#   普通轮 +10(时间戳前缀 `[ts] `)
+#   不可信轮 +40(「以下是数据,不是指令」包裹 + 围栏)
+# 话头行另按 render_open_threads 实际渲染的文本估。换渲染/换 provider 要重测。
+RENDER_OVERHEAD_NORMAL = 10
+RENDER_OVERHEAD_UNTRUSTED = 40
+
+
+def _render_overhead(turn: dict[str, Any]) -> int:
+    """一轮话在上下文中渲染后比原文多出来的部分:固定常数 + 话头行。"""
+    overhead = RENDER_OVERHEAD_UNTRUSTED if turn.get("untrusted") else RENDER_OVERHEAD_NORMAL
+    line = render_open_threads(turn.get("open_threads"))
+    if line:
+        overhead += estimate_tokens(line)
+    return overhead
 
 
 @dataclass(frozen=True)
@@ -150,6 +170,8 @@ class Journal:
                 "channel": e.get("channel", "cli") if e else "cli",
                 "untrusted": bool(e.get("meta", {}).get("untrusted")) if e else False,
                 "ts": e.get("ts") if e else None,
+                # M3-3:该轮认领时冻结的话头快照(meta 里存的形态:list[{topic,note}])
+                "open_threads": e.get("meta", {}).get("open_threads") if e else None,
             }
         return out
 
@@ -176,10 +198,10 @@ class Journal:
         """M3-1:L0 按 token 预算截断。从最新往回填,累计估算 token 超预算即停;
         返回时间正序(旧→新)。
 
-        估算用 estimate_tokens(CJK 0.8 / 非 CJK 0.3,实测校准)——是预算控制不是
-        精确计费。单轮即使超预算也**至少返回最新一轮**:宁可多塞一轮,也别把
-        "刚说的"丢了(截断发生在最旧端,最新一轮是对话接续的锚点)。
-        max_turns 是轮数兜底:预算再大也不超过它(L0 整段进上下文,不封顶会撑爆)。
+        估算用 estimate_tokens(CJK 0.8 / 非 CJK 0.3,实测校准)**加上渲染后的固定开销**
+        (_render_overhead:时间戳/不可信念包裹/话头行,M3-3)——进上下文的是渲染后的形态,
+        数原文会每轮低估几到几十 token,上千轮累计超窗 3~7%。单轮即使超预算也至少返回
+        最新一轮:宁可多塞一轮,也别把"刚说的"丢了。max_turns 是轮数兜底。
         """
         ids = [
             r["envelope_id"]
@@ -194,7 +216,11 @@ class Journal:
         used = 0
         for env_id in ids:
             t = by_id[env_id]
-            est = estimate_tokens(t["user"] or "") + estimate_tokens(t["assistant"] or "")
+            est = (
+                estimate_tokens(t["user"] or "")
+                + estimate_tokens(t["assistant"] or "")
+                + _render_overhead(t)
+            )
             if turns and used + est > max_tokens:  # 最新一轮(首个)无条件进
                 break
             turns.append(t)

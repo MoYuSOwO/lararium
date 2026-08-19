@@ -87,6 +87,12 @@ class Steward:
         if env is None:
             return TurnOutcome(kind="empty")
 
+        # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
+        # 冻结的是此刻的快照,for 历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。
+        snapshot = [{"topic": t.topic, "note": t.note} for t in self.threads.open_threads()]
+        if snapshot:
+            env.meta["open_threads"] = snapshot
+
         self.journal.append(
             env.id,
             "envelope",
@@ -100,12 +106,17 @@ class Steward:
         )
 
         try:
+            # M3-3 顺带:ledger/directory 一轮读一次,预算估算和 assemble 共用同一份
+            # (之前各读一遍,同轮内不会变但纯属冗余)。
+            directory = self.registry.directory_lines()
+            ledger_text = self.ledger.read()
+            prefix_text = self.persona + directory + ledger_text
             ctx = assemble(
                 persona=self.persona,
-                directory=self.registry.directory_lines(),
-                ledger=self.ledger.read(),
+                directory=directory,
+                ledger=ledger_text,
                 l1="",  # M3 压缩接管后填充
-                l0=self._recent_turns(),
+                l0=self._recent_turns(prefix_text),
                 envelope=env,
                 timezone=self.settings.timezone,
             )
@@ -170,24 +181,16 @@ class Steward:
             self.inbox.fail(env.id, f"{type(exc).__name__}: {exc}")
             raise
 
-    def _prefix_text(self) -> str:
-        # 与 assemble 渲染前缀区用的同三样材料(persona+目录+账本),只用于估算
-        # "前缀占了多少预算"。组装时就在手上,不用重复构造。
-        return self.persona + self.registry.directory_lines() + self.ledger.read()
-
-    def _l0_token_budget(self) -> int:
+    def _l0_token_budget(self, prefix_text: str) -> int:
         # M3-1b:LARARIUM_L0_MAX_TOKENS 是**整个上下文预算**(200000=200k 窗口用满)。
-        # 先扣前缀区(persona+目录+账本)再减固定留白(工具 schema + 输出窗口),余额才归
-        # L0——这才是"200k 用满"的忠实实现,不是假装 L0 等于整个窗口。
-        return max(
-            0,
-            self.settings.l0_max_tokens - estimate_tokens(self._prefix_text()) - L0_RESERVE,
-        )
+        # 先扣前缀区(persona+目录+账本,由调用方 read-once 算好)再减固定留白(工具
+        # schema + 输出窗口),余额才归 L0——这才是"200k 用满"的忠实实现。
+        return max(0, self.settings.l0_max_tokens - estimate_tokens(prefix_text) - L0_RESERVE)
 
-    def _recent_turns(self) -> list[Turn]:
+    def _recent_turns(self, prefix_text: str) -> list[Turn]:
         # M3-1:L0 按整个上下文预算的余额截断,l0_max_turns 只当轮数兜底。
         rows = self.journal.recent_turns_within_budget(
-            max_tokens=self._l0_token_budget(), max_turns=self.settings.l0_max_turns
+            max_tokens=self._l0_token_budget(prefix_text), max_turns=self.settings.l0_max_turns
         )
         return [
             Turn(
@@ -197,6 +200,8 @@ class Steward:
                 channel=r.get("channel", "cli"),
                 untrusted=r.get("untrusted", False),
                 ts=r.get("ts"),
+                # M3-3:历史轮带**当时冻结**的话头快照,渲染的是那份不是最新的
+                open_threads=r.get("open_threads"),
             )
             for r in rows
         ]

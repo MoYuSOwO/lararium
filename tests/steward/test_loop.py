@@ -394,9 +394,14 @@ def test_l0_budget_deducts_prefix(steward_factory):
     前缀越大,留给 L0 的越少——LARARIUM_L0_MAX_TOKENS 是整窗,不是假装 L0 等于整窗。
     """
     steward, _ = steward_factory()
-    small_prefix = steward._l0_token_budget()
+
+    def budget():
+        prefix = steward.persona + steward.registry.directory_lines() + steward.ledger.read()
+        return steward._l0_token_budget(prefix)
+
+    small_prefix = budget()
     steward.persona = "用" * 10000  # ≈8000 token 的人格
-    big_prefix_budget = steward._l0_token_budget()
+    big_prefix_budget = budget()
     assert big_prefix_budget < small_prefix, "人格越大,留给 L0 的预算越少"
 
 
@@ -421,8 +426,73 @@ def test_l0_truncated_before_context_overflow(steward_factory, monkeypatch):
         )
         steward.journal.append(f"env-{i}", "reply", {"content": f"回{i}"})
 
-    turns = steward._recent_turns()
+    prefix = steward.persona + steward.registry.directory_lines() + steward.ledger.read()
+    turns = steward._recent_turns(prefix)
     assistants = [t.assistant for t in turns]
     assert 0 < len(assistants) < 500, f"预算耗尽前必须截断 L0,实际保留了 {len(assistants)} 轮"
     assert assistants[-1] == "回499", "最新一轮(对话接续锚点)必须在"
     assert assistants[0] != "回0", "最旧一轮应被截掉(截断只发生在最旧端)"
+
+
+async def test_open_threads_frozen_per_turn_and_append_only(steward_factory):
+    """M3-3:话头冻结进 envelope.meta,历史轮渲染的是**当时那份**。
+
+    连聊 5 轮、中途话头变两次,断言第 N 轮 messages 是第 N+1 轮的**严格前缀**
+    (照 M2-6 验收里查起居注 prompt 事件的写法)。这是 M3 三条全局约束里最容易破的
+    一条:一旦历史轮拿"最新的"话头渲染,前缀就断了。
+    """
+    steward, _ = steward_factory(
+        [ModelReply("一"), ModelReply("二"), ModelReply("三"), ModelReply("四"), ModelReply("五")]
+    )
+    env_ids = []
+    for i, content in enumerate(["第一问", "第二问", "第三问", "第四问", "第五问"]):
+        env = Envelope.new(source="user", channel="cli", content=content)
+        steward.submit(env)
+        env_ids.append(env.id)
+        await steward.process_next()
+        if i == 1:
+            steward.threads.open_thread("装修", "在比价")
+        elif i == 3:
+            steward.threads.open_thread("买基金", "在等调仓")
+            steward.threads.close_thread("装修")
+
+    msgs = [
+        next(e["payload"]["messages"] for e in steward.journal.replay(eid) if e["kind"] == "prompt")
+        for eid in env_ids
+    ]
+    for n in range(4):
+        assert msgs[n] == msgs[n + 1][: len(msgs[n])], (
+            f"第 {n} 轮必须是第 {n + 1} 轮的严格前缀——话头冻结没守住,append-only 破了"
+        )
+    # 方向抽查:第 4 轮才开的「买基金」不该出现在第 1 轮的信封(它认领时还没有)
+    assert "还在忙的事" not in msgs[0][0]["content"], "第 1 轮认领时没有话头,不该有这行"
+    assert "买基金" in msgs[4][-1]["content"], "第 5 轮认领时话头已是「买基金」,当前信封该有这行"
+
+
+async def test_assembled_whole_stays_within_200k_for_short_chat(steward_factory, monkeypatch):
+    """M3-3 Step0:预算按渲染后形态估——2000 轮短聊 + 整窗预算 200000,组装出来的
+    整份必须 ≤ 200000(改成渲染口径之前是红的:超 7%,214005)。"""
+    from lararium.steward.journal import estimate_tokens
+
+    monkeypatch.setenv("LARARIUM_L0_MAX_TOKENS", "200000")
+    steward, model = steward_factory([ModelReply("嗯")])
+    for i in range(2000):  # 短聊:每轮约 110 字
+        steward.journal.append(
+            f"env-{i}",
+            "envelope",
+            {
+                "content": "用" * 110,
+                "source": "user",
+                "channel": "cli",
+                "meta": {},
+                "ts": "2026-08-01T00:00:00+00:00",
+            },
+        )
+        steward.journal.append(f"env-{i}", "reply", {"content": "嗯"})
+    steward.submit(Envelope.new(source="user", channel="cli", content="你好"))
+    await steward.process_next()
+
+    ctx = model.seen[0]
+    whole = ctx.system_prompt + "".join(m["content"] for m in ctx.messages)
+    total = estimate_tokens(whole)
+    assert total <= 200000, f"组装整份 {total} token > 200000——渲染口径没把差额算进去"

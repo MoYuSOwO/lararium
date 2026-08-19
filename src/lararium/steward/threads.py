@@ -33,7 +33,8 @@ def _normalize_topic(topic: str) -> str:
     topic = re.sub(r"\s+", " ", topic).strip()
     if not topic:
         raise ValueError("话头名不能为空")
-    return topic[:MAX_TOPIC_LEN]
+    topic = topic[:MAX_TOPIC_LEN]
+    return topic.strip()  # 截断可能落在空格上,键尾不留空格
 
 
 class Threads:
@@ -51,7 +52,7 @@ class Threads:
     def open_thread(self, topic: str, note: str) -> ThreadInfo:
         """建/更新一个话头:同名是更新不是新建(upsert 靠主键)。
 
-        topic 归一化(PMID: strip+折内部空白)后当钥匙;note 就地截到 MAX_NOTE_LEN——
+        topic 归一化(折内部空白 + 去首尾)后当钥匙;note 就地截到 MAX_NOTE_LEN——
         写进去的就该是进上下文那份,别让库越攒越肥。
         """
         topic = _normalize_topic(topic)
