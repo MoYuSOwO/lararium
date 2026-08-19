@@ -16,6 +16,7 @@ def test_load_reads_env(monkeypatch, tmp_path):
     assert settings.l0_max_turns == 2000  # 默认值(M3-1:轮数兜底)
     assert settings.l0_max_tokens == 200000  # 默认值(M3-1:L0 token 预算)
     assert settings.max_attempts == 3  # 默认值
+    assert settings.recall_min_similarity == 0.35  # 默认值(M3-4 语义检索阈值,猜的初值)
     assert settings.bind_host == "127.0.0.1"  # 默认值(M2 只绑本机,不公网)
     assert settings.bind_port == 8420  # 默认值
     assert settings.control_tokens == {}  # 默认值

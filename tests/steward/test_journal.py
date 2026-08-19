@@ -39,7 +39,7 @@ def test_search_finds_chinese_substring(journal):
     journal.append("env-1", "envelope", {"content": "昨天那家日料店真不错"})
     journal.append("env-2", "envelope", {"content": "今天去了健身房"})
 
-    hits = journal.search("日料店")
+    _, hits = journal.search("日料店")
     assert len(hits) == 1
     assert hits[0].envelope_id == "env-1"
     assert "日料店" in hits[0].text
@@ -48,7 +48,7 @@ def test_search_finds_chinese_substring(journal):
 def test_search_finds_two_character_word(journal):
     """trigram 不匹配短于3字的查询,必须回退 LIKE——中文两字词是最常用的。"""
     journal.append("env-1", "envelope", {"content": "昨天那家日料店真不错"})
-    hits = journal.search("日料")
+    _, hits = journal.search("日料")
     assert len(hits) == 1
     assert hits[0].envelope_id == "env-1"
 
@@ -56,18 +56,20 @@ def test_search_finds_two_character_word(journal):
 def test_search_does_not_index_internal_events(journal):
     """prompt/tool_call 是内部结构,不该污染用户的旧账检索。"""
     journal.append("env-1", "prompt", {"content": "系统提示词里也有日料店三个字"})
-    assert journal.search("日料店") == []
+    assert journal.search("日料店") == (0, [])
 
 
 def test_search_respects_limit(journal):
     for i in range(5):
         journal.append(f"env-{i}", "envelope", {"content": f"消费记录 {i}"})
-    assert len(journal.search("消费", limit=3)) == 3
+    total, hits = journal.search("消费", limit=3)
+    assert total == 5
+    assert len(hits) == 3
 
 
 def test_search_returns_empty_for_no_match(journal):
     journal.append("env-1", "envelope", {"content": "你好"})
-    assert journal.search("量子力学") == []
+    assert journal.search("量子力学") == (0, [])
 
 
 def test_recent_turns_returns_newest_last(journal):
@@ -155,3 +157,31 @@ def test_recent_turns_within_budget_respects_turns_ceiling(journal):
     assert [t["envelope_id"] for t in turns] == ["env-3", "env-4"], (
         "预算充足时被 max_turns 兜底截断"
     )
+
+
+def test_search_similar_counts_only_above_threshold(journal, monkeypatch):
+    """M3-4:语义检索低于相似度阈值的不计入总数。
+
+    query=[1,0,...];装修涨=A(cos .8) 装修贵=B(cos .7) 跑步=C(cos 0)。
+    阈值 0.35 → A、B 计入,C 不计。
+    """
+    import lararium.steward.journal as jmod
+
+    def _v(*w):
+        v = [0.0] * 256
+        for i, x in enumerate(w[:256]):
+            v[i] = x
+        n = __import__("math").sqrt(sum(x * x for x in v)) or 1.0
+        return [x / n for x in v]
+
+    memo = {"装修涨价了": _v(0.8, 0.6), "装修报价贵": _v(0.7, 0.7), "跑步五公里": _v(0, 0, 1.0)}
+    monkeypatch.setattr(jmod, "embed", lambda t: memo.get(t))
+    journal.append("env-A", "envelope", {"content": "装修涨价了"})
+    journal.append("env-B", "envelope", {"content": "装修报价贵"})
+    journal.append("env-C", "envelope", {"content": "跑步五公里"})
+    # 查询向量单独喂:search_similar 内部 embed(query),这里 memo 没有 query → 得单独可查
+    memo["装修多少钱"] = _v(1.0)
+
+    total, hits = journal.search_similar("装修多少钱", min_similarity=0.35)
+    assert total == 2, f"低于阈值的不计入总数,实际 {total}"
+    assert [h.envelope_id for h in hits] == ["env-A", "env-B"], "按相似度降序,最相似在前"

@@ -69,7 +69,13 @@ class Steward:
         self.threads = threads
         self.bundle_tools = bundle_tools or []
         self.mcp_servers = mcp_servers or []
-        self.tools = BuiltinTools(journal, registry, settings.timezone, threads)
+        self.tools = BuiltinTools(
+            journal,
+            registry,
+            settings.timezone,
+            threads,
+            recall_min_similarity=settings.recall_min_similarity,
+        )
 
     def all_tools(self) -> list[Callable]:
         """内置工具在前、bundle 工具在后,顺序固定——工具 schema 是前缀第0层。"""
@@ -88,7 +94,7 @@ class Steward:
             return TurnOutcome(kind="empty")
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
-        # 冻结的是此刻的快照,for 历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。
+        # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。
         snapshot = [{"topic": t.topic, "note": t.note} for t in self.threads.open_threads()]
         if snapshot:
             env.meta["open_threads"] = snapshot

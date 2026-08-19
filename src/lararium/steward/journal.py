@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lararium.steward.assembler import render_open_threads
+from lararium.steward.embeddings import embed
 
 SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 
@@ -27,6 +28,10 @@ def estimate_tokens(text: str) -> int:
 # 话头行另按 render_open_threads 实际渲染的文本估。换渲染/换 provider 要重测。
 RENDER_OVERHEAD_NORMAL = 10
 RENDER_OVERHEAD_UNTRUSTED = 40
+
+# 语义检索的候选上限:vec0 一次取最近邻的天花板(单用户量级足够),之后在 Python
+# 里做阈值过滤 + 分页。总条数因此封顶在此数——真超过说明该换关键词了。
+_SEMANTIC_CANDIDATES = 1000
 
 
 def _render_overhead(turn: dict[str, Any]) -> int:
@@ -74,6 +79,15 @@ class Journal:
         seq = int(cur.lastrowid)
         if text is not None:
             self._conn.execute("INSERT INTO journal_fts (text, seq) VALUES (?,?)", (text, seq))
+            # M3-4:embedding 在**数据面**算(不进前缀、不碰缓存)。语义检索没它就没法跑;
+            # 模型不可用(embed 返回 None)就不建向量行——词法路照常。sqlite-vec 的
+            # INSERT 向量参数收 JSON 数组文本 / numpy。模型不可用不能打崩 append(E2)。
+            vec = embed(text)
+            if vec is not None:
+                self._conn.execute(
+                    "INSERT INTO journal_vec (seq, embedding) VALUES (?,?)",
+                    (seq, json.dumps(vec)),
+                )
         return seq
 
     def replay(self, envelope_id: str) -> list[dict[str, Any]]:
@@ -93,36 +107,47 @@ class Journal:
             for r in rows
         ]
 
-    def search(self, query: str, limit: int = 10) -> list[SearchHit]:
-        """≥3 字用 FTS5 trigram;更短的走 LIKE 回退(trigram 不匹配短查询)。"""
+    def search(self, query: str, limit: int = 10, offset: int = 0) -> tuple[int, list[SearchHit]]:
+        """词法路(FTS5):≥3 字用 trigram,更短的走 LIKE 回退。
+
+        返回 (总条数, 第 offset 起的一页)。总条数是给工具分页报数的(找到 N 条,
+        第 X/Y 页),不是精确计费。
+        """
         query = query.strip()
         if not query:
-            return []
+            return 0, []
         if len(query) >= 3:
             escaped = query.replace('"', '""')
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM journal_fts WHERE journal_fts MATCH ?", (f'"{escaped}"',)
+            ).fetchone()[0]
             rows = self._conn.execute(
-                "SELECT j.envelope_id, j.kind, f.text, j.ts, "
+                "SELECT j.envelope_id, j.kind, f.text AS text, j.ts, "
                 "json_extract(j.payload, '$.source') AS source, "
                 "json_extract(j.payload, '$.channel') AS channel, "
                 "json_extract(j.payload, '$.meta.untrusted') AS untrusted "
                 "FROM journal_fts f JOIN journal j ON j.seq = f.seq "
-                "WHERE journal_fts MATCH ? ORDER BY j.seq DESC LIMIT ?",
-                (f'"{escaped}"', limit),
+                "WHERE journal_fts MATCH ? ORDER BY j.seq DESC LIMIT ? OFFSET ?",
+                (f'"{escaped}"', limit, offset),
             ).fetchall()
         else:
             escaped = query
             for ch in ("\\", "%", "_"):
                 escaped = escaped.replace(ch, "\\" + ch)
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM journal WHERE search_text LIKE ? ESCAPE '\\'",
+                (f"%{escaped}%",),
+            ).fetchone()[0]
             rows = self._conn.execute(
                 "SELECT envelope_id, kind, search_text AS text, ts, "
                 "json_extract(payload, '$.source') AS source, "
                 "json_extract(payload, '$.channel') AS channel, "
                 "json_extract(payload, '$.meta.untrusted') AS untrusted "
                 "FROM journal "
-                "WHERE search_text LIKE ? ESCAPE '\\' ORDER BY seq DESC LIMIT ?",
-                (f"%{escaped}%", limit),
+                "WHERE search_text LIKE ? ESCAPE '\\' ORDER BY seq DESC LIMIT ? OFFSET ?",
+                (f"%{escaped}%", limit, offset),
             ).fetchall()
-        return [
+        hits = [
             SearchHit(
                 r["envelope_id"],
                 r["kind"],
@@ -134,6 +159,53 @@ class Journal:
             )
             for r in rows
         ]
+        return int(total), hits
+
+    def search_similar(
+        self,
+        query: str,
+        min_similarity: float,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> tuple[int, list[SearchHit]]:
+        """语义路(vec0 最近邻 + 余弦阈值):凭印象/改写的查询,词法对不上的那种。
+
+        返回 (阈值之上总条数, 当前页)。低于 min_similarity 的不计入总数——否则模型
+        翻到第 7 页才发现后面全是噪音。embedding 不可用(模型没加载)返回 (0, [])。
+        """
+        vec = embed(query)
+        if vec is None:
+            return 0, []
+        rows = self._conn.execute(
+            "SELECT seq, distance FROM journal_vec WHERE embedding MATCH ? AND k=?",
+            (json.dumps(vec), _SEMANTIC_CANDIDATES),
+        ).fetchall()
+        # 向量已 L2 归一化:cos = 1 - d²/2。vec0 的 distance 是 L2 距离。
+        seqs: list[int] = []
+        for r in rows:
+            cos = 1.0 - (r["distance"] ** 2) / 2.0
+            if cos >= min_similarity:
+                seqs.append(int(r["seq"]))
+        total = len(seqs)
+        page = seqs[offset : offset + limit]
+        hits: list[SearchHit] = []
+        if page:
+            qmarks = ",".join("?" * len(page))
+            q = f"SELECT seq, envelope_id, kind, search_text AS text, ts, json_extract(payload, '$.source') AS source, json_extract(payload, '$.channel') AS channel, json_extract(payload, '$.meta.untrusted') AS untrusted FROM journal WHERE seq IN ({qmarks})"  # noqa: S608 - qmarks 全是 ?,参数是内部 seq int,无用户数据
+            by_seq: dict[int, SearchHit] = {}
+            for jrow in self._conn.execute(q, page).fetchall():
+                by_seq[int(jrow["seq"])] = SearchHit(
+                    jrow["envelope_id"],
+                    jrow["kind"],
+                    jrow["text"],
+                    jrow["ts"],
+                    source=jrow["source"],
+                    channel=jrow["channel"] or "",
+                    untrusted=bool(jrow["untrusted"]),
+                )
+            # page 按 vec0 余弦序(最相似在前);SQL 取回的行序未知,按 page 对齐
+            hits = [by_seq[s] for s in page if s in by_seq]
+        return total, hits
 
     def _turns_by_id(self, env_ids: list[str]) -> dict[str, dict[str, Any]]:
         """一条 SQL 取这批信封的 (envelope, reply),按 env_id 建索引。

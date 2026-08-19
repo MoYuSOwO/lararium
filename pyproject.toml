@@ -11,6 +11,8 @@ dependencies = [
     "httpx>=0.28",        # CLI 纯 HTTP 客户端与服务端共用(CONVENTIONS D:直接 import 就显式声明)
     "starlette>=1.6",     # M2-4 HTTP 服务框架
     "uvicorn>=0.52",      # M2-4 服务运行器
+    "sqlite-vec>=0.1.9",  # M3-4 语义检索:纯扩展零依赖,vec0 最近邻
+    "model2vec>=0.5",     # M3-4 本地中文 embedding(不拖 torch/transformers)
 ]
 
 [dependency-groups]
@@ -114,5 +116,5 @@ warn_return_any = true
 
 # 第三方库没有完整 stub —— 这不是我们的锅,别让它污染信噪比
 [[tool.mypy.overrides]]
-module = ["fastmcp.*", "pydantic_ai.*", "mcp.*"]
+module = ["fastmcp.*", "pydantic_ai.*", "mcp.*", "sqlite_vec", "model2vec.*"]
 ignore_missing_imports = true

@@ -85,6 +85,7 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         # 前缀第0层,插队 = 每轮毁缓存);open_threads() 不在——它是代码路径,组装器调。
         "open_thread",
         "close_thread",
+        "recall_similar",
         "propose_fact",
         "list_pending",
     ]
