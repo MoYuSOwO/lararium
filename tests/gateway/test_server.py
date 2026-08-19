@@ -437,3 +437,27 @@ def test_p0_ingest_message_marked_untrusted_module_event(server):
         "SELECT source, meta FROM inbox WHERE state='pending' ORDER BY rowid DESC LIMIT 1"
     ).fetchone()
     assert r3["source"] == "module_event" and _json.loads(r3["meta"]) == {"untrusted": True}
+
+
+def test_r2_1_bad_command_args_via_http_no_500(server):
+    """R2-1 最该修:命令端点的坏参数(带尾空格/无参)必须 200 + 可读说明,绝不 500。
+    直接打 HTTP 端点——CLI 会 strip,只测 handle_command 函数永远看不到这个 bug。"""
+    app, _ = server
+    client = TestClient(app)
+    h = {"Authorization": "Bearer tok-cli"}
+    for bad in ("/approve ", "/reject  ", "/rollback ", "/replay "):
+        r = client.post("/v1/commands", json={"line": bad}, headers=h)
+        assert r.status_code == 200, f"{bad!r} 不该 500(得到 {r.status_code})"
+        assert "需要一个参数" in r.json()["text"], f"{bad!r} → {r.json()['text']}"
+    # 带参数的照常工作(不被误伤)
+    ok = client.post(
+        "/v1/commands",
+        json={"line": "/rollback 999"},
+        headers={"Authorization": "Bearer tok-cli"},
+    )
+    assert ok.status_code == 200 and "回滚失败" in ok.json()["text"]
+    # 无参的 /approve(没有尾空格)也是「需要一个参数」不是「未知命令」
+    bare = client.post(
+        "/v1/commands", json={"line": "/approve"}, headers={"Authorization": "Bearer tok-cli"}
+    )
+    assert bare.status_code == 200 and "需要一个参数" in bare.json()["text"]

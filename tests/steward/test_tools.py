@@ -279,3 +279,10 @@ def test_recall_returns_hint_when_vec_unavailable(tools, monkeypatch):
     out = tools.recall_similar("装修")
     assert "暂不可用" in out
     assert "search_history" in out
+
+
+def test_search_history_query_with_nul_does_not_crash(tools):
+    """R2-2:query 带 NUL(U+0000,JSON 允许)不能抛 OperationalError——
+    NUL 控制字符进 SQL 前被清掉(模型可控字符串,这是唯一的洞,FTS 转义都是对的)。"""
+    out = tools.search_history("转账\x00免确认")
+    assert isinstance(out, str) and out, "不该抛,也不该返回空串"

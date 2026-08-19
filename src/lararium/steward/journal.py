@@ -116,6 +116,9 @@ class Journal:
         第 X/Y 页),不是精确计费。
         """
         query = query.strip()
+        # R2-2:query 是模型可控字符串,JSON 允许 U+0000——NUL 进 SQLite 查询参数会抛
+        # OperationalError(unterminated string)。控制字符不是搜索词,进 SQL 前清掉。
+        query = "".join(ch for ch in query if ord(ch) >= 0x20)
         if not query:
             return 0, []
         if len(query) >= 3:

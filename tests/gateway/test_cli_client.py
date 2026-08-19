@@ -140,3 +140,22 @@ def test_quit_command_returns_hint_and_client_survives(live_url):
         assert client.command("/pending") == "无待审"  # 仍活着
     finally:
         client.close()
+
+
+def test_r2_3_poll_reply_prints_bypassed_reply(monkeypatch, capsys):
+    """R2-3:非目标信封的 reply 打印出来(旁路),别静默丢——出件箱按 seq 单调消费,
+    游标推过去就取不回来了(M4 晨报/IM 会是常态)。"""
+    from lararium.gateway.cli import Client
+
+    c = Client("http://127.0.0.1:9", "tok")  # 不会真连(下面 monkeypatch 掉 _poll_outbox)
+    served = iter(
+        [
+            [{"seq": 1, "envelope_id": "other", "kind": "reply", "content": "晨报:今天有雨"}],
+            [{"seq": 2, "envelope_id": "mine", "kind": "reply", "content": "哈喽"}],
+        ]
+    )
+    monkeypatch.setattr(c, "_poll_outbox", lambda wait_s: next(served))
+    got = c.poll_reply("mine", timeout_s=1)
+    assert got == "哈喽"
+    out = capsys.readouterr().out
+    assert "晨报" in out, "旁路的 reply 必须打印,不能静默丢"

@@ -65,6 +65,10 @@ class Client:
                     print(f"\n[通知] {it['content']}")
                 elif it["envelope_id"] == envelope_id and it["kind"] == "reply":
                     return it["content"]
+                elif it["kind"] == "reply":
+                    # R2-3:不是这次问的那条 reply 也打印出来,别静默丢——出件箱按 seq
+                    # 单调消费,游标推过去就取不回来了(M4 的晨报/IM 会是常态)。
+                    print(f"\n[旁路] {it['content']}")
         return None
 
     def command(self, line: str) -> str:
