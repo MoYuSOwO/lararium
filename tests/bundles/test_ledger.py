@@ -83,3 +83,55 @@ def test_diff_shows_changed_lines(ledger):
     text = ledger.diff(a, b)
     assert "-- 旧的" in text or "- 旧的" in text
     assert "新的" in text
+
+
+def test_r3_1_write_crash_leaves_file_old_and_no_false_manual_edit(ledger, monkeypatch):
+    """R3-1:写文件写到一半抛 OSError →
+    ①目标文件仍是崩前那份完整的(没截断)②重启后 sync_manual_edit 不误记成手编快照。"""
+    old = "## 身份\n- 对芒果过敏\n"
+    ledger.write(old, source="init", proposal_ids=[])
+    assert ledger.read() == old
+    new = old + "- 备考雅思\n"
+
+    real_open = open
+
+    def crashy_open(path, *a, **kw):
+        if str(path).endswith(".tmp"):
+            f = real_open(path, *a, **kw)
+            orig_write = f.write  # 先抓住真写,再遮——否则 partial 里 f.write 递归自己
+
+            def partial(data):
+                orig_write(data[: len(data) // 2])  # 写一半
+                raise OSError("写一半崩了")
+
+            f.write = partial
+            return f
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr("io.open", crashy_open)  # Path.open 走 io.open,打这里才对
+    with pytest.raises(OSError):
+        ledger.write(new, source="approval_batch", proposal_ids=["p1"])
+    monkeypatch.undo()
+
+    # ① 目标文件仍是崩前那份完整的(没被截断)
+    assert ledger.read() == old
+    # 快照表已有"该写进去的那份"(latest = new)→ 可恢复可发现
+    latest = ledger._conn.execute(
+        "SELECT content FROM ledger_history ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert "备考雅思" in latest["content"]
+
+    # ② "重启"(同一份文件+库)后 sync_manual_edit 不产生 manual_edit 快照——
+    #    旧版文件对得上历史快照,是崩机残留,不是手编,不能被当成合法手编存进去
+    fresh = Ledger(ledger.path, ledger._conn)
+    assert fresh.sync_manual_edit() is False
+    assert not [s for s in fresh.history() if s.source == "manual_edit"]
+
+
+def test_r3_1_genuine_manual_edit_still_recorded(ledger):
+    """真手编(内容匹配不上任何快照)仍要记 manual_edit——补洞不能把正经手编也咽了。"""
+    ledger.ensure_initialized()
+    orig = ledger.read()
+    ledger.path.write_text(orig + "- 手编一条\n", encoding="utf-8")
+    assert ledger.sync_manual_edit() is True
+    assert any(s.source == "manual_edit" for s in ledger.history())

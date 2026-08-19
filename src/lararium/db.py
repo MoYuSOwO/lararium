@@ -167,6 +167,7 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try:
         yield conn
         conn.execute("COMMIT")
-    except Exception:
+    except BaseException:  # 含 KeyboardInterrupt/SystemExit——Ctrl-C 落在事务中间也得回滚,
+        # 否则 conn.in_transaction 仍是 True,之后写库全报 cannot start a transaction。
         conn.execute("ROLLBACK")
         raise

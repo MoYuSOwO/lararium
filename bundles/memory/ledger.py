@@ -1,6 +1,7 @@
 import difflib
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -95,18 +96,50 @@ class Ledger:
         return int(cur.lastrowid)
 
     def write(self, content: str, source: str, proposal_ids: list[str]) -> int:
+        """唯一的账本写入口。两步,顺序不能换(R3-1):
+
+        1. 先 snapshot() 落 SQLite——事务性、耐崩;
+        2. 再原子替换文件(same-dir .tmp → fsync → os.replace)。
+
+        崩在两步之间:文件仍是旧版完整内容,快照表里有"该写进去的那份"——
+        可恢复(从 history/rollback)且可发现(sync 不会把旧文件误记成手编)。
+        旧实现是 path.write_text() 直接覆盖:写一半崩 → 账本截断 → read() 不报错 →
+        重启 sync_manual_edit 把截断当合法手编存成新快照,四条事实从前缀区消失。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(content, encoding="utf-8")
-        return self.snapshot(content, source, proposal_ids)
+        snap_id = self.snapshot(content, source, proposal_ids)
+        self._write_file_atomic(content)
+        return snap_id
+
+    def _write_file_atomic(self, content: str) -> None:
+        """同目录写 .tmp → fsync → 原子替换:文件要么旧的完整、要么新的完整,永不被截断。"""
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(self.path)  # Path.replace = os.replace(同目录,原子)
 
     def sync_manual_edit(self) -> bool:
-        """文件与最新快照不符 → 先把手编版存为一次变更。返回是否发生了同步。"""
+        """文件与最新快照不符 → 先把手编版存为一次变更。返回是否发生了同步。
+
+        R3-1:文件 ≠ 最新快照有两种,只有一种是手编:
+         ① 真手编:当前内容对不上任何快照 → 记一次 manual_edit;
+         ② 「先 snapshot 后写文件」两步之间崩了 → 文件是**旧版完整内容**(能对上某个
+            历史快照)→ 不是手编,不记——否则把旧版当"合法手编"存成新快照,反而把
+            该写进去的那份顶掉。
+        """
         current = self.read()
         latest = self._conn.execute(
             "SELECT content_hash FROM ledger_history ORDER BY id DESC LIMIT 1"
         ).fetchone()
         if latest is not None and latest["content_hash"] == _hash(current):
             return False
+        row = self._conn.execute(
+            "SELECT 1 FROM ledger_history WHERE content_hash=?", (_hash(current),)
+        ).fetchone()
+        if row is not None:
+            return False  # 是旧版快照的内容(两步之间崩了),不是手编,别误记
         self.snapshot(current, source="manual_edit" if latest else "init", proposal_ids=[])
         return True
 

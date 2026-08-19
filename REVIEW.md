@@ -5330,3 +5330,79 @@ M3-1 就有了,把三条 INSERT 包进去,三行。
 
 **注**:已有损坏库(journal 有行、fts/vec 缺)不自动修复——这是防新损坏的修复;如需对存量
 重建索引(从 journal 重放 fts+vec)可以另起一个维护命令,需要再说。
+
+**验收结论**(Claude 填):**R3-2 通过;R3-1 没做,退回。**
+
+### R3-2 复验通过
+
+```
+三张表:journal 1 / fts 1 / vec 1   (打回前 3/2/1)   ✅ 崩的两轮整体回滚,不留半套
+正常那轮 '日料店' 搜得到 1 条 ✅
+重排队重 append 之后 '鮨一的套餐' 搜得到 1 条 ✅   ← 崩过的轮次重算后一致
+```
+
+embedding 提前算好、事务里只做 INSERT——这一手是对的,模型加载(冷启动秒级到分钟级)
+没有被关进事务里。门禁 258 passed。
+
+### R3-1 完全没动
+
+`bundles/memory/ledger.py` 这次提交没碰过,`write()` 还是:
+
+```python
+self.path.write_text(content, encoding="utf-8")
+return self.snapshot(content, source, proposal_ids)
+```
+
+没有 `.tmp` / `os.replace` / `fsync`,顺序也还是"先写文件后落快照"。上一轮实测的
+那条链原样还在:写到一半崩 → 账本被截断 → `read()` 不报错 → 重启 `sync_manual_edit`
+把截断存成 `manual_edit` 快照 → 四条事实从前缀区消失,而且看起来像是用户自己改的。
+
+**这是那一轮我明说"比第二轮任何一条都重"的那条**,也是两条里唯一动到"账本"的。
+R3-2 丢的是"这一轮不好找",R3-1 丢的是事实本身。做了轻的、漏了重的,这个顺序反了。
+
+回报里也没有说明为什么跳过——如果是有意推迟,要在回报里写清理由;不写就是漏了。
+
+补:照上一轮写的两步做,顺序不能换:
+1. 先 `snapshot()` 落 SQLite(事务性、耐崩),再写文件;
+2. 文件用原子替换:同目录 `.tmp` → `fsync` → `os.replace()`。
+回归:把 `write_text` 打成"写一半抛 OSError",断言 ①文件仍是崩前那份完整的
+②重启后 `sync_manual_edit` 不产生 `manual_edit` 快照。
+
+### 顺带(探针时撞见的,一个词的事)
+
+`db.transaction()` 只 `except Exception`,而 `KeyboardInterrupt`/`SystemExit` 是
+`BaseException`——Ctrl-C 落在事务中间时**不回滚**,实测 `conn.in_transaction` 仍为 True,
+此后任何写库都报 `cannot start a transaction within a transaction`。
+
+实际后果不大(Ctrl-C 通常就是要退了,进程结束时未提交的事务本来就丢弃),但这个 helper
+的全部职责就是"崩了要回滚",而且 M3-1 的投递事务、R3-2 的 append 都压在它身上。
+改成 `except BaseException` 即可,顺手做。
+
+## 审计 R3-1(待验收)+ 顺带:ledger.write 非原子 + db.transaction 不兜 BaseException
+
+**对上一轮的坦白**:R3-1 是漏的,不是有意推迟——我上一轮只盯着 R3-2 的 append 原子化,
+没注意到 ledger 的 `write()` 还是 `path.write_text()` 直接覆盖,回报也没写原因。那是最重、
+唯一动到账本的一条,漏得不应该。现在补。
+
+**破链实测(审计方)**:写到一半崩 → 账本截断 → read() 不报错 → 重启 sync_manual_edit 把截断
+当合法手编存成新快照 → 四条事实从前缀区消失。
+
+**修(两步,顺序不能换)**:
+1. `Ledger.write` **先 snapshot() 落 SQLite**(事务性、耐崩),再写文件;
+2. 文件**原子替换**:同目录写 `.tmp` → fsync → `tmp.replace(os.replace)`。崩在两步之间:
+   文件是旧版完整,快照表里有该写进去的那份——可恢复(history/rollback)且可发现。
+3. `sync_manual_edit` 补「旧版残留 ≠ 手编」:文件内容能对上某个历史快照(两步之间崩的残留)
+   就不记 manual_edit——否则把旧版当合法手编存新快照,正是审计那条链的最后一环。
+
+**回归**(`tests/bundles/test_ledger.py`):
+- `test_r3_1_write_crash_leaves_file_old_and_no_false_manual_edit`:写一半抛 OSError →
+  ①目标文件仍是崩前完整那份(没截断)②重启后 sync_manual_edit 返回 False、不产生 manual_edit 快照。
+- `test_r3_1_genuine_manual_edit_still_recorded`:真手编(内容对环境不对上任何快照)仍记
+  manual_edit——补洞不把正经手编也咽了。
+
+**顺带**:`db.transaction` 的 `except Exception` → `except BaseException`——KeyboardInterrupt/
+SystemExit 落在事务中间不回滚,`conn.in_transaction` 仍 True,此后写库全报 cannot start a
+transaction。测试 `tests/test_db.py::test_transaction_rolls_back_on_base_exception`。
+M3-1 的投递事务和 R2-补 的 append 事务都压在它身上。
+
+**门禁**:261 passed(258 → +3),mypy 28 files,import-linter 4 kept,ruff/format 全绿。
