@@ -276,6 +276,15 @@ def create_app(
             )
             return JSONResponse({"text": sweep_result.summary}, status_code=200)
 
+        if line.strip() == "/compact":
+            # M3-6 压缩:手动触发(占时,需要模型)。compactor 用真 Gate 造好(Steward 的
+            # GatePort 不放 propose,单写者编进类型);上下文未顶满时 no-op。
+            from lararium.steward.compact import make_compactor
+
+            compactor = make_compactor(steward.settings, steward.journal, gate, steward.threads)
+            compact_summary = await steward.maybe_compact(compactor)
+            return JSONResponse({"text": compact_summary or "上下文未满,无需压缩"}, status_code=200)
+
         result = handle_command(line, steward=steward, ledger=ledger, gate=gate)
         return JSONResponse({"text": result.text}, status_code=200)
 

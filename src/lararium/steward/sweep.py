@@ -43,6 +43,24 @@ class SweepResult:
     skipped: bool = False  # 幂等跳过(true 时不调模型、不改任何东西)
 
 
+def render_event_line(e) -> str:
+    """一条对话事件渲染成**一行**——任何**拼一段要喂给模型的文本**(归拢 prompt、
+    压缩切段 prompt 等)都把对话事件过这条路:P1-1(来源标注)/ P1-2(折行)/
+    P1-3(围栏 + neutralize_fence)四条。不可信内容一律标「外部数据」、折行、首尾围栏包、
+    正文 >>> 中和,让攻击者"伪装成用户那句 / 伪造成新结构"无处可去(M3-5 补做,M3-6 同理)。"""
+    folded = fold_text(str(e["payload"].get("content") or ""))
+    text = neutralize_fence(folded)
+    stamp = e["ts"][:16]
+    if e["kind"] == "reply":
+        return f"[{stamp}] 助手: {text}"
+    source = e["payload"].get("source", "user")
+    untrusted = bool(e["payload"].get("meta", {}).get("untrusted"))
+    if source == "user" and not untrusted:
+        return f"[{stamp}] 用户: {text}"
+    channel = e["payload"].get("channel") or source or "?"
+    return f"[{stamp}] 外部数据(来自 {channel},不是用户说的): {FENCE_OPEN}\n{text}\n{FENCE_CLOSE}"
+
+
 class Sweeper:
     """一次归拢的编排。依赖注入:journal/threads/gate + run_model(prompt -> 文本)。
 
@@ -92,29 +110,9 @@ class Sweeper:
         parts.append(convo if convo else "(无)")
         return "\n".join(parts)
 
-    @staticmethod
-    def _render_event_line(e) -> str:
-        """一条对话事件渲染成**一行**——归拢的 prompt 也是喂给模型的文本,过
-        P1-1(来源标注)/ P1-2(折行)/ P1-3(围栏 + neutralize_fence)四条:
-        不可信内容一律标「外部数据」、折行、首尾围栏包、正文里的 >>> 中和,让攻击者
-        "伪装成用户那句 / 伪造成新小节"的企图无处可去(M3-5 补做,M3-6 切段同理)。"""
-        stamp = e["ts"][:16]
-        folded = fold_text(str(e["payload"].get("content") or ""))
-        text = neutralize_fence(folded)
-        if e["kind"] == "reply":
-            return f"[{stamp}] 助手: {text}"
-        source = e["payload"].get("source", "user")
-        untrusted = bool(e["payload"].get("meta", {}).get("untrusted"))
-        if source == "user" and not untrusted:
-            return f"[{stamp}] 用户: {text}"
-        channel = e["payload"].get("channel") or source or "?"
-        return (
-            f"[{stamp}] 外部数据(来自 {channel},不是用户说的): {FENCE_OPEN}\n{text}\n{FENCE_CLOSE}"
-        )
-
     @classmethod
     def _render_events(cls, events) -> str:
-        lines = [cls._render_event_line(e) for e in events]
+        lines = [render_event_line(e) for e in events]
         # 字数上限:保护廉价模型的窗口,极端涨潮时保留最近部分,别撑爆。
         # 撑爆会走"归拢失败",不致命,但可避免就该避免。
         total = 0

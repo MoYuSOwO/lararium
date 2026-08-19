@@ -58,6 +58,7 @@
 - **M3-1** L0 按 token 预算截断(200k)+ 收掉 M2-6 遗留:`outbox.put`+`inbox.complete` 同一事务(崩在中间不再重复回复,D10 真·恰好一次);`recent_turns_within_budget` 从最新往回填、预算耗尽即停、最新一轮无条件在;上下文超长类 400 的 notice 说人话(不甩 status_code: 400)。补做:M3-1b 把估算器实测定标(CJK 0.8/非 CJK 0.3,原 len//2 低估 1.4~1.6 倍)、预算改为整窗口径(读前缀-8000 留白,余额归 L0)、`_turns_by_id` 一条 SQL 不走 replay(800 轮 274ms→28ms)、`db.transaction(conn)` + `Inbox/Outbox.conn` 属性
 - **M3-2** 话头存储(Steward 独占,非 bundle):`Threads` 表 + `open_thread`(同名 upsert)/`close_thread` 内置工具追加在既有工具之后、顺序不插队,`open_threads()` 是代码路径不占模型工具位;条数上限 5、note 字数 80。补做:topic 加 `MAX_TOPIC_LEN=24` + 归一化(折内部空白/去首尾/空名拒),close 同套归一化
 - **M3-3** 话头进信封(冻结):认领后把 `open_threads()` 快照冻结进 `env.meta`,历史轮渲染**当时那份**(append-only 严格前缀回归);话头行渲染规矩(P1-2 折内部换行 / P1-3 topic+note 过 neutralize_fence / 像自己记的待办)。Step0:预算口径改「渲染后的形态」(每轮 +10 普通/+40 不可信 + 话头行),2000 轮短聊整份 ≤200k;threads 顺带(去 PMID:、截后 strip);directory/ledger read-once
+- **M3-5** 夜间归拢(sweep):扫一段起居注补账——只改话头 + 提 pending(untrusted,账本单写者),模型输入/输出逐字落起居注,同区间幂等,掉出前5名的话头也能关(Threads.all_open);廉价模型可单配。补做:归拢 prompt builder 过四条渲染规矩(按来源标注外部数据不写成用户 / fold_text 折行 / 围栏+中和),_fold 提公开
 - **M3-4** 检索拆两个工具 + 分页:`search_history` 词法(报总数+页)、`recall_similar` 语义(vec0+256 维本地 embedding)——决定性对照独立语料 0/5 vs 4/5,recall 存在的一切理由;低于相似度阈值(0.35)不计入总数;page 钳制;两条注入回归照抄词法路(P1-2 折行 / P1-3 中和围栏);embedding 数据面算不碰缓存。补做:扩展加载失败降级不拦启动(VEC_AVAILABLE 三处消费,recall 复用 E2 提示)+ 启动期预热 embedding(慢启动诚实,聊一半卡住不是)
 
 ---

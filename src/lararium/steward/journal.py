@@ -282,6 +282,8 @@ class Journal:
             r["envelope_id"]
             for r in self._conn.execute(
                 "SELECT envelope_id, MAX(seq) AS last_seq FROM journal "
+                "WHERE kind='envelope' "
+                "AND envelope_id NOT IN (SELECT envelope_id FROM compressed_envelopes) "
                 "GROUP BY envelope_id ORDER BY last_seq DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -293,7 +295,7 @@ class Journal:
         self, max_tokens: int, max_turns: int = 2000
     ) -> list[dict[str, Any]]:
         """M3-1:L0 按 token 预算截断。从最新往回填,累计估算 token 超预算即停;
-        返回时间正序(旧→新)。
+        返回时间正序(旧→新)。**已压缩成 l1 索引的信封不往 L0 灌**(M3-6)。
 
         估算用 estimate_tokens(CJK 0.8 / 非 CJK 0.3,实测校准)**加上渲染后的固定开销**
         (_render_overhead:时间戳/不可信念包裹/话头行,M3-3)——进上下文的是渲染后的形态,
@@ -304,6 +306,8 @@ class Journal:
             r["envelope_id"]
             for r in self._conn.execute(
                 "SELECT envelope_id, MAX(seq) AS last_seq FROM journal "
+                "WHERE kind='envelope' "
+                "AND envelope_id NOT IN (SELECT envelope_id FROM compressed_envelopes) "
                 "GROUP BY envelope_id ORDER BY last_seq DESC LIMIT ?",
                 (max_turns,),
             ).fetchall()
@@ -323,3 +327,69 @@ class Journal:
             turns.append(t)
             used += est
         return turns[::-1]
+
+    # ── M3-6 压缩的存储口 ──────────────────────────────────────────────
+
+    def is_compressed(self, envelope_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM compressed_envelopes WHERE envelope_id=?", (envelope_id,)
+        ).fetchone()
+        return row is not None
+
+    def uncompressed_envelope_ids(self, limit: int = 100000) -> list[str]:
+        """未压缩的信封 id,按最早发生在前(时间正序)——压缩从最旧的开始吃。"""
+        rows = self._conn.execute(
+            "SELECT envelope_id, MIN(seq) AS first_seq FROM journal "
+            "WHERE kind='envelope' "
+            "AND envelope_id NOT IN (SELECT envelope_id FROM compressed_envelopes) "
+            "GROUP BY envelope_id ORDER BY first_seq LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [r["envelope_id"] for r in rows]
+
+    def mark_compressed(self, envelope_ids: list[str]) -> None:
+        if not envelope_ids:
+            return
+        now = datetime.now(UTC).isoformat()
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO compressed_envelopes (envelope_id, created_at) VALUES (?,?)",
+            [(eid, now) for eid in envelope_ids],
+        )
+
+    def add_index(self, date: str, line: str, envelope_id: str) -> None:
+        self._conn.execute(
+            "INSERT INTO l1_index (date, line, envelope_id, created_at) VALUES (?,?,?,?)",
+            (date, line, envelope_id, datetime.now(UTC).isoformat()),
+        )
+
+    def prune_index(self, index_days: int) -> None:
+        """超保留期(默认 90 天)的索引行删掉——L1 只留近期的书签。"""
+        from datetime import timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(days=index_days)).isoformat()
+        self._conn.execute("DELETE FROM l1_index WHERE date < ?", (cutoff,))
+
+    def l1_block(self, index_days: int) -> str:
+        """L1 索引块(给 assemble 当 l1):`日期 · 话题 · 一句结论 · 信封id`,每行一条。
+
+        只含保留期内的行;sqlite 的 ISO 时间字符串比较即时间比较。
+        """
+        from datetime import timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(days=index_days)).isoformat()
+        rows = self._conn.execute(
+            "SELECT date, line, envelope_id FROM l1_index WHERE date >= ? ORDER BY id",
+            (cutoff,),
+        ).fetchall()
+        return "\n".join(f"{r['date']} · {r['line']} · {r['envelope_id']}" for r in rows)
+
+    def min_max_ts(self, envelope_ids: list[str]) -> tuple[str, str] | None:
+        """这批信封的 envelope 事件最早/最晚时间——定压缩窗口用。"""
+        if not envelope_ids:
+            return None
+        qmarks = ",".join("?" * len(envelope_ids))
+        q = f"SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM journal WHERE envelope_id IN ({qmarks}) AND kind='envelope'"  # noqa: S608 - qmarks 全是 ?,参数是内部 id
+        row = self._conn.execute(q, envelope_ids).fetchone()
+        if row["lo"] is None:
+            return None
+        return row["lo"], row["hi"]

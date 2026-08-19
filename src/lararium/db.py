@@ -66,6 +66,24 @@ CREATE TABLE IF NOT EXISTS sweep_runs (
     range_id TEXT PRIMARY KEY,   -- "since|until"——同一区间只归拢一次(幂等)
     ran_at   TEXT NOT NULL
 );
+
+-- M3-6 压缩:M3-3 之后的命根子是 append-only(起居注只增不改),压缩**不删正文**,
+-- 只是把"已压成索引"的信封标记掉(退出 L0 一线),索引行单独一张表供 assemble 当 l1。
+CREATE TABLE IF NOT EXISTS l1_index (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    date        TEXT NOT NULL,      -- 索引行日期(供 90 天保留期剪枝)
+    line        TEXT NOT NULL,      -- "话题 · 一句结论"(L1 渲染时拼 日期 · line · 信封id)
+    envelope_id TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_l1_date ON l1_index(date);
+
+-- 已被压缩(退出 L0 一线)的信封 id。逐字正文仍在 journal——可重放/可检索,
+-- 只是不再往近期上下文里灌。不反复压缩靠它(见 compact)。
+CREATE TABLE IF NOT EXISTS compressed_envelopes (
+    envelope_id TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL
+);
 """
 
 # M3-4 语义检索:嵌入向量(256 维,L2 归一化后入库)与起居注同库。

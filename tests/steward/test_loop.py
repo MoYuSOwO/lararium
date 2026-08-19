@@ -398,7 +398,7 @@ def test_l0_budget_deducts_prefix(steward_factory):
 
     def budget():
         prefix = steward.persona + steward.registry.directory_lines() + steward.ledger.read()
-        return steward._l0_token_budget(prefix)
+        return steward._l0_token_budget(prefix, l1_text="")  # M3-6:预算签名多了 l1
 
     small_prefix = budget()
     steward.persona = "用" * 10000  # ≈8000 token 的人格
@@ -428,7 +428,7 @@ def test_l0_truncated_before_context_overflow(steward_factory, monkeypatch):
         steward.journal.append(f"env-{i}", "reply", {"content": f"回{i}"})
 
     prefix = steward.persona + steward.registry.directory_lines() + steward.ledger.read()
-    turns = steward._recent_turns(prefix)
+    turns = steward._recent_turns(prefix, l1_text="")
     assistants = [t.assistant for t in turns]
     assert 0 < len(assistants) < 500, f"预算耗尽前必须截断 L0,实际保留了 {len(assistants)} 轮"
     assert assistants[-1] == "回499", "最新一轮(对话接续锚点)必须在"
@@ -497,3 +497,84 @@ async def test_assembled_whole_stays_within_200k_for_short_chat(steward_factory,
     whole = ctx.system_prompt + "".join(m["content"] for m in ctx.messages)
     total = estimate_tokens(whole)
     assert total <= 200000, f"组装整份 {total} token > 200000——渲染口径没把差额算进去"
+
+
+def _fake_compactor(steward):
+    """测试用:真 Compactor + 假切段模型 + 真 Sweeper(假模型无建议)→ 沉淀筛复用 M3-5。"""
+    from lararium.steward.compact import Compactor
+    from lararium.steward.sweep import Sweeper
+
+    async def cut(prompt):
+        return '{"segments": [{"topic": "片段", "conclusion": "一段对话"}]}'
+
+    async def noop_sweep(prompt):
+        return '{"open": [], "close": [], "suggest": []}'
+
+    sweeper = Sweeper(steward.journal, steward.threads, steward.gate, noop_sweep, "指令")
+    return Compactor(
+        steward.journal,
+        steward.gate,
+        cut,
+        "切段指令",
+        sweeper,
+        steward.settings.compact_index_days,
+    )
+
+
+async def test_6_fact_survives_compression_memory_consistency(steward_factory):
+    """M3-6 记忆一致性:压缩前聊过的事实已结算进账本,压缩后问同样问题答案不变
+    (DESIGN §12 标准——事实还在前缀区,没被压缩弄丢)。"""
+    steward, model = steward_factory([ModelReply("记下了"), ModelReply("对芒果过敏")])
+    env1 = Envelope.new(source="user", channel="cli", content="我过敏,记一下")
+    steward.submit(env1)
+    await steward.process_next()
+    steward.gate.propose(
+        kind="add",
+        content="对芒果过敏",
+        provenance="user_stated",
+        origin="test",
+        section="长期偏好",
+    )
+    steward.settle_if_needed()  # 事实进账本 → 每轮前缀可见
+
+    rng = steward.journal.min_max_ts([env1.id])
+    await _fake_compactor(steward).run(rng[0], rng[1])
+    assert steward.journal.is_compressed(env1.id), "env1 已被压缩(退出 L0 一线)"
+
+    env2 = Envelope.new(source="user", channel="cli", content="我上次说对什么过敏来着")
+    steward.submit(env2)
+    await steward.process_next()
+    assert "对芒果过敏" in model.seen[1].system_prompt, "已结算的事实必须还在前缀里,答案不变"
+
+
+async def test_7_compression_rebuilds_stream_once_then_strict(steward_factory):
+    """M3-6 缓存:压缩那一轮流水区重建一次(允许),之后各轮恢复严格追加。
+    查起居注的 prompt 事件,不是缓存百分比。"""
+    steward, _ = steward_factory(
+        [ModelReply("一"), ModelReply("二"), ModelReply("三"), ModelReply("四")]
+    )
+    envs: list[str] = []
+    msgs = []
+    for i in range(4):
+        env = Envelope.new(source="user", channel="cli", content=f"问{i}")
+        steward.submit(env)
+        envs.append(env.id)
+        await steward.process_next()
+        msgs.append(
+            next(
+                e["payload"]["messages"]
+                for e in steward.journal.replay(env.id)
+                if e["kind"] == "prompt"
+            )
+        )
+        if i == 1:  # 第二轮后、第三轮前压一次(旧轮变成 L1 索引)
+            await _fake_compactor(steward).run(*steward.journal.min_max_ts([envs[0]]))
+
+    # 压缩前:第 0 轮是第 1 轮的严格前缀
+    assert msgs[0] == msgs[1][: len(msgs[0])], "压缩前流水区严格追加"
+    # 压缩那一轮:重建一次(第 1 轮不再严格含于第 2 轮——L1 冒出来、旧轮退出)
+    assert msgs[1] != msgs[2][: len(msgs[1])], "压缩轮到重建一次"
+    # 之后:第 2 轮是第 3 轮的严格前缀
+    assert msgs[2] == msgs[3][: len(msgs[2])], "压缩后恢复严格追加"
+    # L1 进流水区(可见即入账):第 2 轮的 prompt 里能看到索引块
+    assert "片段" in msgs[2][0]["content"] or "更早的对话摘要" in msgs[2][0]["content"]

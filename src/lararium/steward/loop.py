@@ -117,12 +117,14 @@ class Steward:
             directory = self.registry.directory_lines()
             ledger_text = self.ledger.read()
             prefix_text = self.persona + directory + ledger_text
+            # M3-6:L1(压缩索引块)供数给 assemble;一轮算一次,预算和渲染共用。
+            l1_text = self.journal.l1_block(self.settings.compact_index_days)
             ctx = assemble(
                 persona=self.persona,
                 directory=directory,
                 ledger=ledger_text,
-                l1="",  # M3 压缩接管后填充
-                l0=self._recent_turns(prefix_text),
+                l1=l1_text,
+                l0=self._recent_turns(prefix_text, l1_text),
                 envelope=env,
                 timezone=self.settings.timezone,
             )
@@ -187,16 +189,23 @@ class Steward:
             self.inbox.fail(env.id, f"{type(exc).__name__}: {exc}")
             raise
 
-    def _l0_token_budget(self, prefix_text: str) -> int:
-        # M3-1b:LARARIUM_L0_MAX_TOKENS 是**整个上下文预算**(200000=200k 窗口用满)。
-        # 先扣前缀区(persona+目录+账本,由调用方 read-once 算好)再减固定留白(工具
-        # schema + 输出窗口),余额才归 L0——这才是"200k 用满"的忠实实现。
-        return max(0, self.settings.l0_max_tokens - estimate_tokens(prefix_text) - L0_RESERVE)
+    def _l0_token_budget(self, prefix_text: str, l1_text: str) -> int:
+        # M3-1b/3-6:LARARIUM_L0_MAX_TOKENS 是**整个上下文预算**(200000=200k 窗口用满)。
+        # 先扣前缀区(persona+目录+账本,由调用方 read-once 算好)、L1 压缩索引块、固定留白
+        # (工具 schema + 输出窗口),余额才归 L0——「200k 是整窗,不是 L0 独占」的忠实实现。
+        return max(
+            0,
+            self.settings.l0_max_tokens
+            - estimate_tokens(prefix_text)
+            - estimate_tokens(l1_text)
+            - L0_RESERVE,
+        )
 
-    def _recent_turns(self, prefix_text: str) -> list[Turn]:
+    def _recent_turns(self, prefix_text: str, l1_text: str) -> list[Turn]:
         # M3-1:L0 按整个上下文预算的余额截断,l0_max_turns 只当轮数兜底。
         rows = self.journal.recent_turns_within_budget(
-            max_tokens=self._l0_token_budget(prefix_text), max_turns=self.settings.l0_max_turns
+            max_tokens=self._l0_token_budget(prefix_text, l1_text),
+            max_turns=self.settings.l0_max_turns,
         )
         return [
             Turn(
@@ -211,3 +220,36 @@ class Steward:
             )
             for r in rows
         ]
+
+    async def maybe_compact(self, compactor: Any) -> str | None:
+        """M3-6 触发:上下文装不下时,把顶出低水位的未压缩轮压成 L1 索引。
+
+        compactor 由组装根用**真 Gate** 造好传入(Steward 的 GatePort 不放 propose,
+        单写者编进类型)。平常未顶满是 no-op;COMPACT=off 退回纯截断。
+        """
+        s = self.settings
+        if s.compact != "on":
+            return None
+        l1_text = self.journal.l1_block(s.compact_index_days)
+        prefix_text = self.persona + self.registry.directory_lines() + self.ledger.read()
+        low_budget = max(
+            0,
+            s.compact_low_water
+            - estimate_tokens(prefix_text)
+            - estimate_tokens(l1_text)
+            - L0_RESERVE,
+        )
+        keep_ids = {
+            t["envelope_id"]
+            for t in self.journal.recent_turns_within_budget(
+                max_tokens=low_budget, max_turns=s.l0_max_turns
+            )
+        }
+        to_compress = [e for e in self.journal.uncompressed_envelope_ids() if e not in keep_ids]
+        if not to_compress:
+            return None  # 上下文还没顶到压缩线,no-op
+        rng = self.journal.min_max_ts(to_compress)
+        if rng is None:
+            return None
+        result: Any = await compactor.run(rng[0], rng[1])
+        return str(result.summary)

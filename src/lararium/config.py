@@ -34,6 +34,9 @@ class Settings:
     max_attempts: int
     recall_min_similarity: float
     sweep_model: str
+    compact: str
+    compact_low_water: int
+    compact_index_days: int
     bind_host: str
     bind_port: int
     control_tokens: dict[str, str]
@@ -60,6 +63,11 @@ class Settings:
             # M3-5 夜间归拢(sweep)的廉价模型,单配;空则用主模型。归拢是扫历史做剪枝,
             # 不需要主模型那么强,便宜够用就行。
             sweep_model=os.environ.get("LARARIUM_SWEEP_MODEL", ""),
+            # M3-6 压缩(M3 最后一块硬骨头)。整窗 200k、低水位 150k、索引保留 90 天,
+            # 口径一律 estimate_tokens + _render_overhead(渲染后形态,M3-1b/M3-3 定死)。
+            compact=os.environ.get("LARARIUM_COMPACT", "on"),  # on | off(off 退回纯截断)
+            compact_low_water=int(os.environ.get("LARARIUM_COMPACT_LOW_WATER", "150000")),
+            compact_index_days=int(os.environ.get("LARARIUM_COMPACT_INDEX_DAYS", "90")),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
             # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。
