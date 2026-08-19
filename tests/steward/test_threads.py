@@ -46,3 +46,43 @@ def test_open_threads_caps_count_and_note_length(threads):
 
     threads.open_thread("长注记", "很" * 200)
     assert len(threads.open_threads()[0].note) == 80, "单条字数上限 80(就地截断)"
+
+
+def test_open_thread_truncates_oversized_topic(threads):
+    """topic 同样是模型传的、同样每轮进信封——必须和 note 一样就地截断。
+
+    实测过不受限的 topic:open_thread("话"*5000, "短的") 后 5 条话头占 5086 字,
+    本该是 80x5≈400。MAX_TOPIC_LEN 就是来堵这个的。
+    """
+    t = threads.open_thread("话" * 5000, "短的")
+    assert len(t.topic) == 24  # MAX_TOPIC_LEN
+    assert len(threads.open_threads()[0].topic) == 24
+
+
+def test_topic_is_normalized_so_same_name_updates(threads):
+    """「同名是更新」必须对真实用法成立:topic 要 strip(内部空白一并折叠)。
+
+    实测没归一化时:("装修") / (" 装修") / ("装修 ") → 库里 3 条全露出来,
+    close_thread(" 装修") 关掉的只是复制品。归一化后这些都该是同一把钥匙。
+    """
+    threads.open_thread(" 装修 ", "A")
+    threads.open_thread("装修", "B")  # 首尾空白 strip 后同名 → 更新
+    open_ones = threads.open_threads()
+    assert len(open_ones) == 1, "首尾空白归一化后应同名更新,不新建"
+    assert open_ones[0].note == "B"
+    assert open_ones[0].topic == "装修"
+
+    # close 用同一套归一化:存的和找的对得上
+    assert threads.close_thread("  装修  ") is True
+    assert threads.open_threads() == []
+
+
+def test_empty_topic_is_rejected(threads):
+    """空 topic 现在也能建一条(空串也是主键)——不该让它存在。"""
+    try:
+        threads.open_thread("   ", "空话题")
+    except ValueError as exc:
+        assert "话头" in str(exc)
+    else:
+        raise AssertionError("空 topic 应被拒绝")
+    assert threads.open_threads() == []

@@ -90,7 +90,10 @@ class BuiltinTools:
     def open_thread(self, topic: str, note: str) -> str:
         """开一个话头:还有件没聊完的事,记个名字和一句状态。
         同名再次调用 = 更新这句状态,不是另开一个。"""
-        t = self.threads.open_thread(topic, note)
+        try:
+            t = self.threads.open_thread(topic, note)
+        except ValueError as exc:
+            return f"开话头失败:{exc}"  # E2:模型传空/坏话头名也要能自我纠正
         return f"话头已开:{t.topic} —— {t.note}"
 
     def close_thread(self, topic: str) -> str:

@@ -166,3 +166,9 @@ def test_close_thread_tool_confirms_or_says_not_found(tools):
     tools.open_thread("租房", "在等房东回复")
     assert "话头已关闭" in tools.close_thread("租房")
     assert "没有在开" in tools.close_thread("租房")
+
+
+def test_open_thread_tool_rejects_empty_topic_with_text(tools):
+    """E2:空话头名是模型传的坏输入,返回可纠正文本而非抛异常。"""
+    result = tools.open_thread("   ", "空话题")
+    assert "开话头失败" in result

@@ -5,6 +5,7 @@
 信封撑爆:条数上限 MAX_OPEN、单条字数 MAX_NOTE_LEN 都在这一层守。
 """
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,8 +22,22 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+MAX_TOPIC_LEN = 24  # 话头名本来就该短;主键塞几千字也不像话(实测没上限时 5000 字照存)
+
+
+def _normalize_topic(topic: str) -> str:
+    """把话头名归一到「同一把钥匙」。topic 同样是模型传的、同样每轮进信封:
+    不归一化,"装修" / " 装修" / "装修 " 会变成三条,close 关掉的只是复制品(实测)。
+    折叠内部空白(含换行/制表),去首尾,截到 MAX_TOPIC_LEN;空名直接拒。
+    """
+    topic = re.sub(r"\s+", " ", topic).strip()
+    if not topic:
+        raise ValueError("话头名不能为空")
+    return topic[:MAX_TOPIC_LEN]
+
+
 class Threads:
-    # 每轮进上下文,这两个上限是"把信封撑爆"的焊死点。
+    # 每轮进上下文,这些上限是"把信封撑爆"的焊死点。
     MAX_OPEN = 5
     MAX_NOTE_LEN = 80
 
@@ -36,8 +51,10 @@ class Threads:
     def open_thread(self, topic: str, note: str) -> ThreadInfo:
         """建/更新一个话头:同名是更新不是新建(upsert 靠主键)。
 
-        note 就地截到 MAX_NOTE_LEN——写进去的就该是进上下文那份,别让库越攒越肥。
+        topic 归一化(PMID: strip+折内部空白)后当钥匙;note 就地截到 MAX_NOTE_LEN——
+        写进去的就该是进上下文那份,别让库越攒越肥。
         """
+        topic = _normalize_topic(topic)
         note = note.strip()[: self.MAX_NOTE_LEN]
         now = _now()
         self._conn.execute(
@@ -49,7 +66,11 @@ class Threads:
         return ThreadInfo(topic=topic, note=note, updated_at=now)
 
     def close_thread(self, topic: str) -> bool:
-        """关掉一个话头。找不到在开的同名 → False。"""
+        """关掉一个话头。找不到在开的同名 → False。空/归一后为空的 key 也当找不到。"""
+        try:
+            topic = _normalize_topic(topic)
+        except ValueError:
+            return False
         cur = self._conn.execute(
             "UPDATE threads SET state='closed', updated_at=? WHERE topic=? AND state='open'",
             (_now(), topic),
