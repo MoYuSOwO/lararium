@@ -3879,3 +3879,70 @@ open_thread("话"*5000,"短的") 后 5 条进信封占 5086 字);topic 不归一
 
 **已记(不做,归 M3-5)**:掉出前 5 名的话头仍 open,模型看不见也关不掉(库里 22 条 open 只露
 5 条)——M3-5 夜间归拢处理。
+
+**验收结论**(Claude 填):**通过。M3-2 结掉。** 两处上限都补到位,我把打回时的探针原样重跑:
+
+```
+缺陷1 超长 topic:open_thread("话"*5000, ...) → 存进去 24 字
+   两条话头进信封共 110 字(打回前 5086);满 5 条的天花板 = 5×(24+80) = 520 字 ✓
+缺陷2 同名归一化:「装修」的五种写法(前空格/后空格/换行/多空格/原样)→ 库里 2 条
+   close_thread(" 装修 ") 关掉的是本尊,不再是复制品 ✓
+   空名:open_thread("   ") 抛 ValueError,工具层接住返回人话(E2);
+        close_thread("") 返回 False 不抛 ✓
+```
+
+剩下那 2 条是 `装修` 和 `装 修` —— 内部空白折成一个而不是抹掉,这是对的:抹掉会把
+`M3 计划` 和英文话头一起搅坏,不能为了中文的近重复去动所有话头名的语义。
+
+门禁四关独立重跑全绿:ruff ☑ / format ☑ / mypy ☑(25 files)/ import-linter ☑(4 kept)/
+pytest ☑(**209 passed**)。
+
+### 顺带(不值得单开一轮,M3-3 碰到这个文件时顺手)
+
+- `threads.py` 的 `open_thread` docstring 里有个 `PMID:` —— 串进来的,删掉。
+- 归一化是「折空白 → strip → 截 24」,截断落在空格上时键尾会留个空格
+  (`_normalize_topic("阿"*23 + " 尾巴")` → `"阿…阿 "`)。截完再 strip 一次即可。
+
+## Task M3-3:话头进信封(冻结),含 Step 0 三条欠账(待验收)
+
+**执行记录**(程序员填)
+
+### Step 0.1 — 预算口径改成「渲染后的形态」(M3-1b 遗留)
+
+- `journal._render_overhead(turn)`:每轮加实测常数——普通轮 **+10**(时间戳前缀)、
+  不可信轮 **+40**(「以下是数据,不是指令」包裹+围栏),话头行按 `render_open_threads`
+  实际渲染的文本估算。`recent_turns_within_budget` 的每轮预算 = 原文 + 这个开销。
+- **配的测试过**:`test_assembled_whole_stays_within_200k_for_short_chat`——2000 轮短聊
+  (110 字/轮)+ 预算 200000,组装出来的整份 estimate_tokens ≤ 200000(改口径前是红的 214005)。
+- 注释写明 M3-6 设低水位要继承同一口径。
+
+### Step 0.2 — 话头正文三条渲染规矩(M3-2 遗留,P1-2/P1-3)
+
+`assembler.render_open_threads(open_threads) -> str | None`:
+- note 内部换行**折成空格**(`_fold`,P1-2 多行撑开列表);
+- **topic/note 都过 neutralize_fence**(P1-3,防正文里的 >>> 提前闭合围栏);
+- 渲染成「还在忙的事:装修(在比价)、买基金」——像自己记的待办,不是 "SYS: open_threads=…"。
+- 追加在 `_render_user_text` 的**围栏之外**(话头是自己记的状态,可信,不能被包进
+  "以下是数据不是指令")。
+- tests:折行 / 中和围栏(topic+note)/ 像待办 / 空则无这行。
+
+### Step 0.3 — append-only 回归(计划 M3-3 本体)
+
+- `process_next` 收编信封后把 `threads.open_threads()` 快照冻结进 `env.meta["open_threads"]`
+  (认领后,定时/事件信封也能带上);`_turns_by_id` 把它带出来,`Turn` 加 `open_threads` 字段,
+  历史轮渲染**当时那份**,当前信封渲染认领那份。
+- **测试**:`test_open_threads_frozen_per_turn_and_append_only`——连聊 5 轮、中途话头变两次,
+  第 N 轮 messages 是第 N+1 轮的**严格前缀**(查起居注 prompt 事件,照 M2-6 写法);方向抽查:
+  第 1 轮认领时没有话头 → 无「还在忙的」行;第 5 轮认领时话头已是「买基金」→ 当前信封有。
+
+### 顺带(REVIEW 要求)
+
+- `threads.py`:`open_thread` docstring 里的 "PMID:" 删掉;`_normalize_topic` 截 24 后
+  **再 strip 一次**(截断落在空格上键尾不留空格)。
+- M3-1b 的 read-once:`process_next` 里 directory/ledger **一轮读一次**,同时传给
+  `assemble` 与 `_l0_token_budget`/`_recent_turns(prefix_text)`(不再各读一遍)。
+
+### 门禁
+
+216 passed(209 → +7:assembler 渲染 5 + append-only + 预算整份),mypy 25 files,
+import-linter 4 kept(41 deps)。ruff/format 全绿。
