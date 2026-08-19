@@ -132,9 +132,19 @@ def create_app(
                 "embedding 模型未就绪:recall_similar 将提示暂不可用。首次需下载权重(约 10 分钟,M4 打进镜像)"
             )
         # M3-6:空闲自动压缩——compactor 用真 Gate 造好(Steward 的 GatePort 不放 propose)。
+        # P1-3:注入带日限的通知器,压缩被屏障停/归拢提提案时用户能收到消息(别堵死没人知)。
         from lararium.steward.compact import make_compactor
+        from lararium.steward.sweep import make_daily_notifier
 
-        compactor = make_compactor(steward.settings, steward.journal, gate, steward.threads)
+        notify = make_daily_notifier(steward.outbox, steward.outbox.conn, steward.settings.timezone)
+        compactor = make_compactor(
+            steward.settings,
+            steward.journal,
+            gate,
+            steward.threads,
+            ledger=steward.ledger,
+            notify=notify,
+        )
         worker = Worker(steward, wake, compactor=compactor)
         task = asyncio.create_task(worker.run())
         try:
@@ -281,10 +291,20 @@ def create_app(
             from datetime import datetime as _dt
             from datetime import timedelta as _td
 
-            from lararium.steward.sweep import make_sweeper
+            from lararium.steward.sweep import make_daily_notifier, make_sweeper
 
+            notify = make_daily_notifier(
+                steward.outbox, steward.outbox.conn, steward.settings.timezone
+            )
             now = _dt.now(_UTC)
-            sweeper = make_sweeper(steward.settings, steward.journal, steward.threads, gate)
+            sweeper = make_sweeper(
+                steward.settings,
+                steward.journal,
+                steward.threads,
+                gate,
+                ledger=steward.ledger,
+                notify=notify,
+            )
             sweep_result = await sweeper.run(
                 since=(now - _td(hours=24)).isoformat(), until=now.isoformat()
             )
@@ -294,8 +314,19 @@ def create_app(
             # M3-6 压缩:手动触发(占时,需要模型)。compactor 用真 Gate 造好(Steward 的
             # GatePort 不放 propose,单写者编进类型);上下文未顶满时 no-op。
             from lararium.steward.compact import make_compactor
+            from lararium.steward.sweep import make_daily_notifier
 
-            compactor = make_compactor(steward.settings, steward.journal, gate, steward.threads)
+            notify = make_daily_notifier(
+                steward.outbox, steward.outbox.conn, steward.settings.timezone
+            )
+            compactor = make_compactor(
+                steward.settings,
+                steward.journal,
+                gate,
+                steward.threads,
+                ledger=steward.ledger,
+                notify=notify,
+            )
             compact_summary = await steward.maybe_compact(compactor)
             return JSONResponse({"text": compact_summary or "上下文未满,无需压缩"}, status_code=200)
 

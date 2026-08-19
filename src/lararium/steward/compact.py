@@ -63,6 +63,7 @@ class Compactor:
         sweeper,
         index_days: int,
         timezone: str,
+        notify: Callable[[str], None] | None = None,
     ) -> None:
         self._journal = journal
         self._gate = gate
@@ -71,6 +72,8 @@ class Compactor:
         self._sweeper = sweeper
         self._index_days = index_days
         self._tz = ZoneInfo(timezone)
+        # P1-3:被审批屏障停时的通知(组装根注入带日限的通知器);None = 静默。
+        self._notify = notify or (lambda _text: None)
 
     def _local_date(self, ts: str) -> str:
         """起居注 ts 是 UTC;索引行的日期必须走配置时区(L1 时间戳同 L0 的规矩)。
@@ -108,6 +111,8 @@ class Compactor:
         # 1/4. 审批屏障:pending 非空必须停(证据销毁前必须结案,DESIGN §6.3)。
         pending = self._pending_count()
         if pending:
+            # P1-3:被自己挡住不能悄悄——通知用户去结案,否则死循环没人知道
+            self._notify(f"压缩暂停:{pending} 条待审提案,先 /pending 结案再压")
             return CompactResult(
                 f"审批屏障:有 {pending} 条待审提案,压缩停——压缩要销毁提案原始证据,"
                 "先 /pending 结案再压",
@@ -129,6 +134,7 @@ class Compactor:
         # 4. 审批屏障再查:沉淀筛刚提的新 pending 也不能毁证据。
         pending = self._pending_count()
         if pending:
+            self._notify(f"压缩暂停:{pending} 条待审提案,先 /pending 结案再压")
             return CompactResult(
                 f"沉淀筛提出了 {pending} 条待审,压缩停:先审完再压(/pending + /approve)",
                 stopped=True,
@@ -209,11 +215,18 @@ class Compactor:
         return segments
 
 
-def make_compactor(settings: Any, journal: Any, gate: Any, threads: Any) -> Compactor:
+def make_compactor(
+    settings: Any,
+    journal: Any,
+    gate: Any,
+    threads: Any,
+    ledger: Any = None,
+    notify: Callable[[str], None] | None = None,
+) -> Compactor:
     """组装根的压缩工厂:同一廉价模型 runner(切段)+ 复用 M3-5 的 Sweeper 做沉淀筛。"""
     cut_instructions = Path("prompts/cut.md").read_text(encoding="utf-8")
     runner = build_sweep_runner(settings)
-    sweeper = make_sweeper(settings, journal, threads, gate)
+    sweeper = make_sweeper(settings, journal, threads, gate, ledger=ledger, notify=notify)
     return Compactor(
         journal,
         gate,
@@ -222,4 +235,5 @@ def make_compactor(settings: Any, journal: Any, gate: Any, threads: Any) -> Comp
         sweeper,
         settings.compact_index_days,
         settings.timezone,
+        notify=notify,
     )

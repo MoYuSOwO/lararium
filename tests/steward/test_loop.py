@@ -510,7 +510,9 @@ def _fake_compactor(steward):
     async def noop_sweep(prompt):
         return '{"open": [], "close": [], "suggest": []}'
 
-    sweeper = Sweeper(steward.journal, steward.threads, steward.gate, noop_sweep, "指令")
+    sweeper = Sweeper(
+        steward.journal, steward.threads, steward.gate, noop_sweep, "指令", ledger=steward.ledger
+    )
     return Compactor(
         steward.journal,
         steward.gate,

@@ -23,7 +23,7 @@ def compact_factory(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_jm, "embed", lambda t: None)  # 压缩用不到语义向量,别拉模型
 
-    def make(cut_model, sweep_model=None, index_days=90, timezone="Asia/Shanghai"):
+    def make(cut_model, sweep_model=None, index_days=90, timezone="Asia/Shanghai", notify=None):
         conn = connect(tmp_path / "steward.sqlite")
         ledger, gate = build_memory_components(tmp_path)
         journal = Journal(conn)
@@ -32,9 +32,11 @@ def compact_factory(tmp_path, monkeypatch):
         async def _noop_sweep(prompt):
             return '{"open": [], "close": [], "suggest": []}'
 
-        sweeper = Sweeper(journal, threads, gate, sweep_model or _noop_sweep, "测试归拢指令")
+        sweeper = Sweeper(
+            journal, threads, gate, sweep_model or _noop_sweep, "测试归拢指令", ledger=ledger
+        )
         compactor = Compactor(
-            journal, gate, cut_model, "测试切段指令", sweeper, index_days, timezone
+            journal, gate, cut_model, "测试切段指令", sweeper, index_days, timezone, notify=notify
         )
         return compactor, conn, journal, threads, gate, ledger
 
@@ -265,3 +267,57 @@ async def test_hooks_fallback_when_model_gives_bad_id(compact_factory):
     assert l1.count("env-") == 3, f"三段各拿一个窗口内的 id:\n{l1}"
     for eid in ("env-a", "env-b", "env-c"):
         assert eid in l1, eid
+
+
+async def test_p1_compact_stop_notifies(compact_factory):
+    """P1-3:压缩被审批屏障停 → 投 notice;用户不再毫不知情(死循环的解药)。"""
+    from datetime import UTC, datetime, timedelta
+
+    notices: list[str] = []
+
+    async def cut(p):
+        return '{"segments": [{"topic": "T", "conclusion": "C"}]}'
+
+    compactor, _, journal, _, gate, _ = compact_factory(cut, notify=notices.append)
+    gate.propose(
+        kind="add", content="待审一条", provenance="untrusted", origin="test", section="长期偏好"
+    )
+    journal.append("env-1", "envelope", {"content": "聊天内容"})
+    now = datetime.now(UTC)
+    s, u = (now - timedelta(hours=1)).isoformat(), (now + timedelta(hours=1)).isoformat()
+    result = await compactor.run(s, u)
+    assert result.stopped and "审批屏障" in result.summary
+    assert notices and "压缩暂停" in notices[0], "被挡住必须通知用户"
+
+
+async def test_p1_death_loop_broken_sweep_proposal_blocks_then_notice_then_continues(
+    compact_factory,
+):
+    """组合(死循环三段合起来是验收重点):归拢提出提案 → 压缩被自己挡住 → 但用户收到
+    notice(知道该结案,死循环就解了);结案后再压缩**能继续**,不是永久挡死。"""
+    from datetime import UTC, datetime, timedelta
+
+    notices: list[str] = []
+
+    async def cut(p):
+        return '{"segments": [{"topic": "消费", "conclusion": "外卖超支"}]}'
+
+    async def surg_rm(prompt):  # 沉淀筛的假模型:这次会提一条提案
+        return '{"open": [], "close": [], "suggest": ["外卖超支"]}'
+
+    compactor, _, journal, _, gate, _ = compact_factory(
+        cut, sweep_model=surg_rm, notify=notices.append
+    )
+    journal.append("env-1", "envelope", {"content": "外卖这个月花超了"})
+    now = datetime.now(UTC)
+    s, u = (now - timedelta(hours=1)).isoformat(), (now + timedelta(hours=1)).isoformat()
+
+    r1 = await compactor.run(s, u)
+    assert r1.stopped and "沉淀筛" in r1.summary, "沉淀筛提的 pending 挡住第一轮压缩"
+    assert notices, "被自己挡住不能悄悄——用户得收到 notice"
+    assert not journal.is_compressed("env-1"), "被挡住时没索引没标记"
+
+    for p in gate.pending():  # 用户结案(硬门控审完)
+        gate.resolve(p.id, approved=True)
+    r2 = await compactor.run(s, u)  # 同窗口:沉淀筛的光标已推进(无新内容),pending 已清
+    assert r2.index_count == 1 and journal.is_compressed("env-1"), "结案后再压能继续,不是永久挡死"

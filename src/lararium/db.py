@@ -62,9 +62,18 @@ CREATE TABLE IF NOT EXISTS threads (
 );
 CREATE INDEX IF NOT EXISTS idx_threads_open ON threads(state, updated_at);
 
-CREATE TABLE IF NOT EXISTS sweep_runs (
-    range_id TEXT PRIMARY KEY,   -- "since|until"——同一区间只归拢一次(幂等)
-    ran_at   TEXT NOT NULL
+-- P1-1:归拢幂等键从时间区间改成**内容(seq 光标)**。唯一调用方 /sweep 每次传
+-- now-24h~now,都是新区间,按区间字符串永远幂等不了(一秒三次 → 模型调三次 →
+-- 三条重复提案)。光标 = 本次归拢覆盖到的最大 journal seq,下次从那之后扫。
+CREATE TABLE IF NOT EXISTS sweep_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    cursor_seq INTEGER NOT NULL DEFAULT 0,   -- 归拢已覆盖到的最大 journal seq
+    ran_at     TEXT
+);
+
+-- P1-3:notice 每天最多一条(压缩被屏障停/归拢提出提案都投,但别刷屏)。
+CREATE TABLE IF NOT EXISTS notice_log (
+    date TEXT PRIMARY KEY
 );
 
 -- M3-6 压缩:M3-3 之后的命根子是 append-only(起居注只增不改),压缩**不删正文**,

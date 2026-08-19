@@ -214,16 +214,18 @@ class Journal:
 
         给夜间归拢(sweep)扫:它只读起居注、只看这段时间聊了什么。只取这两种 kind——
         prompt/tool_result 是内部结构,归拢用不上,白 json.loads 一遍还费。
+        带 seq:归拢按内容幂等(光标 = 最大已扫 seq,P1-1)要靠它"从那之后扫"。
         ts 是 ISO 8601,同一种 offset 下字符串比较就是时间比较。
         """
         rows = self._conn.execute(
-            "SELECT envelope_id, kind, payload, ts FROM journal "
+            "SELECT seq, envelope_id, kind, payload, ts FROM journal "
             "WHERE ts >= ? AND ts <= ? AND kind IN ('envelope','reply') "
             "ORDER BY seq LIMIT ?",
             (since, until, limit),
         ).fetchall()
         return [
             {
+                "seq": r["seq"],
                 "envelope_id": r["envelope_id"],
                 "kind": r["kind"],
                 "payload": json.loads(r["payload"]),

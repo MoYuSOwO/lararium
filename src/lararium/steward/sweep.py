@@ -8,8 +8,13 @@
 **模型参与的输入输出都落起居注**(sweep 事件,`input`/`output` 两个 phase)——可见即入账,
 不因为它是后台任务就绕过。喂给模型的 prompt 是什么,prove 落下去的就是什么。
 
-**幂等**:同一 (since, until) 区间只归拢一次(sweep_runs 表)。重复跑同区间是 no-op——
-模型非确定性,重跑会产出重复提案。
+**幂等(P1-1)**:按**内容**幂等,不是按时间区间字符串——唯一调用方 /sweep 每次传
+now-24h~now,区间永远不同,按区间字符串一秒三次 → 模型调三次 → 三条重复提案。
+光标(sweep_state.cursor_seq)记录本次覆盖到的最大 journal seq,下次**从那之后扫**,
+光标之后没有新内容就是 no-op。
+
+**账本进 prompt(P1-2)**:喂模型的 prompt 带「已经记在账本里的(别重复提)」——不然模型会
+反复提已入档的事实,那些和重复提交的提案一起把 pending 堵死,压缩又被自己挡住(死循环)。
 
 **失败不影响主循环**:模型调用失败 / 输出不是 JSON → 返回一句可读说明,不抛。
 """
@@ -22,6 +27,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, fold_text, neutralize_fence
 
@@ -75,32 +81,43 @@ class Sweeper:
         gate,
         run_model: Callable[[str], Awaitable[str]],
         instructions: str,
+        ledger=None,
+        notify: Callable[[str], None] | None = None,
     ) -> None:
         self._journal = journal
         self._threads = threads
         self._gate = gate
         self._run_model = run_model
         self._instructions = instructions
-        # journal/threads/gate 同库;用 threads.conn(公开口)做 sweep_runs 幂等
+        # P1-2:账本读入口(供「已经记在账本里的(别重复提)」节);None 则该节留空。
+        self._ledger = ledger
+        # P1-3:提出提案时的通知(组装根注入带日限的通知器);None = 静默。
+        self._notify = notify or (lambda _text: None)
+        # journal/threads/gate 同库;用 threads.conn(公开口)做 sweep_state 光标
         self._conn = threads.conn
 
-    def _range_id(self, since: str, until: str) -> str:
-        return f"{since}|{until}"
+    def _cursor(self) -> int:
+        """已归拢覆盖到的最大 journal seq(P1-1 内容幂等)。"""
+        row = self._conn.execute("SELECT cursor_seq FROM sweep_state WHERE id=1").fetchone()
+        return int(row["cursor_seq"]) if row else 0
 
-    def _was_swept(self, range_id: str) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM sweep_runs WHERE range_id=?", (range_id,)
-        ).fetchone()
-        return row is not None
-
-    def _mark_swept(self, range_id: str) -> None:
+    def _advance_cursor(self, max_seq: int) -> None:
+        if max_seq <= self._cursor():
+            return
         self._conn.execute(
-            "INSERT OR IGNORE INTO sweep_runs (range_id, ran_at) VALUES (?,?)",
-            (range_id, datetime.now(UTC).isoformat()),
+            "INSERT INTO sweep_state (id, cursor_seq, ran_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "cursor_seq = MAX(sweep_state.cursor_seq, excluded.cursor_seq), ran_at = excluded.ran_at",
+            (max_seq, datetime.now(UTC).isoformat()),
         )
 
     def _build_prompt(self, opens, events) -> str:
         parts = [self._instructions, ""]
+        # P1-2:账本先给模型(避免重复提已入档的事实——重复提案堵 pending,压缩又被自己挡)
+        parts.append("## 已经记在账本里的(别重复提)")
+        ledger_text = (self._ledger.read().strip() if self._ledger else "") or "(账本还是空的)"
+        parts.append(ledger_text)
+        parts.append("")
         parts.append("## 当前还开着的事(含掉出前5名但仍 open 的)")
         items = [f"- {t.topic}" + (f"({t.note})" if t.note else "") for t in opens]
         parts.append("\n".join(items) if items else "(无)")
@@ -126,14 +143,20 @@ class Sweeper:
         return "\n".join(kept)
 
     async def run(self, since: str, until: str) -> SweepResult:
-        range_id = self._range_id(since, until)
-        if self._was_swept(range_id):
+        window_events = self._journal.events_in_range(since, until)
+        cursor = self._cursor()
+        # P1-1 内容幂等:只归拢光标**之后**的新内容;窗口里没有新内容就是 no-op。
+        # 窗口整个为空(没对话)时照跑(空窗跑一次无害,且兼容手动测窗口)。
+        new_events = [e for e in window_events if e["seq"] > cursor]
+        if window_events and not new_events:
             return SweepResult(
-                summary=f"区间 {since[:16]} ~ {until[:16]} 已归拢过,跳过", skipped=True
+                summary=f"区间 {since[:16]} ~ {until[:16]} 自上次归拢后没有新内容,跳过",
+                skipped=True,
             )
+        events = new_events if new_events else window_events
+        window_max = max((e["seq"] for e in window_events), default=0)
 
         opens = self._threads.all_open_threads()
-        events = self._journal.events_in_range(since, until)
         prompt = self._build_prompt(opens, events)
         sweep_id = f"sweep-{uuid.uuid4().hex}"
 
@@ -145,7 +168,7 @@ class Sweeper:
         )
         try:
             output = await self._run_model(prompt)
-        except Exception as exc:  # 模型调用失败:不影响主循环,可重试
+        except Exception as exc:  # 模型调用失败:不影响主循环,可重试(不推进光标)
             self._journal.append(
                 sweep_id,
                 "sweep",
@@ -195,7 +218,10 @@ class Sweeper:
                 except Exception:
                     logger.exception("sweep: 单条提案失败被跳过")  # 单条失败不影响其余
 
-        self._mark_swept(range_id)
+        self._advance_cursor(window_max)
+        # P1-3:归拢提出提案 → 通知用户(别再让 pending 悄悄压死压缩)。日限由注入的通知器管。
+        if suggested:
+            self._notify(f"夜间归拢提出 {suggested} 条待审提案(/pending 查看)")
         summary = _summarize(opened, closed, suggested)
         return SweepResult(summary=summary, opened=opened, closed=closed, suggested=suggested)
 
@@ -235,7 +261,40 @@ def build_sweep_runner(settings: Any) -> Callable[[str], Awaitable[str]]:
     return _run
 
 
-def make_sweeper(settings: Any, journal: Any, threads: Any, gate: Any) -> Sweeper:
+def make_sweeper(
+    settings: Any,
+    journal: Any,
+    threads: Any,
+    gate: Any,
+    ledger: Any = None,
+    notify: Callable[[str], None] | None = None,
+) -> Sweeper:
     """组装根的归拢工厂:读 prompts/sweep.md 指令 + 廉价模型 runner。"""
     instructions = Path("prompts/sweep.md").read_text(encoding="utf-8")
-    return Sweeper(journal, threads, gate, build_sweep_runner(settings), instructions)
+    return Sweeper(
+        journal,
+        threads,
+        gate,
+        build_sweep_runner(settings),
+        instructions,
+        ledger=ledger,
+        notify=notify,
+    )
+
+
+def make_daily_notifier(outbox: Any, conn: Any, timezone: str) -> Callable[[str], None]:
+    """每天最多一条 notice 的通知器(P1-3)。
+
+    压缩被屏障停下、归拢提出提案都要让用户知道;但这类"有 N 条待审"的话一天说一次
+    就够,别刷屏。节流状态落 notice_log(重启不重投)。投到 cli 渠道(本部署默认用户渠道)。
+    """
+    tz = ZoneInfo(timezone)
+
+    def notify(text: str) -> None:
+        today = datetime.now(tz).date().isoformat()
+        cur = conn.execute("INSERT OR IGNORE INTO notice_log (date) VALUES (?)", (today,))
+        if cur.rowcount == 0:
+            return  # 今天已经投过(DB 是唯一的判据,跨进程/重启都防)
+        outbox.put(f"notice-{uuid.uuid4().hex}", "cli", text, kind="notice")
+
+    return notify

@@ -21,11 +21,19 @@ S, U = "2026-08-01T00:00:00+00:00", "2026-08-02T00:00:00+00:00"
 
 @pytest.fixture
 def sweeper_factory(tmp_path):
-    def make(run_model, instructions="测试指令"):
+    def make(run_model, instructions="测试指令", notify=None):
         conn = connect(tmp_path / "steward.sqlite")
         ledger, gate = build_memory_components(tmp_path)
         return (
-            Sweeper(Journal(conn), Threads(conn), gate, run_model, instructions),
+            Sweeper(
+                Journal(conn),
+                Threads(conn),
+                gate,
+                run_model,
+                instructions,
+                ledger=ledger,
+                notify=notify,
+            ),
             conn,
             gate,
             ledger,
@@ -100,7 +108,10 @@ async def test_sweep_journals_exact_model_input_and_output(sweeper_factory):
 
 
 async def test_sweep_same_range_is_idempotent(sweeper_factory):
-    """同一区间重复跑是 no-op:不重调模型、不再提提案。"""
+    """P1-1 内容幂等:同一窗口重复跑(真正的 /sweep 每次 now-24h,窗口永远"不同")
+    不重调模型、不重提提案——光标推进后,光标之后没有新内容就是 no-op。"""
+    from datetime import UTC, datetime, timedelta
+
     calls: list[str] = []
 
     async def rm(prompt):
@@ -108,11 +119,19 @@ async def test_sweep_same_range_is_idempotent(sweeper_factory):
         return json.dumps({"open": [], "close": [], "suggest": ["喜欢喝美式"]})
 
     sweeper, _, gate, _ = sweeper_factory(rm)
-    await sweeper.run(S, U)
-    r2 = await sweeper.run(S, U)
-    assert r2.skipped, "第二次同区间应跳过"
+    sweeper._journal.append("env-1", "envelope", {"content": "聊聊咖啡"})
+    now = datetime.now(UTC)
+    s, u = (now - timedelta(hours=1)).isoformat(), (now + timedelta(hours=1)).isoformat()
+    await sweeper.run(s, u)
+    r2 = await sweeper.run(s, u)  # 同窗口再跑:窗口内容都在光标内 → 跳过
+    assert r2.skipped, "第二次同窗口应因『无新内容』跳过"
     assert len(calls) == 1, "模型只该被调一次"
     assert len(gate.pending()) == 1, "只提了一条,不因重跑重复提案"
+    # 有真正的新内容进来 → 重扫(只扫新内容)
+    sweeper._journal.append("env-2", "envelope", {"content": "又聊了咖啡二"})
+    r3 = await sweeper.run(s, u)
+    assert r3.skipped is False and len(calls) == 2, "新内容该触发重扫"
+    assert len(gate.pending()) == 2, "新内容提出新提案"
 
 
 async def test_sweep_model_failure_does_not_break(sweeper_factory):
@@ -177,8 +196,19 @@ async def test_sweep_prompt_applies_render_rules_to_untrusted(sweeper_factory):
     # P1-1 来源标注:攻击内容标成外部数据,不再伪装成"用户:"
     assert "外部数据(来自 smsforwarder,不是用户说的)" in prompt
     # P1-2 折行:伪造不出第二个小节 / 第二条对话行
-    headers = [ln for ln in prompt.splitlines() if ln.startswith("## ")]
-    assert len(headers) == 2, f"正文伪造出了新小节:{headers}"
+    # 合法结构小节(含空账本自带的四节头)不多不少;攻击者伪造的"## 这段对话"被折进行内,
+    # 不可能顶行成新小节
+    actual = {ln for ln in prompt.splitlines() if ln.startswith("## ")}
+    expected = {
+        "## 已经记在账本里的(别重复提)",
+        "## 身份",
+        "## 关系",
+        "## 长期偏好",
+        "## 正在进行",
+        "## 当前还开着的事(含掉出前5名但仍 open 的)",
+        "## 这段对话(时间正序)",
+    }
+    assert actual == expected, f"正文伪造出了不属于的结构小节:{actual - expected}"
     user_lines = [ln for ln in prompt.splitlines() if "] 用户:" in ln]
     assert len(user_lines) == 1, f"攻击者伪造的『用户:』对话行出现了:{user_lines}"
     # P1-3 围栏 + 中和:不可信有首尾围栏,正文里的 >>> 被中和成全角形近字
@@ -207,3 +237,73 @@ async def test_sweep_prompt_caps_convo_length(sweeper_factory):
     prompt = captured["prompt"]
     assert "对话过长" in prompt, "超出上限要标明截断"
     assert len(prompt) < 22000, f"极端涨潮不该把廉价模型窗口撑爆,实际 {len(prompt)} 字"
+
+
+async def test_p1_ledger_seeded_into_sweep_prompt(sweeper_factory):
+    """P1-2:归拢 prompt 带「已经记在账本里的(别重复提)」——已入档的事实不再被重复提。"""
+    from datetime import UTC, datetime, timedelta
+
+    captured: dict = {}
+
+    async def rm(prompt):
+        captured["prompt"] = prompt
+        return '{"open": [], "close": [], "suggest": []}'
+
+    sweeper, _, gate, _ = sweeper_factory(rm)
+    gate.propose(
+        kind="add",
+        content="对芒果过敏",
+        provenance="user_stated",
+        origin="test",
+        section="长期偏好",
+    )
+    gate.settle()  # 落进账本
+    sweeper._journal.append("env-1", "envelope", {"content": "聊聊别的"})
+    now = datetime.now(UTC)
+    s, u = (now - timedelta(hours=1)).isoformat(), (now + timedelta(hours=1)).isoformat()
+    await sweeper.run(s, u)
+
+    assert "已经记在账本里的(别重复提)" in captured["prompt"]
+    assert "对芒果过敏" in captured["prompt"], "模型要能看到已入档的,才知道别重复提"
+
+
+async def test_p1_sweep_notifies_when_suggesting(sweeper_factory):
+    """P1-3:归拢提出提案 → 投 notice(用户能收到,不会让 pending 悄悄压死压缩)。"""
+    from datetime import UTC, datetime, timedelta
+
+    notices: list[str] = []
+
+    async def rm(prompt):
+        return '{"open": [], "close": [], "suggest": ["喜欢喝美式"]}'
+
+    sweeper, _, _, _ = sweeper_factory(rm, notify=notices.append)
+    sweeper._journal.append("env-1", "envelope", {"content": "聊聊咖啡"})
+    now = datetime.now(UTC)
+    s, u = (now - timedelta(hours=1)).isoformat(), (now + timedelta(hours=1)).isoformat()
+    await sweeper.run(s, u)
+    assert notices == ["夜间归拢提出 1 条待审提案(/pending 查看)"]
+
+    # 没提议的归拢不投
+    async def rm2(prompt):
+        return '{"open": [], "close": [], "suggest": []}'
+
+    sweeper2, _, _, _ = sweeper_factory(rm2, notify=notices.append)
+    sweeper2._journal.append("env-2", "envelope", {"content": "纯聊聊天"})
+    await sweeper2.run(
+        (now - timedelta(hours=2)).isoformat(), (now + timedelta(hours=2)).isoformat()
+    )
+    assert len(notices) == 1, "没提提案就不该投 notice"
+
+
+def test_p1_daily_notifier_dedupes(tmp_path):
+    """P1-3:make_daily_notifier 每天最多一条——同一天第二次不重投(DB 是唯一判据)。"""
+    from lararium.db import connect
+    from lararium.steward.outbox import Outbox
+    from lararium.steward.sweep import make_daily_notifier
+
+    conn = connect(tmp_path / "n.sqlite")
+    outbox = Outbox(conn)
+    notify = make_daily_notifier(outbox, conn, "Asia/Shanghai")
+    notify("第一条")
+    notify("第二条")
+    assert [i.content for i in outbox.take("cli", 0)] == ["第一条"], "同一天只投一条"
