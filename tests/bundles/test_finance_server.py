@@ -1,6 +1,6 @@
 """finance bundle 的骨架契约测试(M4-1)。
 
-M4-1 不测工具行为(那是 M4-2/3/4 的活),测的是四条骨架契约:
+M4-1 不测工具行为(record_expense 的行为在 test_finance_record.py),测的是四条骨架契约:
 1. finance 独占自己的 SQLite,落在自己的目录下(§5 数据产权);
 2. finance 的库与 steward 的库物理分离、零表重叠(不许碰 steward.sqlite);
 3. 工具顺序冻结,且 manifest 声明 == 实现暴露(工具 schema 是前缀第0层);
@@ -17,7 +17,7 @@ from bundles.finance.server import build
 
 @pytest.fixture
 def runtime(tmp_path):
-    return build(tmp_path)
+    return build(tmp_path, timezone="Asia/Shanghai")
 
 
 def test_build_creates_own_sqlite_in_own_dir(runtime, tmp_path):
@@ -36,7 +36,10 @@ def test_finance_db_never_leaks_into_steward_sqlite(runtime, tmp_path):
     fin = sqlite3.connect(tmp_path / "finance" / "finance.sqlite")
     fin_tables = {
         r[0]
-        for r in fin.execute("SELECT name FROM sqlite_master WHERE type IN ('table','virtual')")
+        for r in fin.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','virtual')"
+            " AND name NOT LIKE 'sqlite_%'"
+        )
     }
     fin.close()
     assert fin_tables  # 独占库里确实建了东西,重叠检查不是空断言
@@ -46,7 +49,10 @@ def test_finance_db_never_leaks_into_steward_sqlite(runtime, tmp_path):
     conn = connect(tmp_path / "steward.sqlite")
     stew_tables = {
         r[0]
-        for r in conn.execute("SELECT name FROM sqlite_master WHERE type IN ('table','virtual')")
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','virtual')"
+            " AND name NOT LIKE 'sqlite_%'"
+        )
     }
     conn.close()
     assert not (stew_tables & fin_tables), (
@@ -56,15 +62,21 @@ def test_finance_db_never_leaks_into_steward_sqlite(runtime, tmp_path):
 
 
 def test_build_is_idempotent_and_reentrant(tmp_path):
-    """服务器重启/测试反复装配不炸、不留重复表。"""
-    build(tmp_path)
-    build(tmp_path)
+    """服务器重启/测试反复装配不炸、不留重复表,也不清掉已有流水。"""
+    tool = next(
+        f for f in build(tmp_path, timezone="Asia/Shanghai").tools if f.__name__ == "record_expense"
+    )
+    tool(45, "餐饮")
+    build(tmp_path, timezone="Asia/Shanghai")
+
     conn = sqlite3.connect(tmp_path / "finance" / "finance.sqlite")
-    n_meta = conn.execute(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='meta'"
+    n_expenses = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='expenses'"
     ).fetchone()[0]
+    n_rows = conn.execute("SELECT count(*) FROM expenses").fetchone()[0]
     conn.close()
-    assert n_meta == 1
+    assert n_expenses == 1
+    assert n_rows == 1, "重新 build 不许把已经记下的流水冲掉"
 
 
 def test_tool_order_is_frozen_and_matches_manifest(runtime):

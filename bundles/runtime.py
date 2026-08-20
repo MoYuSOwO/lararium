@@ -1,6 +1,7 @@
 """领域 bundle 的统一构造出口。
 
-每个领域 bundle 暴露 `build(data_dir) -> BundleRuntime`,组装根拿它拼工具列表。
+每个领域 bundle 暴露 `build(data_dir, *, ...) -> BundleRuntime`,组装根拿它拼工具列表;
+运行期需要的东西(时区之类)由组装根按关键字注入,bundle 不许自己兜默认值。
 memory 是特殊 bundle(§6.1:ledger/gate 走 Steward 的 ports,不试图抹平),不进这个
 通用形状。
 """
@@ -16,6 +17,9 @@ class BundleRuntime:
     tools 是模型可调的工具函数列表,**顺序即冻结顺序**(工具 schema 是前缀第0层,
     DESIGN §4);manifest.yaml 的 tools 顺序是设计时的权威,实现必须逐名对齐。
     bundle 的独有资产不进这里,由各 bundle 自己定义并交给需要的消费者。
+
+    **本模块只放形状,不放行为。** 它是两个 bundle 共享的模块,independence 契约管不到
+    它——一旦往里塞逻辑,bundle 之间就开始背着契约共享东西,而边界是这个项目的命根子。
     """
 
     tools: list[Callable] = field(default_factory=list)

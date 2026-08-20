@@ -85,3 +85,16 @@ def test_duplicate_bundle_names_are_rejected(tmp_path):
 
     with pytest.raises(ValueError, match="重名"):
         Registry.load(tmp_path)
+
+
+def test_every_registered_bundle_has_a_readable_overview(registry):
+    """每个注册进来的 bundle 都必须有能读到的总览(M4-1 登记一的结构性一半)。
+
+    persona 的路由规则是「动手做某个领域的事之前先 read_skill 读总览」——这条规矩
+    只有在总览**确实存在**时才兑现得了。finance 是第一个撞上的:它的要点
+    (别把流水记进账本)只写在 SKILL.md 里,`skills: []` 让目录行连个方法名都不列,
+    总览要是再缺失,那段话就成了谁也走不到的正文。
+    """
+    for bundle in registry.bundles:
+        text = registry.read_skill(bundle.name)
+        assert text.strip(), f"{bundle.name} 的 SKILL.md 是空的——总览不可达"

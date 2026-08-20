@@ -5558,3 +5558,226 @@ ingest token GET /v1/outbox → 403(设计如此)
 
 前三轮修的东西在真机上全都还成立,没有互相碰坏。第四轮这条不拦 M3 收口
 ——它要等 M4 的渠道定型才有正确答案。
+
+---
+
+# M4 · 第一个领域 bundle(财务·对话侧)
+
+## M4-1:bundle 骨架 + 统一构造入口
+
+**契约验收点逐条(可自己复跑)**:
+
+1. **注册表自动发现**:`Registry.load(Path("bundles"))` 认出 finance,目录行出现
+   `- finance:记账与消费分析`;`tests/steward/test_registry.py` 的确定性测试覆盖
+   「跨两次加载字节相同」。加 bundle **没有改一行注册代码**——扔目录即发现。
+2. **四条 import 契约 KEPT**:`.importlinter` 给 `bundles.finance` 加入了
+   `bundles-are-independent`(finance ↔ memory 互不依赖);finance → steward/gateway
+   本就在禁入面里。gate 输出 4 kept / 0 broken。
+3. **数据产权**:`build(data_dir)` 只建 `data_dir/finance/finance.sqlite`;
+   `tests/bundles/test_finance_server.py::test_finance_db_never_leaks_into_steward_sqlite`
+   把两库建在同一 data_dir,断言 finance 表与 steward 表**零重叠**。
+4. **统一构造入口**:`build(data_dir) -> BundleRuntime`(`bundles/runtime.py`,至少
+   含 `tools: list[Callable]`),这是领域 bundle 的契约;**memory 没有套这个形状**——
+   按计划的「不要试图抹平」,memory 的 ledger/gate 走 Steward 的 ports(§6.1 特殊
+   地位),保留 `build_memory_components`/`memory_tool_functions`。若你要 memory 也
+   走 `build`,说一声我再补一层。
+5. **组装根显式小表**:`build_steward` 里写死的 `memory_tool_functions(gate)` 换成
+   `_assemble_bundle_tools(data_dir, gate)`——memory 工具在前、finance 追加在后;
+   `test_bundle_tool_order_memory_first_finance_appended` 把顺序钉死为
+   `[propose_fact, list_pending, record_expense, query_spending, list_recent]`。
+   **没做动态装配加载器**(照 PLAN 的理由:import-linter 静态可证 > 运行时约定)。
+
+**工具骨架态(如实说明)**:M4-1 里三个工具**签名/文档已定死、函数体是 E2 式人话
+占位**(「记一笔还没接通,这笔先没记」)。这是因为工具 schema 是前缀第0层、顺序
+冻结后不许再动——要一次定住 schema,就不能等 M4-2/3/4 才造出签名。正体实现在
+M4-2/3/4 落进来,只换函数体、不动签名。若你认为骨架态占位不可接受(哪怕跨里程碑),
+我会把 M4-2 的 `record_expense` 提前到本步。
+
+**前缀影响(一次性)**:目录行 +1 行、工具 schema +3(record_expense/query_spending/
+list_recent)——D3 认可的重建点(注册表/工具变更 = 重启),之后字节稳定。
+`manifest.tools` 顺序即冻结顺序,被 `test_tool_order_is_frozen_and_matches_manifest`
+钉住。
+
+**门禁**:270 passed(261 → +9:registry +1、finance 骨架 7、组合顺序 +1),mypy 31
+files,import-linter 4 kept,ruff/format 全绿。
+
+**提交**:`13dc94a` feat(M4-1)。工作树干净。等你验收再进 M4-2。
+
+### 验收结论:**通过**(2026-08-21)
+
+**实跑复核**(不是照抄自述):
+
+```
+ruff ✓ / format 61 files ✓ / mypy 31 files ✓ / lint-imports 4 kept 0 broken / pytest 270 passed
+目录行 '- finance:记账与消费分析',跨两次 Registry.load 字节相同 ✓
+build(tmp) 只造 finance/finance.sqlite,data_dir 下无第二个库 ✓
+manifest.tools == 实现暴露 == [record_expense, query_spending, list_recent] ✓
+_assemble_bundle_tools == [propose_fact, list_pending, record_expense, query_spending, list_recent] ✓
+```
+
+契约层干净:扔目录即发现、注册代码零改动;显式小表的取舍认可。两个旧测试原本拿
+"finance" 当「不存在的 bundle」占位,改成 `health` 并注明原因——正确处理,不是掩盖。
+
+#### 登记一:SKILL.md 是不可达的正文(**M4-2 硬前置**,不拦 M4-1)
+
+模型在前缀里关于 finance 能看到的**全部**内容,实测只有一行:
+
+```
+'- finance:记账与消费分析'
+```
+
+`别把这些流水记进账本` 只存在于 `bundles/finance/skills/SKILL.md`,唯一入口是模型
+主动调 `read_skill("finance")`。而 persona 的路由规则是「**目录行只告诉你某个领域有
+哪些方法**,要用就先 read_skill」——finance 目录行一个方法都没列(`skills: []`,
+`directory_lines()` 只在 skills 非空时拼 `[skills: ...]` 后缀)。同时 `record_expense`
+凭 schema 直接可调,没有任何一步逼它先读。
+
+**后果**:M4-2 一落地,模型就会在从没读过那段话的前提下开始记账——而那段话是 M4-5
+唯一的成文防线。今天不咬人(函数体是占位、无人在跑),所以不拦 M4-1。
+
+**这是注册表的设计缺口,不是 finance 写漏**:任何把要点写在总览 SKILL.md、`skills`
+为空的 bundle 都会隐身。finance 是第一个撞上的。
+
+**M4-2 验收条件**:真模型验证,须证明该段落确实进了模型上下文(或存在等价的强制
+路径);证不出来不收。这正是 M2/M3 审计的同一课——**防护存在,但没人真的走到那里**。
+
+#### 登记二:「此后字节稳定」说过头
+
+已排着两次重建:(a) M4-4 往 `manifest.skills` 加 `monthly-review`,目录行即变;
+(b) **docstring 就是 schema**,而当前 docstring 承诺了尚未实现的行为(固定七类目、
+上限 20、聚合在 SQL 内完成)。故「只换函数体、不动签名」须读成**连 docstring 也不动**;
+确需修改的,在回报里明说,不许让前缀重建悄悄发生。
+
+#### 对程序员两个提问的答复:**均保持现状**
+
+- **骨架态占位可接受**,不要把 M4-2 提前。schema 一次定死对前缀第0层是对的;占位话
+  符合 E2(告诉模型这步没成,而非假装成了)。条件:别在此状态停留,M4-2 紧接着做。
+- **不要给 memory 补 `build` 层**。memory 是 §6.1 特殊 bundle,ledger/gate 走 ports 是
+  刻意的;为形状统一再开一条通往同一批组件的路,等于给「账本只有一条写入路径」加岔口。
+
+#### 小事(不阻塞,M4-2 顺手处理)
+
+- `meta` 表建了无人用(仅为让产权测试的 `assert fin_tables` 不空转)——要么派用场
+  (schema 版本),要么删。
+- 零重叠测试比的是两个独立库的**表名**:确实能抓住真违规(finance 写进 steward.sqlite),
+  但也顺带禁止 finance 复用任何 steward 已用的表名。steward 现有 19 张表、无 `meta`,
+  暂有余量;将来若撞名会因非实质原因红灯。加行注释即可。
+- `bundles/runtime.py` 是两 bundle 的共享模块,independence 契约管不到它。**保持纯形状、
+  不放行为**——一放行为,bundle 之间就开始背着契约共享东西。
+
+---
+
+## M4-2:记一笔
+
+**先说结论**:PLAN 的四条验收点全部落地并经变异检查;**M4-1 登记一的硬前置没能闭合**
+——你建议的 persona 修法实测挡不住,数据在下面。M4-2 的代码可以验收,那条前置需要你拍板
+走哪条路。
+
+### 一、PLAN M4-2 四条(可自己复跑)
+
+`uv run pytest tests/bundles/test_finance_record.py -v`,8 条:
+
+1. **落库 + 人话确认**:`record_expense(45, "餐饮", note="公司楼下")` 落一行,回
+   「记好了:餐饮 45.00 元(08-21 06:43,公司楼下)。」
+2. **金额存整数分**:`amount_cents` 是 INTEGER,换算走 `Decimal(str(amount)) * 100`
+   四舍五入,不碰浮点。
+3. **类目固定七类**(餐饮|交通|日用|娱乐|医疗|人情|其他):非法类目返回可读提示并列出
+   全部合法值,**不抛**(E2),且不落库。
+4. **`occurred_at` 缺省为"现在"**,且是**配置时区**的现在;给了就用给的。
+
+外加三条边界(都由 E2 兜住、都不落库):非正数金额、看不懂的时间、带偏移的时间
+(先 `astimezone` 折回配置时区再落库)。
+
+### 二、变异检查:9 条变异,9 条被咬住
+
+「运行测试确认失败」那一步我做的是变异检查而不是只看首次红——首次红只是
+`ImportError: CATEGORIES`,那证明不了每条断言各自咬得住什么。逐条把实现改坏再跑:
+
+```
+浮点金额(amount * 100)          → 红    截断(int(amount * 100))        → 红
+类目不校验                        → 红    缺省时间读系统本地时区           → 红
+看不懂的时间静默退回"现在"        → 红    带偏移的时间原样存               → 红
+只回确认不落库                    → 红    无视传入的 occurred_at           → 红
+finance 的 SKILL.md 被清空        → 红(registry 那条新测试)
+```
+
+**其中一条第一版是绿的,必须记下来**:金额测试原本用 0.1 / 0.2,把实现换成
+`return amount * 100` 它照样绿。两个原因叠在一起——`0.1 * 100` 在 IEEE754 里正好是
+`10.0`(会漂的是 `0.1+0.2`,不是这个乘法),而 SQLite 的 INTEGER 亲和性还会把整数值的
+浮点**悄悄收成整数**(`10.0` → `integer 10`)。也就是说浮点实现能大摇大摆过那一版测试。
+换成 `1.005`(`* 100` = `100.49999999999999`,浮点路径要么截成 100 少收一分、要么落成
+REAL)后才咬得住。这条教训写进测试 docstring 了,那三个值不许改成"更自然"的数字。
+
+### 三、硬前置:没闭合,数据如下
+
+真模型跑「我今天吃饭花了 45」,从**起居注**取证(不看回复文本猜):
+`read_skill` 的 `tool_result` 里是否逐字含 SKILL.md 全文,且 seq 早于
+`record_expense` 的 `tool_call`。2026-08-21,mimo-v2.5,每档 5 次:
+
+| 配置 | 读了总览 |
+|---|---|
+| M4-1 原版 persona(基线) | 1/5 |
+| M4-2 新版 persona(「动手做某个领域的事之前先 read_skill 读总览」) | 2/5 |
+| 新版 persona + 目录行加 `[用前先 read_skill("finance")]` | 2/5 |
+
+三档在 n=5 下互相区分不开,合计 **5/15 ≈ 33%**。不读的那些直接就调 `record_expense`。
+**结论:靠 prompt 让模型先读总览不是机制,是概率。** 你建议的修法我照做了(persona
+那句现在是"目录行只告诉你有哪些领域;动手前先 read_skill 读总览",对以后每个 bundle
+都成立,比原文更准——原文说"目录行告诉你有哪些方法",而 finance 一个方法都没列),
+但它不足以支撑「证明那段正文进了模型上下文」。目录行那一版是我加的实验,**已还原**,
+`registry.py` 零改动。
+
+**为什么必然如此**(这条比数字重要):`recent_turns` 只把 user/assistant 正文带进 L0,
+**tool_result 不跨轮存活**。所以"读了再干"这条规矩在每一轮都要重付一次工具往返,
+模型跳过它是省钱的理性选择,不是不听话。软提示改不动这个激励。
+
+两条自洽的出路,我不替你选:
+
+- **甲·强制路径**:Steward 按注册表把「工具 → 所属 bundle」映射起来,本轮没读过该
+  bundle 总览就拒绝它的工具(返回 E2 人话 + 让模型去读)。**能证死**,代价是每个记账/
+  查账轮固定多一次往返,而且会连带 memory(§6.1 特殊 bundle)和 M4-3/4-4 的查询工具,
+  属于动 Steward 核心的改动,该单开一步而不是塞进 M4-2。
+- **乙·硬边界上移**:承认 SKILL.md 只能承载**方法论**(A7 本来就是这个意思),
+  把「流水不进账本」这种**硬边界**放进始终在场的前缀(persona 已经装着入档纪律和变化
+  频率轴,它天然是这条的家)。代价是前缀多两行;好处是零往返、100% 在场。
+  **但这块地是 M4-5 的**(它计划改 `writing-facts.md`),所以我没动——顺带提醒:
+  `writing-facts.md` 也是 skill 文件,同一个可达性问题,M4-5 会原样撞上。
+
+`tests/test_live_finance_skill.py` **故意留红**并 `-m live` 隔在门禁外(无 API key 自动
+skip)。它红着就是"这条前置还没兑现"的可执行形式;把它改绿的正确方式是给强制路径,
+不是放松断言。
+
+### 四、顺手清的两件小事
+
+- **`meta` 表:删了**。它当初存在只是为了让产权测试的 `assert fin_tables` 不空转,
+  现在 `expenses` 顶上了。没选"派用场(schema 版本)":单用户本地库、代码和库总是一起
+  发布,一个没人读的版本号是摆设,真到要迁移那天再加才知道该长什么样(G5)。
+  幂等测试同步改成数 `expenses`,并多断言一条「重新 build 不许冲掉已有流水」。
+- **`bundles/runtime.py` 保持纯形状**:一行行为都没加,并把"为什么不许加"写进 docstring
+  (共享模块不受 independence 契约保护)。
+- 顺带把零重叠测试的判据写清楚了,并排除 `sqlite_%` 内部表——`expenses` 用了
+  AUTOINCREMENT,SQLite 会生 `sqlite_sequence`,而 steward 那边也有,不排除这条会因为
+  一个纯实现细节常红(正是登记里预警的"非实质原因红灯")。
+
+### 五、偏离计划的地方(都不是悄悄发生的)
+
+1. **`build(data_dir)` → `build(data_dir, *, timezone)`**,组装根传 `settings.timezone`。
+   M4-1 冻的是这个形状,我改了它。理由:"缺省用当前时间"必须有个时钟,而 bundle
+   不许 import `lararium.config`(它是未来的独立容器,现在零依赖)。若在 bundle 里兜
+   一个默认时区,就和 `Settings.timezone` 各走各的——用户改了配置、账本还按老时区记,
+   正是 M1 Task 9 修过的那个 8 小时时差。**不影响前缀**(`build` 不是模型可见的工具)。
+   `runtime.py` 的契约文字与 `_assemble_bundle_tools` 签名同步更新。
+2. **docstring 一字未动**(登记二的要求):`record_expense` 的实现严格按 M4-1 已经承诺
+   的那份写——七类目、元转整数分、缺省现在。没有前缀重建。
+3. **`record_expense` 保持 4 个位置参数,没按 F3 改 keyword-only**:签名在 M4-1 冻结,
+   而模型侧是按名字传 JSON、不存在位置错乱,A1(前缀是禁区)在这里优先于 F3。
+4. **`occurred_at` 落库不带时区偏移**,存配置时区的墙上时间。SQLite 的 `date()` 见到
+   偏移会先折回 UTC 再切天(`date('2026-08-21T01:00:00+08:00')` = 2026-08-20),
+   原样存会让 M4-3 的按天/按月分组静悄悄错一天。理由写在 schema 上方。
+5. **多加了一条注册表测试** `test_every_registered_bundle_has_a_readable_overview`:
+   登记一说"这是注册表的设计缺口",这条守住结构性的那一半(总览必须存在且非空)。
+
+**没做的**(按你的纪律):没把 M4-3/4-4 的函数体提前;没碰流水的 propose 逻辑(M4-5)。
+
+**门禁**:279 passed + 1 skipped(live),mypy 31 files,import-linter 4 kept 0 broken,
+ruff/format 全绿。CHANGELOG 补了 `## M4` 段 + M4-1 一行,进度表 M4 改「🔄 进行中」。

@@ -76,7 +76,7 @@ def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
     from lararium.gateway.server import _assemble_bundle_tools
 
     _ledger, gate = build_memory_components(tmp_path)
-    names = [f.__name__ for f in _assemble_bundle_tools(tmp_path, gate)]
+    names = [f.__name__ for f in _assemble_bundle_tools(tmp_path, gate, "Asia/Shanghai")]
     assert names == [
         "propose_fact",  # memory[0]
         "list_pending",  # memory[1]
