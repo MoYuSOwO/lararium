@@ -67,6 +67,25 @@ def server(tmp_path, monkeypatch):
     return app, steward
 
 
+def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
+    """组装根的显式小表:M4-1 起 memory 工具在前、finance 追加在后。
+
+    工具 schema 是前缀第0层,顺序一旦定了不许再动——这条把组合顺序钉死,
+    免得哪天有人把 finance 插到 memory 前面(或反过来)还自以为是排序优化。
+    """
+    from lararium.gateway.server import _assemble_bundle_tools
+
+    _ledger, gate = build_memory_components(tmp_path)
+    names = [f.__name__ for f in _assemble_bundle_tools(tmp_path, gate)]
+    assert names == [
+        "propose_fact",  # memory[0]
+        "list_pending",  # memory[1]
+        "record_expense",  # finance[0]
+        "query_spending",  # finance[1]
+        "list_recent",  # finance[2]
+    ]
+
+
 def test_no_token_or_wrong_token_returns_generic_401(server):
     app, _ = server
     client = TestClient(app)

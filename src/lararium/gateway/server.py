@@ -9,11 +9,13 @@ import asyncio
 import contextlib
 import hmac
 import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
+from bundles.finance.server import build as build_finance
 from bundles.memory.server import build_memory_components, memory_tool_functions
 from pydantic import ValidationError
 from starlette.applications import Starlette
@@ -43,6 +45,19 @@ _UNAUTHORIZED = JSONResponse({"error": "未授权"}, status_code=401)
 _FORBIDDEN = JSONResponse({"error": "无权限"}, status_code=403)
 
 
+def _assemble_bundle_tools(data_dir: Path, gate: Any) -> list[Callable]:
+    """组装根的显式小表:加一个领域 bundle,在这里加一行。
+
+    memory 是特殊 bundle(§6.1,ledger/gate 走 Steward 的 ports,不试图抹平),
+    工具**仍排最前**;领域 bundle 走统一构造入口 `build(data_dir) -> BundleRuntime`,
+    追加在后。顺序即工具 schema(前缀第0层),`test_bundle_tool_order_*` 把它钉死——
+    一旦定了不许再动,免得哪天有人把 finance 插到 memory 前面还自认为是排序优化。
+    """
+    tools: list[Callable] = list(memory_tool_functions(gate))
+    tools.extend(build_finance(data_dir).tools)  # 每加一个领域,这里加一行
+    return tools
+
+
 def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
     """组装 Steward。这是全系统唯一允许 import bundles 的地方之一(组装根)。
 
@@ -63,7 +78,7 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
         outbox=Outbox(conn),
         threads=Threads(conn),
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
-        bundle_tools=memory_tool_functions(gate),
+        bundle_tools=_assemble_bundle_tools(settings.data_dir, gate),
     )
 
 

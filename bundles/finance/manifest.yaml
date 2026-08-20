@@ -1,0 +1,6 @@
+name: finance
+description: 记账与消费分析          # 前缀目录行
+skills: []                          # 领域方法(monthly-review)在 M4-4 补
+tools: [record_expense, query_spending, list_recent]   # 顺序即冻结顺序(§5 示例)
+triggers: []
+events: []

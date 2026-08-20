@@ -14,6 +14,13 @@ def test_load_discovers_memory_bundle(registry):
     assert "memory" in [b.name for b in registry.bundles]
 
 
+def test_load_discovers_finance_bundle(registry):
+    """M4-1:扔个目录进来就被发现——目录行(前缀第1层)零改动自动列出来。"""
+    assert "finance" in [b.name for b in registry.bundles]
+    assert "finance" in registry.directory_lines()
+    assert "记账与消费分析" in registry.directory_lines()  # 财务 bundle 的目录行(§5 示例)
+
+
 def test_directory_lines_include_name_description_and_skills(registry):
     lines = registry.directory_lines()
     assert "memory" in lines
@@ -39,8 +46,9 @@ def test_read_skill_with_name_returns_body(registry):
 
 
 def test_read_skill_rejects_unknown_bundle(registry):
-    with pytest.raises(KeyError, match="finance"):
-        registry.read_skill("finance", None)
+    # finance 在 M4-1 已注册,换一个确实不存在的名字来测"未知 bundle"分支
+    with pytest.raises(KeyError, match="health"):
+        registry.read_skill("health", None)
 
 
 def test_read_skill_rejects_path_traversal(registry):

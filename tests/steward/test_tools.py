@@ -31,7 +31,8 @@ def test_read_skill_delegates_to_registry(tools):
 
 def test_read_skill_returns_readable_error_for_unknown(tools):
     """工具报错要让模型能自我纠正,不能抛异常炸掉整轮。"""
-    result = tools.read_skill("finance", None)
+    # finance 在 M4-1 已注册(能读到 SKILL.md);换 health 测"未知 bundle"分支
+    result = tools.read_skill("health", None)
     assert "没有这个 bundle" in result
 
 
