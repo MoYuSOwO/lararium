@@ -42,7 +42,7 @@ def test_read_skill_without_name_returns_overview(registry):
 
 def test_read_skill_with_name_returns_body(registry):
     text = registry.read_skill("memory", "writing-facts")
-    assert "三个判据" in text
+    assert "怎么写账本条目" in text  # 钉正文标题,不钉判据条数(那是会被打磨的内容)
 
 
 def test_read_skill_rejects_unknown_bundle(registry):

@@ -23,7 +23,6 @@ M2/M3 审计九条里有六条是同一个毛病——防护存在,但没人真�
     set -a && source .env && set +a && uv run pytest tests/test_live_finance_skill.py -v -s -m live
 """
 
-import os
 import sqlite3
 from pathlib import Path
 
@@ -31,17 +30,7 @@ import pytest
 
 from lararium.envelope import Envelope
 
-# 模块级抓取:conftest 的 autouse fixture 会在每个测试前清掉所有 LARARIUM_*。
-# 收集期(fixture 跑之前)先把真实配置留在手里,测试里再原样喂回去。
-_LIVE_ENV = {k: v for k, v in os.environ.items() if k.startswith("LARARIUM_")}
-
-pytestmark = [
-    pytest.mark.live,
-    pytest.mark.skipif(
-        not _LIVE_ENV.get("LARARIUM_API_KEY"),
-        reason="真模型验收:需要 LARARIUM_API_KEY(先 set -a && source .env && set +a)",
-    ),
-]
+pytestmark = pytest.mark.live
 
 SKILL_PATH = Path("bundles/finance/skills/SKILL.md")
 
@@ -52,27 +41,9 @@ def skill_text() -> str:
     return SKILL_PATH.read_text(encoding="utf-8").strip()
 
 
-@pytest.fixture
-def steward(tmp_path, monkeypatch):
-    """走**生产的组装根** build_steward,不是测试专用的平行构造——测的才真。
-
-    只把 data_dir 改到 tmp_path:真 key、真模型、真 persona、真 registry、真 bundle 工具。
-    """
-    from bundles.memory.server import build_memory_components
-
-    from lararium.config import Settings
-    from lararium.gateway.server import build_steward
-
-    for key, value in _LIVE_ENV.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
-
-    settings = Settings.load()
-    ledger, gate = build_memory_components(settings.data_dir)
-    return build_steward(settings, ledger, gate)
-
-
-async def test_model_reads_the_finance_overview_before_it_records(steward, tmp_path, skill_text):
+async def test_model_reads_the_finance_overview_before_it_records(
+    live_steward, tmp_path, skill_text
+):
     """一轮"我今天吃饭花了 45":模型必须先读到 finance 总览正文,再动手记账。
 
     断言三件事,全部取自起居注:
@@ -81,11 +52,11 @@ async def test_model_reads_the_finance_overview_before_it_records(steward, tmp_p
     3. 账真的记进了 finance 自己的库(这一轮确实干了活,不是只读不做)。
     """
     env = Envelope.new(source="user", channel="cli", content="我今天吃饭花了 45")
-    steward.submit(env)
-    outcome = await steward.process_next()
+    live_steward.submit(env)
+    outcome = await live_steward.process_next()
     assert outcome.kind == "replied", f"这一轮没走到终态:{outcome}"
 
-    events = steward.journal.replay(env.id)
+    events = live_steward.journal.replay(env.id)
     calls = [(e["seq"], e["payload"].get("tool")) for e in events if e["kind"] == "tool_call"]
     reads = [
         e for e in events if e["kind"] == "tool_result" and e["payload"].get("tool") == "read_skill"

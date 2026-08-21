@@ -26,7 +26,7 @@ def test_current_time_returns_iso_with_configured_zone(tools):
 
 
 def test_read_skill_delegates_to_registry(tools):
-    assert "三个判据" in tools.read_skill("memory", "writing-facts")
+    assert "怎么写账本条目" in tools.read_skill("memory", "writing-facts")
 
 
 def test_read_skill_returns_readable_error_for_unknown(tools):
