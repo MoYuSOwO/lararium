@@ -76,6 +76,29 @@ _GROUP_SQL = {
     ),
 }
 
+# list_recent 的两条查询。日期缺省时用哨兵边界(存的是 'YYYY-MM-DDTHH:MM:SS',字典序
+# 可比),这样 WHERE 恒定、只有 ORDER BY 两种,不必拼 SQL(同 _GROUP_SQL 的理由)。
+_OPEN_LOWER = "0000-01-01"
+_OPEN_UPPER = "9999-12-31"
+_RECENT_COLUMNS = "SELECT occurred_at, category, amount_cents, note FROM expenses"
+_RECENT_WHERE = " WHERE occurred_at >= ? AND occurred_at < ?"
+_RECENT_SQL = {
+    "recent": _RECENT_COLUMNS + _RECENT_WHERE + " ORDER BY occurred_at DESC, id DESC LIMIT ?",
+    # 金额并列时用时间倒序兜底,保证同一份数据每次返回同一个顺序(前缀之外也不该抖)
+    "largest": _RECENT_COLUMNS
+    + _RECENT_WHERE
+    + " ORDER BY amount_cents DESC, occurred_at DESC, id DESC LIMIT ?",
+}
+
+_ORDER_BY = {
+    "recent": "recent",
+    "最近": "recent",
+    "最新": "recent",
+    "largest": "largest",
+    "最大": "largest",
+    "最大额": "largest",
+}
+
 _GROUP_BY = {
     "category": "category",
     "类目": "category",
@@ -239,9 +262,14 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         except sqlite3.Error as exc:  # E2:写不进去也要让模型知道这步没成
             return f"这笔没记进去(库写入失败:{exc})。"
 
-        yuan = f"{Decimal(cents) / 100:.2f}"
-        tail = f",{note}" if note else ""
-        return f"记好了:{category} {yuan} 元({when.strftime('%m-%d %H:%M')}{tail})。"
+        # 备注走 **和 list_recent 同一个** 渲染器。曾经这里是 `f",{note}"` 原样回吐:
+        # 换行没折、围栏没中和,而隔壁 list_recent 渲染得干干净净——同一个文件里两套
+        # 渲染器,正是 assembler.py 记下的那条教训(P1-1:当前轮包了、历史轮没包)。
+        # 共用之后,包裹要么两边都有、要么两边都没有,不会只在一边悄悄退化。
+        return (
+            f"记好了:{category} {_yuan(cents)} 元"
+            f"({when.strftime('%m-%d %H:%M')}){_render_note(note)}。"
+        )
 
     def query_spending(
         since: str,
@@ -299,26 +327,50 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
             lines += [_group_line(r) for r in shown]
         return "\n".join(lines)
 
-    def list_recent(limit: int = 10) -> str:
-        """列出最近几笔流水——全系统唯一返回原始流水的工具,因此硬封顶(上限 20),
-        limit 为负数或超大值都钳制到上限。"""
+    def list_recent(
+        limit: int = 10,
+        since: str | None = None,
+        until: str | None = None,
+        order: str = "recent",
+    ) -> str:
+        """列出流水——全系统唯一返回原始流水的工具,因此硬封顶(上限 20),limit 为负数
+        或超大值都钳制到上限。since/until 格式 YYYY-MM-DD、两端都含,缺省为全时段;
+        order 取 recent(最近的在前)或 largest(金额从大到小)。回答"某段时间最大的
+        一笔"要 order=largest **并且**给上 since/until——只给 order 会答成全时段之最。"""
         # 负数在 SQLite 的 LIMIT 里是"不限制",不钳制就是全表倒进上下文(M3-1 教训)。
-        # 钳的是上界和下界两头:0 或负数取上限、超大值取上限。
         n = MAX_RECENT_ROWS if limit < 1 else min(limit, MAX_RECENT_ROWS)
+        mode = _ORDER_BY.get(order.strip().lower() if isinstance(order, str) else "")
+        if mode is None:
+            return f"看不懂 order「{order}」:只能是 recent(最近的在前)或 largest(金额从大到小)。"
+
+        lower, upper = _OPEN_LOWER, _OPEN_UPPER
+        if since is not None:
+            start = _parse_day(since)
+            if start is None:
+                return f"看不懂日期「{since}」:要 YYYY-MM-DD。相对时间先调 current_time 换算。"
+            lower = start.isoformat()
+        if until is not None:
+            end = _parse_day(until)
+            if end is None:
+                return f"看不懂日期「{until}」:要 YYYY-MM-DD。相对时间先调 current_time 换算。"
+            # 上界取次日零点、开区间,理由同 query_spending(闭区间会吃掉末日带时刻的流水)
+            upper = (end + timedelta(days=1)).isoformat()
+
         try:
-            rows = list(
-                conn.execute(
-                    "SELECT occurred_at, category, amount_cents, note FROM expenses"
-                    " ORDER BY occurred_at DESC, id DESC LIMIT ?",
-                    (n,),
-                )
-            )
+            rows = list(conn.execute(_RECENT_SQL[mode], (lower, upper, n)))
         except sqlite3.Error as exc:  # E2:查不了也要让模型知道,而不是整轮炸掉
             return f"查不了(库读取失败:{exc})。"
 
+        scoped = since is not None or until is not None
         if not rows:
-            return "还没有记过账。"
-        lines = [f"最近 {len(rows)} 笔:"]
+            # "这段没有" ≠ "一笔都没记过":混成一句会让模型以为账本是空的。
+            return (
+                f"{since or '开头'} ~ {until or '现在'} 没有记录。" if scoped else "还没有记过账。"
+            )
+
+        word = "最近" if mode == "recent" else "最大的"
+        scope = f"{since or '开头'} ~ {until or '现在'} " if scoped else ""
+        lines = [f"{scope}{word} {len(rows)} 笔:"]
         for r in rows:
             when = r["occurred_at"].replace("T", " ")[:16]
             lines.append(
