@@ -5781,3 +5781,72 @@ skip)。它红着就是"这条前置还没兑现"的可执行形式;把它改绿
 
 **门禁**:279 passed + 1 skipped(live),mypy 31 files,import-linter 4 kept 0 broken,
 ruff/format 全绿。CHANGELOG 补了 `## M4` 段 + M4-1 一行,进度表 M4 改「🔄 进行中」。
+
+### 验收结论:**通过**(2026-08-21);E2 有一条击穿,补完再进 M4-3
+
+**实跑复核**:
+
+```
+ruff ✓ / format 63 files ✓ / mypy 31 ✓ / lint-imports 4 kept 0 broken / 279 passed + 1 skipped(live)
+_to_cents(1.005)=101(浮点路径=100,咬得住)、0.005=1、NaN/inf=None
+_parse_when('2026-08-20T20:00:00+00:00')=2026-08-21 04:00:00;'上周三'/'10:30'/''=None
+tool_result 不进 L0:_turns_by_id 只取 envelope/reply 两种 kind ——该论证成立
+```
+
+变异检查那一节值钱:自己咬出「0.1/0.2 那版测试是绿的、浮点实现照样过」
+(`0.1*100` 在 IEEE754 里正好是 `10.0`,加上 SQLite 的 INTEGER 亲和性把 `10.0` 收成
+整数,两层一起掩护),并把三个值锁进 docstring。这是他自己发现的,不是复核提的。
+偏离计划的五处全部事先声明、理由成立(尤其 `build(..., *, timezone)`:bundle 不许
+import `lararium.config`,又不能自兜默认时区)。
+
+#### 必补一条:E2 在大额上被击穿(阻塞 M4-3)
+
+```
+record_expense(1e17, "餐饮") -> OverflowError: Python int too large to convert to SQLite INTEGER
+```
+
+`except sqlite3.Error` 接不住 `OverflowError`,异常逃出工具边界。阈值是 int64
+(约 9.2e16 元)。真人说不出这个数——但 E2 的意义正是**边界上不推演可能性**,
+M3-1「负数在 SQLite 里 = 不限制」是同一类。后果不致命(`loop.py:219` 毒消息范式
+标 failed 再冒泡,worker 存活),但那条信封无声死掉,模型连自我纠正的机会都没有。
+两行 + 一条测试。
+
+#### 硬前置拍板:否决甲,采纳乙,丙作后备(且丙才是真答案)
+
+**先摆一个双方都没查的事实**:`propose(provenance="user_stated")` → `state="passed"`
+(`gate.py:81`,当场通过);`worker.py:81` **空闲自动 `settle()`**。即:
+
+> 模型把一笔午饭 propose 成 user_stated,**没有任何人工闸门**,下一次 worker 空闲
+> 它就进账本、就是一次前缀重建。审批流在这条路上根本不在场。
+
+所以这不是"要不要让模型读到一段话"的问题。
+
+- **甲(强制读)否决**。它保证的是**读过**,不是**照做**——本项目已有实测反例:P0-1 里
+  模型读到了正确渲染的围栏,照样 `propose_fact(provenance="user_stated")`,最后是
+  代码路径降档按住的。用固定往返 + 动 Steward 核心 + 连带 memory 与 M4-3/4-4,
+  换一个已被证明不够的保证,不划算。
+- **乙采纳,作为 M4-5 起点**。硬边界进常驻前缀是对的(persona 那节本就装着入档纪律)。
+  但说清楚:**乙仍是 prompt,不是机制**,只把 33% 的到达率换成 100% 的在场率。
+- **丙(双方都没提,判为真答案),M4-5 后备**:`_guard_propose_fact` 钩子已在
+  (不可信轮强制降 provenance)。同位置加一条——**本轮调过 finance 写工具,该轮 propose
+  一律降 pending、不许 auto-pass**。零前缀、零往返,挡的是结果不是意图:模型再热心,
+  那笔午饭也只是躺进 pending 等 `/drop`,进不了账本、动不了前缀。这正是 P0-1 那条路。
+
+**M4-5 执行顺序**:先上乙 → 真模型跑 → 数据说话 → 不够就上丙。
+
+`tests/test_live_finance_skill.py` 保持红着,直到丙(或等效机制)落地。
+
+#### 登记给 M4-4(现在别动)
+
+`list_recent` 要返回原始流水,含 `note`。`note` 由模型写入,而模型在不可信轮会把短信
+正文转述进去——存下来之后,**第 50 轮 `list_recent` 把它捞回来,是以 tool_result 的身份、
+在可信位置、脱掉了围栏与来源标签**。四条渲染规则(`fold_text`/`neutralize_fence`)
+一条都没走。
+
+M4-2 尚不咬人:tool_result 不跨轮存活,`record_expense` 回执只回显同轮已在场的内容。
+**跨轮那一刀由 M4-4 落下**——要么 note 入库前中和,要么出库渲染时过一遍。
+
+#### 顺带
+
+persona 现在写的是「**包括调它的工具**」,对 memory 同样生效,等于给每次 `propose_fact`
+也挂一次往返。乙落地后,M4-5 回头判这半句还值不值。

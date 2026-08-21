@@ -51,9 +51,9 @@ def test_records_the_expense_and_confirms_in_plain_words(record, tmp_path):
 
 
 def test_amount_is_stored_as_integer_cents_without_float_drift(record, tmp_path):
-    """金额存整数分:0.1 + 0.2 在账上必须正好是 30 分。
+    """金额存整数分,且四舍五入定在 Decimal 上,不是 int(amount * 100)。
 
-    浮点存法下 0.1+0.2=0.30000000000000004,月度合计会以「对不上一分钱」的形式冒出来,
+    浮点存法会把误差带进账,月度合计以「对不上一分钱」的形式冒出来,
     而那时候你已经不记得是哪笔的问题了。
 
     **这几个值是挑过的,不许随手改成"更自然"的数字。** 写这条测试时第一版用的是
@@ -146,6 +146,22 @@ def test_unparseable_occurred_at_returns_readable_hint_and_records_nothing(recor
 def test_non_positive_amount_returns_readable_hint_and_records_nothing(record, tmp_path):
     """0 和负数不是支出。落进去会让月度合计变成一道谜题。"""
     for bad in (0, -28):
+        said = record(bad, "餐饮")
+        assert "金额" in said
+
+    assert rows(tmp_path) == []
+
+
+def test_absurdly_large_amount_returns_readable_hint_instead_of_escaping(record, tmp_path):
+    """大到 SQLite 存不下的金额也得走 E2,不许把异常扔出工具边界。
+
+    `1e17` 元换算成分是 1e19,超出 int64(约 9.2e18),sqlite3 绑定时抛 OverflowError
+    ——而 `except sqlite3.Error` 接不住它。真人说不出这个数,但 E2 的意义正是**边界上
+    不推演可能性**:异常逃出去,那条信封会被毒消息范式标 failed 再冒泡(worker 活着,
+    不致命),可它是**无声**死的,模型连自我纠正的机会都没有。M3-1「负数在 SQLite 里
+    = 不限制」是同一类教训。
+    """
+    for bad in (1e17, -1e17, 10**19):
         said = record(bad, "餐饮")
         assert "金额" in said
 

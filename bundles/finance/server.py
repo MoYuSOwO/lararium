@@ -23,6 +23,11 @@ from bundles.runtime import BundleRuntime
 # M4-3 的 GROUP BY 就聚不出东西来。顺序即 E2 提示里列出的顺序,保持稳定。
 CATEGORIES = ("餐饮", "交通", "日用", "娱乐", "医疗", "人情", "其他")
 
+# 金额上界 = SQLite INTEGER 能存的最大值(int64)。超过它 sqlite3 在**绑定参数时**抛
+# OverflowError,而那不是 sqlite3.Error 的子类——异常会直接逃出工具边界(M4-2 补)。
+# 真人说不出 9.2e16 元这种数,但 E2 的意义正是边界上不推演可能性。
+_MAX_CENTS = 2**63 - 1
+
 # 架构测试 test_only_the_ledger_module_writes_files 只放行 ledger.py 写文件;
 # bundle 的库是 SQLite,写入走 sqlite3 连接,不落那条 AST 的禁写面。
 # occurred_at 存的是**配置时区的墙上时间、不带偏移**:SQLite 的 date() 见到偏移会先
@@ -89,7 +94,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         类目之一(餐饮|交通|日用|娱乐|医疗|人情|其他),非法类目返回可读提示并列出合法值;
         occurred_at 缺省用当前时间,给了就用给的。"""
         cents = _to_cents(amount)
-        if cents is None or cents <= 0:
+        if cents is None or cents <= 0 or cents > _MAX_CENTS:
             return f"金额不对({amount}):要一个大于 0 的数字,单位是元(比如 28.5)。这笔没记。"
         if category not in CATEGORIES:
             legal = "|".join(CATEGORIES)
