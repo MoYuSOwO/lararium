@@ -109,18 +109,87 @@ def test_three_hundred_rows_in_bounded_conclusions_out(finance, tmp_path):
         assert f"流水明细-{i}" not in said, "单笔流水漏进了聚合结果"
 
 
-def test_truncation_is_announced_not_silent(finance):
-    """超过上限时要说清楚"其余多少组合计多少",不许静默截断。
+def test_a_full_year_by_day_is_still_bounded(finance):
+    """上限放宽到装得下整月之后,「查一年 = 365 行」这条仍要防住。"""
+    record, query = finance
+    for month in range(1, 13):
+        for day in (1, 15, 28):
+            record(10, "餐饮", occurred_at=f"2026-{month:02d}-{day:02d}")
 
-    静默截断读起来和"就这些"一模一样,模型会拿一个残缺的合计去下结论。
+    said = query("2026-01-01", "2026-12-31", "day")
+
+    assert len(said.splitlines()) <= MAX_GROUP_ROWS + 2
+    assert "更早 5 天合计" in said
+
+
+def test_day_groups_come_back_in_chronological_order(finance):
+    """按天必须是**时间正序**,不是金额降序。
+
+    分组键本身就是时间序,按金额降序等于把时间轴打散——日子会跳着来
+    (07-04 / 07-25 / 07-11 …)。而且这两种排序不对称:「哪几天花得多」从正序的
+    31 行里一眼能挑出来,「趋势」从金额 top-N 里**推不出来**。正序严格更强。
+    monthly-review 的第一句方法就是「先看总额趋势」,照降序的输出做不到。
     """
     record, query = finance
-    for day in range(1, 26):  # 25 天 > MAX_GROUP_ROWS(20)
-        record(10 + day, "餐饮", occurred_at=f"2026-08-{day:02d}")
+    for day, amount in ((11, 5), (4, 90), (25, 40), (5, 70)):
+        record(amount, "餐饮", occurred_at=f"2026-07-{day:02d}")
 
-    said = query("2026-08-01", "2026-08-31", "day")
+    said = query("2026-07-01", "2026-07-31", "day")
 
-    assert "其余 5 组" in said, "被截掉的组数要报出来"
+    days = [line.split()[1] for line in said.splitlines()[1:]]
+    assert days == ["2026-07-04", "2026-07-05", "2026-07-11", "2026-07-25"]
+
+
+def test_a_whole_month_by_day_is_never_truncated(finance):
+    """整月按天查是财务 bundle 最常见的一次查询,**必须原样装得下**。
+
+    上限不该照抄 MAX_SEARCH_HITS(20),该按"最常见的那个查询要装得下"来定:
+    31 天一样防得住「查一年 = 365 行」。
+    """
+    record, query = finance
+    for day in range(1, 32):
+        record(10 + day, "餐饮", occurred_at=f"2026-07-{day:02d}")
+
+    said = query("2026-07-01", "2026-07-31", "day")
+
+    assert "未逐条列出" not in said, "整月按天被截断了——最常见的查询装不下"
+    assert len(said.splitlines()) == 32, "表头 + 31 天,一天都不许少"
+    for day in range(1, 32):
+        assert f"2026-07-{day:02d}" in said
+
+
+def test_day_truncation_keeps_the_most_recent_and_announces_the_earlier_part(finance):
+    """真超限(查一年)时保留**最近**那段,更早的报成一行合计,不许静默截断。
+
+    静默截断读起来和"就这些"一模一样,模型会拿残缺的合计去下结论。保留最近而不是
+    最早:问"今年花了多少"的人,关心的是近况。
+    """
+    record, query = finance
+    for day in range(1, 32):
+        record(10, "餐饮", occurred_at=f"2026-05-{day:02d}")  # 31 天
+    for day in range(1, 11):
+        record(20, "餐饮", occurred_at=f"2026-06-{day:02d}")  # 再 10 天,共 41 天
+
+    said = query("2026-05-01", "2026-06-30", "day")
+
+    assert "更早 10 天合计 100.00 元" in said, "被砍掉的是最早那 10 天,要报出组数和合计"
+    assert "2026-05-11" in said and "2026-06-10" in said, "最近的 31 天要留着"
+    assert "2026-05-10" not in said, "最早那段不许逐条列出"
+    assert "510.00" in said, "总额始终是全区间的(31*10 + 10*20)"
+
+
+def test_group_by_accepts_the_forms_the_model_actually_writes(finance):
+    """同义词表要收模型最容易写出的形式,包括带"按"字的。
+
+    同义词表是代码、零前缀代价;让模型因为写了"按天"吃一次 E2 往返是白烧钱。
+    """
+    record, query = finance
+    record(45, "餐饮", occurred_at="2026-08-03")
+
+    for form in ("按类目", "类目", "分类", "按分类", "CATEGORY"):
+        assert "餐饮 45.00 元" in query("2026-08-01", "2026-08-31", form)
+    for form in ("按天", "天", "日", "按日", "date"):
+        assert "2026-08-03 45.00 元" in query("2026-08-01", "2026-08-31", form)
 
 
 def test_unknown_group_by_returns_readable_hint(finance):

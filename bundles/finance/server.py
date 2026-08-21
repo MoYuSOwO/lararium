@@ -30,8 +30,11 @@ _MAX_CENTS = 2**63 - 1
 
 # 聚合结果的行数上限(A4 工具铁律)。按类目最多 7 行、天然安全;按天不封顶——查一年
 # 就是 365 行,一次工具调用把 L0 顶穿,而压缩是全系统仅有的两个缓存重建点之一。
-# 20 这个数对齐 steward/tools.py 的 MAX_SEARCH_HITS,理由相同。
-MAX_GROUP_ROWS = 20
+#
+# **31 的判据是「最常见的那个查询要原样装得下」,不是对齐 MAX_SEARCH_HITS**(初版取 20,
+# 就是照抄了那个数)。查这个月按天 = 31 天,是财务 bundle 最常见的一次查询,被截断则
+# monthly-review 的第一句方法「先看总额趋势」当场做不到;而防「查一年」,31 一样防得住。
+MAX_GROUP_ROWS = 31
 
 # group_by 的规范值与同义词。类目是**存下去**的东西所以必须固定,group_by 只是控制参数、
 # 进 SQL 前就归一成规范值,收几个同义词不会污染数据——而模型用中文思考,
@@ -47,20 +50,27 @@ _GROUP_SQL = {
         " GROUP BY grp ORDER BY cents DESC"
     ),
     "day": (
+        # 按天走**时间正序**:分组键本身就是时间序,按金额降序等于把时间轴打散
+        # (日子会跳着来)。且两种排序不对称——「哪几天花得多」从正序里一眼能挑,
+        # 「趋势」从金额 top-N 里推不出来。正序严格更强。
         "SELECT substr(occurred_at, 1, 10) AS grp, SUM(amount_cents) AS cents, COUNT(*) AS n"
         " FROM expenses WHERE occurred_at >= ? AND occurred_at < ?"
-        " GROUP BY grp ORDER BY cents DESC"
+        " GROUP BY grp ORDER BY grp ASC"
     ),
 }
 
 _GROUP_BY = {
     "category": "category",
     "类目": "category",
+    "按类目": "category",
     "分类": "category",
+    "按分类": "category",
     "day": "day",
-    "天": "day",
-    "日": "day",
     "date": "day",
+    "天": "day",
+    "按天": "day",
+    "日": "day",
+    "按日": "day",
 }
 
 # 架构测试 test_only_the_ledger_module_writes_files 只放行 ledger.py 写文件;
@@ -120,6 +130,14 @@ def _parse_day(raw: str) -> date | None:
         return date.fromisoformat(raw.strip())
     except (ValueError, AttributeError):
         return None
+
+
+def _group_line(row: sqlite3.Row) -> str:
+    return f"- {row['grp']} {_yuan(row['cents'])} 元({row['n']} 笔)"
+
+
+def _cents(rows: list[sqlite3.Row]) -> int:
+    return sum(r["cents"] for r in rows)
 
 
 def _yuan(cents: int) -> str:
@@ -212,16 +230,27 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         total = sum(r["cents"] for r in groups)
         count = sum(r["n"] for r in groups)
         label = "类目" if mode == "category" else "天"
+        # 总额那行始终是**全区间**的,和截断与否无关——截掉的部分单列一行报合计,
+        # 两边永远对得上。静默截断读起来和"就这些"一模一样,模型会拿残缺的合计下结论。
         lines = [f"{since} ~ {until},共 {count} 笔,合计 {_yuan(total)} 元(按{label}):"]
-        for row in groups[:MAX_GROUP_ROWS]:
-            lines.append(f"- {row['grp']} {_yuan(row['cents'])} 元({row['n']} 笔)")
-        rest = groups[MAX_GROUP_ROWS:]
-        if rest:
-            # 静默截断读起来和"就这些"一模一样,模型会拿残缺的合计去下结论。
-            # 被砍掉的部分必须报出组数和合计,总额那一行才对得上。
-            lines.append(
-                f"- 其余 {len(rest)} 组合计 {_yuan(sum(r['cents'] for r in rest))} 元(未逐条列出)"
-            )
+        if mode == "category":
+            # 类目按金额降序,砍尾巴:哪一类吃掉了预算,第一行就是答案。
+            # 最多 7 组,这条截断线实际上摸不着,留着是为了不让"以后加类目"变成隐患。
+            dropped, shown = groups[MAX_GROUP_ROWS:], groups[:MAX_GROUP_ROWS]
+            lines += [_group_line(r) for r in shown]
+            if dropped:
+                lines.append(
+                    f"- 其余 {len(dropped)} 组合计 {_yuan(_cents(dropped))} 元(未逐条列出)"
+                )
+        else:
+            # 按天是时间正序,所以砍的是**最早**那段(问"今年花了多少"的人关心近况),
+            # 合计行放最前面——它在时间轴上本来就该在那儿。
+            dropped, shown = groups[:-MAX_GROUP_ROWS], groups[-MAX_GROUP_ROWS:]
+            if dropped:
+                lines.append(
+                    f"- 更早 {len(dropped)} 天合计 {_yuan(_cents(dropped))} 元(未逐条列出)"
+                )
+            lines += [_group_line(r) for r in shown]
         return "\n".join(lines)
 
     def list_recent(limit: int = 10) -> str:
