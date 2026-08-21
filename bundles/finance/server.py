@@ -4,13 +4,13 @@ M4-1 立的骨架:manifest + 独占 SQLite + 统一构造入口 `build(...)`。�
 **签名与文档在 M4-1 定死**(工具 schema 是前缀第0层,顺序冻结后不许再动);
 M4-2 起只换函数体、不动签名与 docstring——docstring 就是 schema,改它是一次前缀重建。
 
-M4-2 落地 `record_expense`;`query_spending` / `list_recent` 仍是 E2 人话占位,
-正体在 M4-3/4-4。
+M4-2 落地 `record_expense`,M4-3 落地 `query_spending`;`list_recent` 仍是 E2 人话占位,
+正体在 M4-4。
 """
 
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -27,6 +27,41 @@ CATEGORIES = ("餐饮", "交通", "日用", "娱乐", "医疗", "人情", "其�
 # OverflowError,而那不是 sqlite3.Error 的子类——异常会直接逃出工具边界(M4-2 补)。
 # 真人说不出 9.2e16 元这种数,但 E2 的意义正是边界上不推演可能性。
 _MAX_CENTS = 2**63 - 1
+
+# 聚合结果的行数上限(A4 工具铁律)。按类目最多 7 行、天然安全;按天不封顶——查一年
+# 就是 365 行,一次工具调用把 L0 顶穿,而压缩是全系统仅有的两个缓存重建点之一。
+# 20 这个数对齐 steward/tools.py 的 MAX_SEARCH_HITS,理由相同。
+MAX_GROUP_ROWS = 20
+
+# group_by 的规范值与同义词。类目是**存下去**的东西所以必须固定,group_by 只是控制参数、
+# 进 SQL 前就归一成规范值,收几个同义词不会污染数据——而模型用中文思考,
+# 让它因为写了"类目"而吃一次 E2 往返是白烧钱。
+# 两条写全的字面量,不用 f-string 拼列名:拼出来的 SQL 会被 S608 盯上(而且它是对的
+# ——白名单今天成立不等于明天有人加个分支时还成立),写死则连"可能"都没有,
+# 顺带还能整条 grep 出来。聚合全在 SQL 里做完:取回来在 Python 里算,就已经把三百条
+# 塞进内存了,离塞进上下文只差一步(A4)。
+_GROUP_SQL = {
+    "category": (
+        "SELECT category AS grp, SUM(amount_cents) AS cents, COUNT(*) AS n"
+        " FROM expenses WHERE occurred_at >= ? AND occurred_at < ?"
+        " GROUP BY grp ORDER BY cents DESC"
+    ),
+    "day": (
+        "SELECT substr(occurred_at, 1, 10) AS grp, SUM(amount_cents) AS cents, COUNT(*) AS n"
+        " FROM expenses WHERE occurred_at >= ? AND occurred_at < ?"
+        " GROUP BY grp ORDER BY cents DESC"
+    ),
+}
+
+_GROUP_BY = {
+    "category": "category",
+    "类目": "category",
+    "分类": "category",
+    "day": "day",
+    "天": "day",
+    "日": "day",
+    "date": "day",
+}
 
 # 架构测试 test_only_the_ledger_module_writes_files 只放行 ledger.py 写文件;
 # bundle 的库是 SQLite,写入走 sqlite3 连接,不落那条 AST 的禁写面。
@@ -77,6 +112,19 @@ def _parse_when(raw: str, tz: ZoneInfo) -> datetime | None:
     if dt.tzinfo is not None:
         dt = dt.astimezone(tz)
     return dt.replace(tzinfo=None)
+
+
+def _parse_day(raw: str) -> date | None:
+    """只认 YYYY-MM-DD。看不懂返回 None(由调用方给人话提示)。"""
+    try:
+        return date.fromisoformat(raw.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def _yuan(cents: int) -> str:
+    """分 → 元的显示形态。全程 Decimal,显示层也不让浮点沾边。"""
+    return f"{Decimal(cents) / 100:.2f}"
 
 
 def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
@@ -139,7 +187,42 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
     ) -> str:
         """按类目/按天聚合一段时间内的支出(since/until 格式 YYYY-MM-DD),返回总额 +
         每组一行结论;聚合在 SQL 里算完再返回,**绝不返回单笔流水**。"""
-        return "查账还没接通(本里程碑后续实现),暂时查不了。"
+        start, end = _parse_day(since), _parse_day(until)
+        if start is None or end is None:
+            bad = since if start is None else until
+            return f"看不懂日期「{bad}」:要 YYYY-MM-DD。相对时间先调 current_time 换算。"
+        if start > end:
+            return f"日期反了:since={since} 晚于 until={until},换过来再查。"
+        mode = _GROUP_BY.get(group_by.strip().lower() if isinstance(group_by, str) else "")
+        if mode is None:
+            return f"看不懂 group_by「{group_by}」:只能是 category(按类目)或 day(按天)。"
+
+        # until 含端点,但比较的是 'YYYY-MM-DDTHH:MM:SS' 字符串——用 <= until 会把当天
+        # 带时刻的流水全吃掉('2026-08-31T20:00:00' > '2026-08-31')。所以上界取次日零点、
+        # 开区间。这样既含全端点,又保持成范围扫描(M4-4 加索引后直接受益)。
+        upper = (end + timedelta(days=1)).isoformat()
+        try:
+            groups = list(conn.execute(_GROUP_SQL[mode], (start.isoformat(), upper)))
+        except sqlite3.Error as exc:  # E2:查不了也要让模型知道,而不是整轮炸掉
+            return f"查不了(库读取失败:{exc})。"
+
+        if not groups:
+            return f"{since} ~ {until} 没有记录。"
+
+        total = sum(r["cents"] for r in groups)
+        count = sum(r["n"] for r in groups)
+        label = "类目" if mode == "category" else "天"
+        lines = [f"{since} ~ {until},共 {count} 笔,合计 {_yuan(total)} 元(按{label}):"]
+        for row in groups[:MAX_GROUP_ROWS]:
+            lines.append(f"- {row['grp']} {_yuan(row['cents'])} 元({row['n']} 笔)")
+        rest = groups[MAX_GROUP_ROWS:]
+        if rest:
+            # 静默截断读起来和"就这些"一模一样,模型会拿残缺的合计去下结论。
+            # 被砍掉的部分必须报出组数和合计,总额那一行才对得上。
+            lines.append(
+                f"- 其余 {len(rest)} 组合计 {_yuan(sum(r['cents'] for r in rest))} 元(未逐条列出)"
+            )
+        return "\n".join(lines)
 
     def list_recent(limit: int = 10) -> str:
         """列出最近几笔流水——全系统唯一返回原始流水的工具,因此硬封顶(上限 20),

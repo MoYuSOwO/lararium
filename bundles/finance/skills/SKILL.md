@@ -9,6 +9,13 @@ finance 有自己的库(不进 Steward 的存储),记录每一笔消费。记账
 - 用户问某段时间某类花了多少 → `query_spending`(返回结论,不返回单笔流水)
 - 用户问最近一笔 / 最大的一笔 → `list_recent`
 
+## 查账怎么问
+
+`query_spending(since, until, group_by)`:since/until 都是 YYYY-MM-DD、**两端都含**;
+group_by 只有 `category`(按类目)和 `day`(按天)。返回的是**总额 + 每组一行结论**,
+组数超过 20 时其余的会合并成一行报出来(总额始终是全区间的)。
+它**不会**给你单笔流水——要看单笔用 `list_recent`。
+
 ## 时间怎么来
 
 "昨天""上周三""这个月初"这类相对时间,**先调 `current_time` 拿到今天是几号,自己换算成
