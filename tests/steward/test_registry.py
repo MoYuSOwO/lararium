@@ -98,3 +98,18 @@ def test_every_registered_bundle_has_a_readable_overview(registry):
     for bundle in registry.bundles:
         text = registry.read_skill(bundle.name)
         assert text.strip(), f"{bundle.name} 的 SKILL.md 是空的——总览不可达"
+
+
+def test_finance_directory_line_lists_monthly_review(registry):
+    """M4-4:manifest.skills 加了 monthly-review,目录行(前缀第1层)随之列出它。
+
+    这是本里程碑第二次、也是最后一次目录行变动——D3 认可的重建点。
+    """
+    line = next(line for line in registry.directory_lines().splitlines() if "finance" in line)
+    assert "monthly-review" in line
+
+
+def test_read_skill_rejects_unknown_skill_name_in_finance(registry):
+    """白名单校验对 finance 同样生效:skill 名来自模型输出,不许拿去拼路径。"""
+    with pytest.raises(KeyError, match="monthly-review"):
+        registry.read_skill("finance", "../../../etc/passwd")

@@ -4,10 +4,10 @@ M4-1 立的骨架:manifest + 独占 SQLite + 统一构造入口 `build(...)`。�
 **签名与文档在 M4-1 定死**(工具 schema 是前缀第0层,顺序冻结后不许再动);
 M4-2 起只换函数体、不动签名与 docstring——docstring 就是 schema,改它是一次前缀重建。
 
-M4-2 落地 `record_expense`,M4-3 落地 `query_spending`;`list_recent` 仍是 E2 人话占位,
-正体在 M4-4。
+M4-2 落地 `record_expense`,M4-3 落地 `query_spending`,M4-4 落地 `list_recent`。
 """
 
+import re
 import sqlite3
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
@@ -35,6 +35,23 @@ _MAX_CENTS = 2**63 - 1
 # 就是照抄了那个数)。查这个月按天 = 31 天,是财务 bundle 最常见的一次查询,被截断则
 # monthly-review 的第一句方法「先看总额趋势」当场做不到;而防「查一年」,31 一样防得住。
 MAX_GROUP_ROWS = 31
+
+# list_recent 的条数硬上限。它是**全系统唯一返回原始流水的工具**,而 limit 是模型可控
+# 参数:负数在 SQLite 的 LIMIT 里是"不限制"(M3-1 的教训),不钳制就是全表倒进上下文。
+MAX_RECENT_ROWS = 20
+# 单条 note 的显示上限。20 行、每行一条无限长备注,一样能顶穿 L0;对齐 steward/tools.py
+# MAX_HIT_CHARS 的用意,数字按"一行看得完"取。
+MAX_NOTE_CHARS = 60
+
+# 围栏分隔符。**这是从 lararium.steward.assembler 抄来的一份**——bundle 不许 import
+# steward(它是未来的独立容器,零依赖是刻意的),所以只能抄。抄了就会漂,
+# `test_fence_markers_match_the_stewards` 把两边钉在一起:哪天 assembler 改了分隔符,
+# 那条测试立刻红,而不是让这里的防线静默失效。
+FENCE_OPEN = "<<<"
+FENCE_CLOSE = ">>>"
+# 本行里包 note 用的界符。note 正文里出现它就能在同一行伪造出第二个字段,一并中和。
+_NOTE_OPEN = "「"
+_NOTE_CLOSE = "」"
 
 # group_by 的规范值与同义词。类目是**存下去**的东西所以必须固定,group_by 只是控制参数、
 # 进 SQL 前就归一成规范值,收几个同义词不会污染数据——而模型用中文思考,
@@ -87,6 +104,9 @@ CREATE TABLE IF NOT EXISTS expenses (
     note         TEXT,
     created_at   TEXT    NOT NULL
 );
+-- occurred_at 是唯一的检索维度:list_recent 按它倒序取前 N,query_spending 按它做范围
+-- 扫描。没有索引时两者都要全表扫,而这张表只会越长越长(M4-4 补)。
+CREATE INDEX IF NOT EXISTS idx_expenses_occurred_at ON expenses(occurred_at);
 """
 
 
@@ -130,6 +150,31 @@ def _parse_day(raw: str) -> date | None:
         return date.fromisoformat(raw.strip())
     except (ValueError, AttributeError):
         return None
+
+
+def _render_note(note: str | None) -> str:
+    """把 note 当**不可信文本**渲染,一条都不例外。
+
+    note 是模型写的,而模型在不可信轮会把短信正文转述进去(L3:模型输出是不可信输入)。
+    bundle 拿不到本轮的信任度,所以不做区分——统一过三刀:
+
+    - **折行**:换行不折,一条 note 就能伪造出后续流水行,而伪造出来的那行和真实流水
+      形式上一模一样,还坐在可信位置、没有任何来源标记(P1-2);
+    - **中和分隔符**:围栏归 Steward 用,这条输出将来会以 tool_result 的身份被
+      search_history 捞回去再渲染一次,正文里的 `>>>` 能提前闭合围栏(P1-3);
+      本行的界符同理;
+    - **截断**:先折再截,别让空白吃掉预算(照抄 tools.py `_render_hit` 的顺序)。
+    """
+    if not note:
+        return ""
+    folded = re.sub(r"\s+", " ", note).strip()
+    safe = (
+        folded.replace(FENCE_OPEN, "＜＜＜")  # noqa: RUF001 - 换成全角形近字是目的不是笔误
+        .replace(FENCE_CLOSE, "＞＞＞")  # noqa: RUF001 - 同上
+        .replace(_NOTE_OPEN, "﹁")
+        .replace(_NOTE_CLOSE, "﹂")
+    )
+    return f" · 备注{_NOTE_OPEN}{safe[:MAX_NOTE_CHARS]}{_NOTE_CLOSE}"
 
 
 def _group_line(row: sqlite3.Row) -> str:
@@ -203,7 +248,8 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         until: str,
         group_by: str,
     ) -> str:
-        """按类目/按天聚合一段时间内的支出(since/until 格式 YYYY-MM-DD),返回总额 +
+        """按类目/按天聚合一段时间内的支出(since/until 格式 YYYY-MM-DD,两端都含),
+        group_by 取 category(按类目,金额从高到低)或 day(按天,时间正序);返回总额 +
         每组一行结论;聚合在 SQL 里算完再返回,**绝不返回单笔流水**。"""
         start, end = _parse_day(since), _parse_day(until)
         if start is None or end is None:
@@ -256,7 +302,29 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
     def list_recent(limit: int = 10) -> str:
         """列出最近几笔流水——全系统唯一返回原始流水的工具,因此硬封顶(上限 20),
         limit 为负数或超大值都钳制到上限。"""
-        return "查最近流水还没接通(本里程碑后续实现),暂时查不了。"
+        # 负数在 SQLite 的 LIMIT 里是"不限制",不钳制就是全表倒进上下文(M3-1 教训)。
+        # 钳的是上界和下界两头:0 或负数取上限、超大值取上限。
+        n = MAX_RECENT_ROWS if limit < 1 else min(limit, MAX_RECENT_ROWS)
+        try:
+            rows = list(
+                conn.execute(
+                    "SELECT occurred_at, category, amount_cents, note FROM expenses"
+                    " ORDER BY occurred_at DESC, id DESC LIMIT ?",
+                    (n,),
+                )
+            )
+        except sqlite3.Error as exc:  # E2:查不了也要让模型知道,而不是整轮炸掉
+            return f"查不了(库读取失败:{exc})。"
+
+        if not rows:
+            return "还没有记过账。"
+        lines = [f"最近 {len(rows)} 笔:"]
+        for r in rows:
+            when = r["occurred_at"].replace("T", " ")[:16]
+            lines.append(
+                f"- {when} {r['category']} {_yuan(r['amount_cents'])} 元{_render_note(r['note'])}"
+            )
+        return "\n".join(lines)
 
     return [record_expense, query_spending, list_recent]
 

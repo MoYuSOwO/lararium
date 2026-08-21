@@ -7,7 +7,9 @@ finance 有自己的库(不进 Steward 的存储),记录每一笔消费。记账
 ## 什么时候用
 - 用户报一笔开销 → `record_expense`
 - 用户问某段时间某类花了多少 → `query_spending`(返回结论,不返回单笔流水)
-- 用户问最近一笔 / 最大的一笔 → `list_recent`
+- 用户问最近花了些什么 → `list_recent`(**最近**的若干笔,硬封顶 20;
+  它给不了"整个月最大的一笔",别拿它冒充)
+- 想系统地看一个月 → 先 `read_skill("finance", "monthly-review")`
 
 ## 查账怎么问
 
