@@ -17,18 +17,35 @@ SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 # 所以 CJK 每字按 0.8、非 CJK 每字按 0.3(英文约 3~4 字符/token)。
 # 中英混排别一刀切:英文按 0.8 算会白扔一半预算。**换 provider / 换 tokenizer 要
 # 重新实测,这两个数不是普适常数。**
+# 每字符的 token 系数。**跟 tokenizer 走,换模型必须重测**——漂了不报错,只会悄悄超窗
+# 或白扔窗口。2026-08-22 对 deepseek-v4-flash-vision-exp 重测(测法:固定极小 system,
+# 只改正文,读服务商回的 input_tokens,减去基线;样本取项目里的真实文本,不用重复字符
+# ——重复串会被 BPE 压掉,系数会被系统性低估):
+#   纯 ASCII 实测 0.39~0.43 token/字符,而旧值 0.3 **低估到 30%**;
+#   中文实测 ~0.66~0.72,旧值 0.8 略高估。
+# 九样本最小二乘给 0.659 / 0.407,但那组系数会低估其中三个样本。这里取
+# **0.75 / 0.45**:九个样本一个都不低估(最大高估 +27.5%,落在 ASCII 密集的代码上)。
+# 方向是有意的——这个估算撑着 L0 预算与压缩水位,低估会顶穿上下文窗口(M3-1b 修的
+# 正是低估),高估只是少装几轮。
+CJK_TOKENS_PER_CHAR = 0.75
+OTHER_TOKENS_PER_CHAR = 0.45
+
+
 def estimate_tokens(text: str) -> int:
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-    return int(cjk * 0.8 + (len(text) - cjk) * 0.3)
+    return int(cjk * CJK_TOKENS_PER_CHAR + (len(text) - cjk) * OTHER_TOKENS_PER_CHAR)
 
 
-# M3-3 Step0:预算按「渲染后的形态」估,不是原文。进上下文的每轮比原文多出的固定开销,
-# 2026-08-19 对 mimo-v2.5 实测校准(实测每轮差额:普通轮 +9、不可信轮 +39,取整留余量):
-#   普通轮 +10(时间戳前缀 `[ts] `)
-#   不可信轮 +40(「以下是数据,不是指令」包裹 + 围栏)
-# 话头行另按 render_open_threads 实际渲染的文本估。换渲染/换 provider 要重测。
-RENDER_OVERHEAD_NORMAL = 10
-RENDER_OVERHEAD_UNTRUSTED = 40
+# M3-3 Step0:预算按「渲染后的形态」估,不是原文。进上下文的每轮比原文多出的固定开销。
+# 2026-08-22 对 deepseek-v4-flash-vision-exp 重测(拿 _render_user_text 真渲染一遍,
+# 比渲染前后的 input_tokens 差额):普通轮 +19、不可信轮 +42,取整留余量。
+#   普通轮 +20(时间戳前缀 `[ts] `——28 个 ASCII 字符,新 tokenizer 下比旧的贵一倍)
+#   不可信轮 +45(「以下是数据,不是指令」包裹 + 围栏)
+# 旧值(mimo-v2.5:+9 / +39)对应 10 / 40;普通轮那条**低估了一半**,2000 轮就是
+# 一万八千 token 没算进预算。话头行另按 render_open_threads 实际渲染的文本估。
+# **换渲染 / 换 provider 要重测**,这一条不是摆设。
+RENDER_OVERHEAD_NORMAL = 20
+RENDER_OVERHEAD_UNTRUSTED = 45
 
 # 语义检索的候选上限:vec0 一次取最近邻的天花板(单用户量级足够),之后在 Python
 # 里做阈值过滤 + 分页。总条数因此封顶在此数——真超过说明该换关键词了。

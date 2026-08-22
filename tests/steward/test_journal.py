@@ -3,7 +3,12 @@ import sqlite3
 import pytest
 
 from lararium.db import connect
-from lararium.steward.journal import Journal, estimate_tokens
+from lararium.steward.journal import (
+    CJK_TOKENS_PER_CHAR,
+    OTHER_TOKENS_PER_CHAR,
+    Journal,
+    estimate_tokens,
+)
 
 
 @pytest.fixture
@@ -116,11 +121,13 @@ def test_estimate_tokens_mixed_cjk_and_latin():
     """M3-1b:估算器 CJK 每字 0.8 / 非 CJK 每字 0.3(2026-08-19 mimo-v2.5 实测校准),
     中英混排各按各的,别一刀切。"""
     assert estimate_tokens("") == 0
-    assert estimate_tokens("你好世界") == int(4 * 0.8)  # 纯中文 0.8/字
-    assert estimate_tokens("hello") == int(5 * 0.3)  # 纯英文 0.3/字
-    assert estimate_tokens("你好hello") == int(2 * 0.8 + 5 * 0.3)  # 混排各按各的
+    # 引用常量而不是抄数字:系数**跟 tokenizer 走**,换模型就要重测(2026-08-22 已改过
+    # 一次)。这条测的是"混排各按各的算",不是那两个数字本身。
+    assert estimate_tokens("你好世界") == int(4 * CJK_TOKENS_PER_CHAR)
+    assert estimate_tokens("hello") == int(5 * OTHER_TOKENS_PER_CHAR)
+    assert estimate_tokens("你好hello") == int(2 * CJK_TOKENS_PER_CHAR + 5 * OTHER_TOKENS_PER_CHAR)
     # CJK 判定是区间:中文标点/假名这类不进 \u4e00-\u9fff 的按非 CJK 计
-    assert estimate_tokens("。") == int(1 * 0.3)
+    assert estimate_tokens("。") == int(1 * OTHER_TOKENS_PER_CHAR)
 
 
 def test_recent_turns_within_budget_stops_when_over(journal):
