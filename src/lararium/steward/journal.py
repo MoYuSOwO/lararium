@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lararium import db as _db
-from lararium.steward.assembler import render_open_threads
+from lararium.steward.assembler import render_open_threads, render_tool_trace
 from lararium.steward.embeddings import embed
 
 SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
@@ -18,17 +18,20 @@ SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 # 中英混排别一刀切:英文按 0.8 算会白扔一半预算。**换 provider / 换 tokenizer 要
 # 重新实测,这两个数不是普适常数。**
 # 每字符的 token 系数。**跟 tokenizer 走,换模型必须重测**——漂了不报错,只会悄悄超窗
-# 或白扔窗口。2026-08-22 对 deepseek-v4-flash-vision-exp 重测(测法:固定极小 system,
-# 只改正文,读服务商回的 input_tokens,减去基线;样本取项目里的真实文本,不用重复字符
-# ——重复串会被 BPE 压掉,系数会被系统性低估):
-#   纯 ASCII 实测 0.39~0.43 token/字符,而旧值 0.3 **低估到 30%**;
-#   中文实测 ~0.66~0.72,旧值 0.8 略高估。
-# 九样本最小二乘给 0.659 / 0.407,但那组系数会低估其中三个样本。这里取
-# **0.75 / 0.45**:九个样本一个都不低估(最大高估 +27.5%,落在 ASCII 密集的代码上)。
-# 方向是有意的——这个估算撑着 L0 预算与压缩水位,低估会顶穿上下文窗口(M3-1b 修的
-# 正是低估),高估只是少装几轮。
-CJK_TOKENS_PER_CHAR = 0.75
-OTHER_TOKENS_PER_CHAR = 0.45
+# 或白扔窗口。2026-08-23 对 mimo-v2.5 实测(测法可复跑:固定极小 system,只改正文,读
+# 服务商回的 input_tokens 减去基线;正文在 system 与 user 各出现一次故差额除以 2;
+# 9 个样本取项目里的真实文本,**不用重复字符**——重复串会被 BPE 压掉,系数会被系统性低估):
+#
+#   纯 ASCII 实测 0.449 / 0.519 token/字符 —— **旧值 0.3 低估了 40~70%**;
+#   中文实测 0.726 / 0.742 —— 旧值 0.8 一直是对的。
+#
+# 也就是说 M3-1b 那次校准里错的自始至终是**非 CJK 那一个**,不是两个。
+# 九样本最小二乘给 0.660/0.474,但它会低估中文样本 9~10% —— 而中文正是 L0 的主要内容,
+# 不能拿它去卡预算。取 **0.8 / 0.52**:九个样本一个都不低估,中文留 6~25% 余量,
+# 最大高估 +40% 落在 ASCII 密集的代码/锁文件上(那不是 L0 的典型内容)。
+# 方向是有意的——低估会顶穿上下文窗口,高估只是少装几轮。
+CJK_TOKENS_PER_CHAR = 0.8
+OTHER_TOKENS_PER_CHAR = 0.52
 
 
 def estimate_tokens(text: str) -> int:
@@ -37,15 +40,17 @@ def estimate_tokens(text: str) -> int:
 
 
 # M3-3 Step0:预算按「渲染后的形态」估,不是原文。进上下文的每轮比原文多出的固定开销。
-# 2026-08-22 对 deepseek-v4-flash-vision-exp 重测(拿 _render_user_text 真渲染一遍,
-# 比渲染前后的 input_tokens 差额):普通轮 +19、不可信轮 +42,取整留余量。
-#   普通轮 +20(时间戳前缀 `[ts] `——28 个 ASCII 字符,新 tokenizer 下比旧的贵一倍)
-#   不可信轮 +45(「以下是数据,不是指令」包裹 + 围栏)
-# 旧值(mimo-v2.5:+9 / +39)对应 10 / 40;普通轮那条**低估了一半**,2000 轮就是
-# 一万八千 token 没算进预算。话头行另按 render_open_threads 实际渲染的文本估。
-# **换渲染 / 换 provider 要重测**,这一条不是摆设。
-RENDER_OVERHEAD_NORMAL = 20
-RENDER_OVERHEAD_UNTRUSTED = 45
+# 2026-08-23 对 mimo-v2.5 重测(拿 _render_user_text 真渲染一遍,比渲染前后的差额):
+#   普通轮 实测 +28 → 取 30(时间戳前缀 `[2026-08-23T19:29:50+08:00] `)
+#   不可信轮 实测 +52 → 取 55(「以下是数据,不是指令」包裹 + 围栏)
+# 旧值是 10 / 40。**普通轮那条低估到了三分之一**:28 个字符的时间戳全是数字与符号,
+# 是 BPE 最吃亏的形状,连 estimate_tokens 自己都只算得出 14。2000 轮就是四万 token
+# 没进预算。**换渲染 / 换 provider 要重测**,这一条不是摆设——它已经错过两次了。
+#
+# 工具痕迹行(M4-5c)**不设常量**:它长度随工具名变,由 _render_overhead 直接
+# estimate_tokens 算。实测核过够用:单个工具实测 +9 估算 10,两个实测 +12 估算 15。
+RENDER_OVERHEAD_NORMAL = 30
+RENDER_OVERHEAD_UNTRUSTED = 55
 
 # 语义检索的候选上限:vec0 一次取最近邻的天花板(单用户量级足够),之后在 Python
 # 里做阈值过滤 + 分页。总条数因此封顶在此数——真超过说明该换关键词了。
@@ -53,12 +58,24 @@ _SEMANTIC_CANDIDATES = 1000
 
 
 def _render_overhead(turn: dict[str, Any]) -> int:
-    """一轮话在上下文中渲染后比原文多出来的部分:固定常数 + 话头行。"""
+    """一轮话在上下文中渲染后比原文多出来的部分:固定常数 + 话头行 + 工具痕迹行。"""
     overhead = RENDER_OVERHEAD_UNTRUSTED if turn.get("untrusted") else RENDER_OVERHEAD_NORMAL
-    line = render_open_threads(turn.get("open_threads"))
-    if line:
-        overhead += estimate_tokens(line)
+    for line in (
+        render_open_threads(turn.get("open_threads")),
+        render_tool_trace(turn.get("tools", ())),
+    ):
+        if line:
+            overhead += estimate_tokens(line)
     return overhead
+
+
+def recent_turns_estimate(turn: dict[str, Any]) -> int:
+    """一轮话进 L0 后的估算 token(原文 + 渲染开销)。预算与压缩共用同一把尺。"""
+    return (
+        estimate_tokens(turn.get("user") or "")
+        + estimate_tokens(turn.get("assistant") or "")
+        + _render_overhead(turn)
+    )
 
 
 @dataclass(frozen=True)
@@ -276,16 +293,25 @@ class Journal:
         # IN 列表数量不定,S608 无法静态证明安全;qmarks 全是 ?、参数是内部 hex 信封
         # id,无用户数据进 SQL 文本——所以 noqa 是安全的(G4 最小范围)。
         qmarks = ",".join("?" * len(env_ids))
-        query = f"SELECT envelope_id, kind, payload FROM journal WHERE envelope_id IN ({qmarks}) AND kind IN ('envelope','reply') ORDER BY seq"  # noqa: S608
+        query = f"SELECT envelope_id, kind, payload FROM journal WHERE envelope_id IN ({qmarks}) AND kind IN ('envelope','reply','tool_call') ORDER BY seq"  # noqa: S608
         rows = self._conn.execute(query, env_ids).fetchall()
         env: dict[str, dict[str, Any]] = {}
         assistant: dict[str, str | None] = {}
+        tools: dict[str, list[str]] = {}
         for r in rows:
             payload = json.loads(r["payload"])
             if r["kind"] == "envelope":
                 env[r["envelope_id"]] = payload
-            else:
+            elif r["kind"] == "reply":
                 assistant[r["envelope_id"]] = payload.get("content")
+            else:
+                # 同名重复只留一个:诊断里有一轮连调七次 record_expense(它在批量补课),
+                # 把「调了 7 次」照实渲进 L0 等于示范"一轮可以补七笔",而那正是要纠正的行为。
+                # L0 是渲染不是流水账——逐字真相在起居注里,replay() 一条不少(A6)。
+                name = payload.get("tool")
+                seen = tools.setdefault(r["envelope_id"], [])
+                if name and name not in seen:
+                    seen.append(name)
         out: dict[str, dict[str, Any]] = {}
         for eid in env_ids:
             e = env.get(eid)
@@ -299,6 +325,9 @@ class Journal:
                 "ts": e.get("ts") if e else None,
                 # M3-3:该轮认领时冻结的话头快照(meta 里存的形态:list[{topic,note}])
                 "open_threads": e.get("meta", {}).get("open_threads") if e else None,
+                # M4-5c:该轮调用过的工具名(去重、首次调用顺序)。白名单校验在
+                # Steward._recent_turns 里做——起居注保持忠实记录,过滤在进上下文那一步。
+                "tools": tuple(tools.get(eid, ())),
             }
         return out
 
@@ -347,11 +376,7 @@ class Journal:
         used = 0
         for env_id in ids:
             t = by_id[env_id]
-            est = (
-                estimate_tokens(t["user"] or "")
-                + estimate_tokens(t["assistant"] or "")
-                + _render_overhead(t)
-            )
+            est = recent_turns_estimate(t)
             if turns and used + est > max_tokens:  # 最新一轮(首个)无条件进
                 break
             turns.append(t)

@@ -27,6 +27,8 @@ class Turn:
     # 该轮认领时冻结的话头快照(meta["open_threads"] 的形态:list[{topic,note}])。
     # 历史轮渲染的是**当时那份**,不是最新的——这是 append-only 成立的另一半。
     open_threads: list[dict[str, Any]] | None = None
+    # M4-5c:该轮调用过的工具名(去重、按首次调用顺序)。**只有名字**,见 render_tool_trace。
+    tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,28 @@ def render_open_threads(open_threads: list[dict[str, Any]] | None) -> str | None
         note = neutralize_fence(fold_text(t.get("note") or ""))
         parts.append(f"{topic}({note})" if note else topic)
     return "还在忙的事:" + "、".join(parts)
+
+
+def render_tool_trace(tools: tuple[str, ...]) -> str | None:
+    """把"这一轮调用过哪些工具"渲染成一行,挂在该轮回复正文之前。
+
+    **为什么要有这一行**(M4-5c):L0 只回放 user/reply,工具事件从不回来。于是模型每轮
+    看到的历史是「用户报一笔开销 → 助手回一句『记好了』」,**里面没有任何证据表明助手
+    调用过工具**。它照着这份被裁掉工具栏的成绩单往下做——2026-08-22 实测:同一个上下文
+    连报十笔只调 33/100 次工具,而每笔在全新上下文里跑是 50/50。上下文里的示范打不过
+    系统提示里的规定,所以只能把示范补回去。
+
+    **只带名字,不带参数、不带结果。** 理由不是省 token:工具名是注册表里的封闭词表
+    (调用方还要过白名单,见 `Steward._recent_turns`),注入面为零;而参数和结果里装着
+    模型转述的外部内容(finance 的 note 就是已登记给 M5 的那笔账),放进 L0 等于在一个
+    更难收拾的位置提前把它捅破。
+
+    放在正文**之前**:真实顺序就是先调工具后作答,示范要照着真实顺序给。
+    无工具返回 None(不输出这一行)——闲聊本来就不该有,那也是要示范的一半。
+    """
+    if not tools:
+        return None
+    return f"[调用工具:{'、'.join(tools)}]"
 
 
 def _render_user_text(
@@ -180,7 +204,9 @@ def assemble(
                 ),
             }
         )
-        messages.append({"role": "assistant", "content": turn.assistant})
+        trace = render_tool_trace(turn.tools)
+        content = f"{trace}\n{turn.assistant}" if trace else turn.assistant
+        messages.append({"role": "assistant", "content": content})
     messages.append({"role": "user", "content": _render_envelope(envelope, tz)})
 
     return AssembledContext(system_prompt=system_prompt, messages=messages)

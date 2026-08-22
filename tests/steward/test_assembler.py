@@ -282,3 +282,78 @@ def test_render_open_threads_multiple_joined():
 
     line = render_open_threads([{"topic": "装修", "note": "在比价"}, {"topic": "买基金"}])
     assert line == "还在忙的事:装修(在比价)、买基金"
+
+
+# ── M4-5c:L0 回放工具痕迹 ────────────────────────────────────────────────
+
+
+def test_render_tool_trace_lists_names_only():
+    """痕迹行**只带名字**,不带参数、不带结果。
+
+    理由不是省 token:工具名是注册表里的封闭词表,注入面为零;而参数和结果里装着
+    模型转述的外部内容(note 那笔已登记给 M5 的账),放进 L0 等于在一个更难收拾的
+    位置提前把它捅破。
+    """
+    from lararium.steward.assembler import render_tool_trace
+
+    assert render_tool_trace(()) is None
+    assert render_tool_trace(("record_expense",)) == "[调用工具:record_expense]"
+    assert (
+        render_tool_trace(("read_skill", "record_expense"))
+        == "[调用工具:read_skill、record_expense]"
+    )
+
+
+def test_assistant_turn_carries_the_tool_trace_before_its_text():
+    """痕迹行在回复正文**之前**——真实顺序就是先调工具后作答,示范要照着真实顺序给。
+
+    这条是 M4-5c 的全部要害:不回放工具痕迹,L0 里的历史读起来就是
+    「用户报开销 → 助手说记好了」,里面没有任何调过工具的证据,而模型照着这份
+    被裁掉工具栏的成绩单往下做(2026-08-22 诊断:同上下文 33/100,空上下文 50/50)。
+    """
+    turn = Turn(
+        user="打车 28",
+        assistant="记好了:打车 28 元。",
+        ts="2026-08-22T12:00:00+08:00",
+        tools=("record_expense",),
+    )
+    ctx = build(Envelope.new(source="user", channel="cli", content="再来一笔"), l0=[turn])
+
+    assistant = next(m for m in ctx.messages if m["role"] == "assistant")
+    assert assistant["content"] == "[调用工具:record_expense]\n记好了:打车 28 元。"
+
+
+def test_turn_without_tools_renders_no_trace_line():
+    """没调工具的轮不加痕迹行——闲聊本来就不该有,那也是要示范的一半。"""
+    turn = Turn(user="今天有点累", assistant="辛苦了。", ts="2026-08-22T12:00:00+08:00")
+    ctx = build(Envelope.new(source="user", channel="cli", content="嗯"), l0=[turn])
+
+    assert next(m for m in ctx.messages if m["role"] == "assistant")["content"] == "辛苦了。"
+
+
+def test_tool_trace_does_not_touch_the_prefix():
+    """前缀区一个字节都不许变:这次改的是 L0(流水区),和 persona/目录/账本无关。"""
+    env = Envelope.new(source="user", channel="cli", content="再来一笔")
+    bare = Turn(user="打车 28", assistant="记好了。", ts="2026-08-22T12:00:00+08:00")
+    with_tools = Turn(
+        user="打车 28",
+        assistant="记好了。",
+        ts="2026-08-22T12:00:00+08:00",
+        tools=("record_expense",),
+    )
+
+    assert build(env, l0=[bare]).system_prompt == build(env, l0=[with_tools]).system_prompt
+
+
+def test_historical_turns_render_identically_across_assembles():
+    """严格追加:同一轮在后续任何一次组装里都渲染成同样的字节,否则 L0 缓存每轮全毁。"""
+    turn = Turn(
+        user="打车 28",
+        assistant="记好了。",
+        ts="2026-08-22T12:00:00+08:00",
+        tools=("read_skill", "record_expense"),
+    )
+    a = build(Envelope.new(source="user", channel="cli", content="一"), l0=[turn])
+    b = build(Envelope.new(source="user", channel="cli", content="二"), l0=[turn, turn])
+
+    assert b.messages[:2] == a.messages[:2]

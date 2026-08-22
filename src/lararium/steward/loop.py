@@ -240,6 +240,10 @@ class Steward:
             max_tokens=self._l0_token_budget(prefix_text, l1_text),
             max_turns=self.settings.l0_max_turns,
         )
+        # M4-5c:痕迹行的词表必须是**注册过的工具名**,认不出的丢掉。模型可以喊一个
+        # 不存在的工具名,框架照样把这次 tool-call 记进起居注——那串名字就是模型可控
+        # 文本。挡在进上下文这一步,"封闭词表、零注入面"才当得起(L3)。
+        known = {getattr(f, "__name__", "") for f in self.all_tools()}
         return [
             Turn(
                 user=r["user"],
@@ -250,6 +254,7 @@ class Steward:
                 ts=r.get("ts"),
                 # M3-3:历史轮带**当时冻结**的话头快照,渲染的是那份不是最新的
                 open_threads=r.get("open_threads"),
+                tools=tuple(t for t in r.get("tools", ()) if t in known),
             )
             for r in rows
         ]

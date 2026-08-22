@@ -8,6 +8,7 @@ from lararium.steward.journal import (
     OTHER_TOKENS_PER_CHAR,
     Journal,
     estimate_tokens,
+    recent_turns_estimate,
 )
 
 
@@ -118,11 +119,13 @@ def test_recent_turns_within_budget_carries_provenance_fields(journal):
 
 
 def test_estimate_tokens_mixed_cjk_and_latin():
-    """M3-1b:估算器 CJK 每字 0.8 / 非 CJK 每字 0.3(2026-08-19 mimo-v2.5 实测校准),
-    中英混排各按各的,别一刀切。"""
+    """M3-1b:估算器**中英混排各按各的算**,别一刀切。
+
+    这里刻意不写系数的具体数值:它跟 tokenizer 走,换模型就得重测,当前值和校准
+    方法写在 `journal.py` 那两个常量旁边——**文档也别抄数字**,抄了就会和代码分头漂移
+    (这条 docstring 上一版就写着 0.8/0.3,断言早改了它还留在那儿)。
+    """
     assert estimate_tokens("") == 0
-    # 引用常量而不是抄数字:系数**跟 tokenizer 走**,换模型就要重测(2026-08-22 已改过
-    # 一次)。这条测的是"混排各按各的算",不是那两个数字本身。
     assert estimate_tokens("你好世界") == int(4 * CJK_TOKENS_PER_CHAR)
     assert estimate_tokens("hello") == int(5 * OTHER_TOKENS_PER_CHAR)
     assert estimate_tokens("你好hello") == int(2 * CJK_TOKENS_PER_CHAR + 5 * OTHER_TOKENS_PER_CHAR)
@@ -133,14 +136,21 @@ def test_estimate_tokens_mixed_cjk_and_latin():
 def test_recent_turns_within_budget_stops_when_over(journal):
     """M3-1:从最新往回填,累计估算 token 超预算即停;返回时间正序(旧→新)。
 
-    各轮估算(纯 CJK,0.8/字 + 渲染开销 10):env-0=50, env-1=90, env-2=170,
-    env-3(newest)=250。budget=420 → 最新 env-3 必进(250),env-2(170)=420 仍在,
-    env-1(90)再进就 510>420。
+    预算**由估算器自己算出来**,不抄具体数字:系数和渲染开销都跟 tokenizer 走,
+    抄死了每次重新校准这条就红,而它测的是"填到超预算就停",不是那几个常量
+    (2026-08-23 重测 RENDER_OVERHEAD_NORMAL 10→30 时它就红过一次)。
+    给刚好装下最新两轮的预算,第三轮必须被挡在外面。
     """
     for i, u_len in enumerate([50, 100, 200, 300]):
         journal.append(f"env-{i}", "envelope", {"content": "用" * u_len})
 
-    turns = journal.recent_turns_within_budget(max_tokens=420)
+    def est(u_len: int) -> int:
+        return recent_turns_estimate({"user": "用" * u_len, "assistant": None, "tools": ()})
+
+    budget = est(300) + est(200)
+    assert budget + est(100) > budget, "第三轮必须确实装不下,否则这条测试是空转的"
+
+    turns = journal.recent_turns_within_budget(max_tokens=budget)
     assert [t["envelope_id"] for t in turns] == ["env-2", "env-3"], "应只留最新两轮,时间正序"
 
 
@@ -272,3 +282,44 @@ def test_append_tables_written_consistently(tmp_path, monkeypatch):
     monkeypatch.setattr(jmod, "embed", lambda t: None)
     j.append("env-b", "envelope", {"content": "模型不在向量也不建"})
     assert c("journal") == 3 and c("journal_fts") == 2 and c("journal_vec") == 1
+
+
+# ── M4-5c:L0 回放工具痕迹 ────────────────────────────────────────────────
+
+
+def test_recent_turns_carry_the_tool_names_of_that_turn(journal):
+    """L0 的每一轮要带上**那一轮**调过的工具名(M4-5c)。"""
+    journal.append("env-1", "envelope", {"content": "打车 28", "ts": "2026-08-22T12:00:00+08:00"})
+    journal.append("env-1", "tool_call", {"tool": "read_skill", "args": {}})
+    journal.append("env-1", "tool_call", {"tool": "record_expense", "args": {}})
+    journal.append("env-1", "reply", {"content": "记好了。"})
+    journal.append("env-2", "envelope", {"content": "今天有点累"})
+    journal.append("env-2", "reply", {"content": "辛苦了。"})
+
+    turns = {t["envelope_id"]: t for t in journal.recent_turns(10)}
+
+    assert turns["env-1"]["tools"] == ("read_skill", "record_expense")
+    assert turns["env-2"]["tools"] == ()
+
+
+def test_repeated_tool_calls_collapse_to_one_name(journal):
+    """同名重复只留一个。
+
+    诊断里有一轮连调七次 `record_expense`(它在批量补课)。把「调了 7 次」照实渲进 L0
+    等于给模型示范"一轮可以补七笔",而这正是要纠正的行为。L0 是渲染不是流水账,
+    逐字真相在起居注里,`replay()` 一条不少。
+    """
+    journal.append("env-1", "envelope", {"content": "补记"})
+    for _ in range(7):
+        journal.append("env-1", "tool_call", {"tool": "record_expense", "args": {}})
+    journal.append("env-1", "reply", {"content": "都记上了。"})
+
+    assert journal.recent_turns(10)[0]["tools"] == ("record_expense",)
+
+
+def test_budget_accounts_for_the_tool_trace_line(journal):
+    """痕迹行进了上下文就要进预算——不算就是又一次"渲染后比原文贵"的低估。"""
+    bare = {"user": "打车 28", "assistant": "记好了。", "tools": ()}
+    traced = {**bare, "tools": ("read_skill", "record_expense")}
+
+    assert recent_turns_estimate(traced) > recent_turns_estimate(bare)
