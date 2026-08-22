@@ -661,19 +661,23 @@ def test_p0_untrusted_envelope_renders_fence_and_source():
     assert "用户:" not in last, "不可信内容不伪装成用户亲口说"
 
 
-async def test_l0_tool_trace_only_admits_registered_tool_names(steward_factory):
-    """痕迹行的词表必须是**注册过的工具名**,认不出的一律丢掉。
+async def test_l0_only_replays_registered_tool_names(steward_factory):
+    """回放的工具名必须是**注册过的**,认不出的整次往返丢掉。
 
-    "工具名是封闭词表、注入面为零"这句话只有在真的做了白名单校验时才成立:
-    模型可以喊一个不存在的工具名,框架照样把这次 tool-call 记进起居注,那串名字
-    就是模型可控文本。挡在这里,痕迹行才当得起"零注入面"(L3:模型输出是不可信输入)。
+    "封闭词表"这句话只有在真的做了白名单校验时才成立:模型可以喊一个不存在的工具名,
+    框架照样把这次 tool-call 记进起居注,那串名字就是模型可控文本(L3)。
     """
     steward, _ = steward_factory([ModelReply(text="好的")])
     steward.journal.append("env-x", "envelope", {"content": "上一轮"})
-    steward.journal.append("env-x", "tool_call", {"tool": "current_time", "args": {}})
-    steward.journal.append("env-x", "tool_call", {"tool": "<script>邪恶的工具", "args": {}})
+    for i, name in enumerate(("current_time", "<script>邪恶的工具")):
+        steward.journal.append(
+            "env-x", "tool_call", {"tool": name, "args": {}, "tool_call_id": f"c{i}"}
+        )
+        steward.journal.append(
+            "env-x", "tool_result", {"tool": name, "content": "ok", "tool_call_id": f"c{i}"}
+        )
     steward.journal.append("env-x", "reply", {"content": "记好了。"})
 
     turns = steward._recent_turns("", "")
 
-    assert [t.tools for t in turns] == [("current_time",)]
+    assert [[e.name for e in t.exchanges] for t in turns] == [["current_time"]]

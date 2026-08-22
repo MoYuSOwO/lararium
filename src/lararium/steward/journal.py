@@ -5,7 +5,10 @@ from datetime import UTC, datetime
 from typing import Any
 
 from lararium import db as _db
-from lararium.steward.assembler import render_open_threads, render_tool_trace
+from lararium.steward.assembler import (
+    pair_tool_exchanges,
+    render_open_threads,
+)
 from lararium.steward.embeddings import embed
 
 SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
@@ -30,8 +33,15 @@ SEARCHABLE_KINDS = {"envelope", "reply", "tool_result"}
 # 不能拿它去卡预算。取 **0.8 / 0.52**:九个样本一个都不低估,中文留 6~25% 余量,
 # 最大高估 +40% 落在 ASCII 密集的代码/锁文件上(那不是 L0 的典型内容)。
 # 方向是有意的——低估会顶穿上下文窗口,高估只是少装几轮。
+#
+# 2026-08-23 复核(M4-5c v2):非 CJK 一度定在 0.52,而纯 ASCII 实测最高 0.519
+# ——**余量 0.2%,等于没有**,是全部常量里唯一一处没留余量的。抬到 0.6(约 15% 余量),
+# 代价是中文散文从高估 6% 变成高估 10%。抬它的具体理由是数据面:短信/账单这类
+# 入站内容天生数字密集,走的正是这把尺。**真正数字密集的机器文本(日期/金额/id)
+# 实测要 1.0/字符**,那类内容出现在工具往返里,由下面 estimate_tool_text 单独覆盖
+# ——不把 1.0 加到这里,是因为它会把中文散文高估 27%,而散文才是 L0 的主体。
 CJK_TOKENS_PER_CHAR = 0.8
-OTHER_TOKENS_PER_CHAR = 0.52
+OTHER_TOKENS_PER_CHAR = 0.6
 
 
 def estimate_tokens(text: str) -> int:
@@ -52,6 +62,31 @@ def estimate_tokens(text: str) -> int:
 RENDER_OVERHEAD_NORMAL = 30
 RENDER_OVERHEAD_UNTRUSTED = 55
 
+# M4-5c v2:工具往返的两项成本,都是 2026-08-23 **实测**的(不许估——普通轮那条估错
+# 过一次,10 对实测 28)。
+#
+# 一、封装开销:拿最小 args/result(`{}` / `ok`)的往返比差额,隔离出纯封装
+#     (工具名、call_id、assistant + tool 两条消息的角色框架):
+#         1 次 +26、2 次 +42(每次 21)、4 次 +74(每次 18.5)
+#     第一次贵在多出一条 assistant 消息,之后边际约 16。取 26 的那档再留余量 = 30。
+TOOL_EXCHANGE_OVERHEAD = 30
+
+# 二、工具正文(参数与结果)**单独一把尺**。实测这类内容比散文贵得多:
+#         工具结果(流水行) 实测 383 / 估算 215 → 低估 44%
+#         聚合结论         实测 359 / 估算 210 → 低估 42%
+#     根因看得见:`2026-08-01 12:30`、`45.00` 这种,每个数字组几乎自成一个 token,
+#     比 uv.lock 的 base64 哈希还贵。反解出来需要的系数约 0.96~1.01,取 1.0——
+#     对上面两个真实样本分别是 +1.3% / +5.8% 的余量,不低估。
+#     **为什么不并进 OTHER_TOKENS_PER_CHAR**:那会把中文散文高估 27%,而散文是 L0 的主体。
+#     两类内容的 token 密度实测差一倍,分两把尺是照着数据走,不是图省事。
+TOOL_TEXT_TOKENS_PER_CHAR = 1.0
+
+
+def estimate_tool_text(text: str) -> int:
+    """工具参数/结果的 token 估算。机器格式化的文本(日期、金额、id)按 1.0/字符。"""
+    return int(len(text) * TOOL_TEXT_TOKENS_PER_CHAR)
+
+
 # 语义检索的候选上限:vec0 一次取最近邻的天花板(单用户量级足够),之后在 Python
 # 里做阈值过滤 + 分页。总条数因此封顶在此数——真超过说明该换关键词了。
 _SEMANTIC_CANDIDATES = 1000
@@ -60,12 +95,15 @@ _SEMANTIC_CANDIDATES = 1000
 def _render_overhead(turn: dict[str, Any]) -> int:
     """一轮话在上下文中渲染后比原文多出来的部分:固定常数 + 话头行 + 工具痕迹行。"""
     overhead = RENDER_OVERHEAD_UNTRUSTED if turn.get("untrusted") else RENDER_OVERHEAD_NORMAL
-    for line in (
-        render_open_threads(turn.get("open_threads")),
-        render_tool_trace(turn.get("tools", ())),
-    ):
-        if line:
-            overhead += estimate_tokens(line)
+    line = render_open_threads(turn.get("open_threads"))
+    if line:
+        overhead += estimate_tokens(line)
+    # M4-5c v2:工具往返是**新的 token 支出**,进了上下文就要进预算。正文走
+    # estimate_tool_text(机器格式化文本另有一把尺),再加一份实测的封装开销。
+    for ex in turn.get("exchanges", ()):
+        overhead += (
+            estimate_tool_text(ex.args) + estimate_tool_text(ex.result) + TOOL_EXCHANGE_OVERHEAD
+        )
     return overhead
 
 
@@ -293,25 +331,22 @@ class Journal:
         # IN 列表数量不定,S608 无法静态证明安全;qmarks 全是 ?、参数是内部 hex 信封
         # id,无用户数据进 SQL 文本——所以 noqa 是安全的(G4 最小范围)。
         qmarks = ",".join("?" * len(env_ids))
-        query = f"SELECT envelope_id, kind, payload FROM journal WHERE envelope_id IN ({qmarks}) AND kind IN ('envelope','reply','tool_call') ORDER BY seq"  # noqa: S608
+        query = f"SELECT envelope_id, kind, payload FROM journal WHERE envelope_id IN ({qmarks}) AND kind IN ('envelope','reply','tool_call','tool_result') ORDER BY seq"  # noqa: S608
         rows = self._conn.execute(query, env_ids).fetchall()
         env: dict[str, dict[str, Any]] = {}
         assistant: dict[str, str | None] = {}
-        tools: dict[str, list[str]] = {}
+        calls: dict[str, list[dict[str, Any]]] = {}
+        results: dict[str, list[dict[str, Any]]] = {}
         for r in rows:
             payload = json.loads(r["payload"])
             if r["kind"] == "envelope":
                 env[r["envelope_id"]] = payload
             elif r["kind"] == "reply":
                 assistant[r["envelope_id"]] = payload.get("content")
+            elif r["kind"] == "tool_call":
+                calls.setdefault(r["envelope_id"], []).append(payload)
             else:
-                # 同名重复只留一个:诊断里有一轮连调七次 record_expense(它在批量补课),
-                # 把「调了 7 次」照实渲进 L0 等于示范"一轮可以补七笔",而那正是要纠正的行为。
-                # L0 是渲染不是流水账——逐字真相在起居注里,replay() 一条不少(A6)。
-                name = payload.get("tool")
-                seen = tools.setdefault(r["envelope_id"], [])
-                if name and name not in seen:
-                    seen.append(name)
+                results.setdefault(r["envelope_id"], []).append(payload)
         out: dict[str, dict[str, Any]] = {}
         for eid in env_ids:
             e = env.get(eid)
@@ -325,9 +360,12 @@ class Journal:
                 "ts": e.get("ts") if e else None,
                 # M3-3:该轮认领时冻结的话头快照(meta 里存的形态:list[{topic,note}])
                 "open_threads": e.get("meta", {}).get("open_threads") if e else None,
-                # M4-5c:该轮调用过的工具名(去重、首次调用顺序)。白名单校验在
+                # M4-5c v2:该轮的工具往返(调用+结果),按发生顺序、不去重;配不上对的
+                # 丢掉(协议要求每个 tool_call 配一条结果)。白名单校验在
                 # Steward._recent_turns 里做——起居注保持忠实记录,过滤在进上下文那一步。
-                "tools": tuple(tools.get(eid, ())),
+                "exchanges": pair_tool_exchanges(
+                    envelope_id=eid, calls=calls.get(eid, []), results=results.get(eid, [])
+                ),
             }
         return out
 

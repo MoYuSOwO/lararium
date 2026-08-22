@@ -96,3 +96,53 @@ async def test_prefix_survives_a_tool_round_trip(wire):
     for i, b in enumerate(bodies, 1):
         assert b["messages"][0] == {"role": "system", "content": PREFIX}, f"第{i}次请求前缀不对"
     assert len({head(b) for b in bodies}) == 1
+
+
+# ── M4-5c v2:历史里的工具往返必须以原生形状发出去 ─────────────────────────
+
+
+async def test_history_tool_exchange_is_sent_as_native_tool_calls(wire):
+    """★ M4-5c v2 的要害:断言**真正发出去的报文**里,历史工具调用走的是协议字段。
+
+    v1 把它渲染成助手正文里的一行字,模型学会了写那一行来代替调那个工具
+    (5/5 漏出的痕迹行零真实调用)。原生形状下调用在 `tool_calls` 字段里、
+    结果是 `role: "tool"` 的独立消息——**正文通道里写什么都伪造不出一次调用**。
+    这条只信 HTTP body,不信库内部表示(补1b 的教训:FunctionModel 看不见适配器)。
+    """
+    client, bodies = wire
+    ctx = AssembledContext(
+        system_prompt=PREFIX,
+        messages=[
+            {"role": "user", "content": "打车 28"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "env-abcd-0", "name": "record_expense", "args": '{"amount": 28}'}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "env-abcd-0",
+                "name": "record_expense",
+                "content": "记好了。",
+            },
+            {"role": "assistant", "content": "记好了:打车 28 元。"},
+            {"role": "user", "content": "再来一笔"},
+        ],
+    )
+    await client.run(ctx, [], [])
+
+    msgs = bodies[-1]["messages"]
+    call_msg = next(m for m in msgs if m.get("tool_calls"))
+    assert call_msg["role"] == "assistant"
+    assert call_msg["tool_calls"][0]["id"] == "env-abcd-0"
+    assert call_msg["tool_calls"][0]["function"]["name"] == "record_expense"
+    assert "28" in call_msg["tool_calls"][0]["function"]["arguments"]
+
+    tool_msg = next(m for m in msgs if m.get("role") == "tool")
+    assert tool_msg["tool_call_id"] == "env-abcd-0"
+    assert tool_msg["content"] == "记好了。"
+
+    # 正文通道里不许出现工具痕迹——v1 就是把它写在这儿才被伪造的
+    assert all("record_expense" not in (m.get("content") or "") for m in msgs)

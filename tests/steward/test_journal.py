@@ -284,42 +284,64 @@ def test_append_tables_written_consistently(tmp_path, monkeypatch):
     assert c("journal") == 3 and c("journal_fts") == 2 and c("journal_vec") == 1
 
 
-# ── M4-5c:L0 回放工具痕迹 ────────────────────────────────────────────────
+# ── M4-5c v2:L0 用协议层原生形状回放工具往返 ─────────────────────────────
 
 
-def test_recent_turns_carry_the_tool_names_of_that_turn(journal):
-    """L0 的每一轮要带上**那一轮**调过的工具名(M4-5c)。"""
-    journal.append("env-1", "envelope", {"content": "打车 28", "ts": "2026-08-22T12:00:00+08:00"})
-    journal.append("env-1", "tool_call", {"tool": "read_skill", "args": {}})
-    journal.append("env-1", "tool_call", {"tool": "record_expense", "args": {}})
+def _turn_with_calls(journal, n: int = 1) -> dict:
+    journal.append("env-1", "envelope", {"content": "打车 28", "ts": "2026-08-23T12:00:00+08:00"})
+    for i in range(n):
+        journal.append(
+            "env-1", "tool_call", {"tool": "record_expense", "args": {}, "tool_call_id": f"c{i}"}
+        )
+        journal.append(
+            "env-1",
+            "tool_result",
+            {"tool": "record_expense", "content": "记好了。", "tool_call_id": f"c{i}"},
+        )
     journal.append("env-1", "reply", {"content": "记好了。"})
-    journal.append("env-2", "envelope", {"content": "今天有点累"})
-    journal.append("env-2", "reply", {"content": "辛苦了。"})
-
-    turns = {t["envelope_id"]: t for t in journal.recent_turns(10)}
-
-    assert turns["env-1"]["tools"] == ("read_skill", "record_expense")
-    assert turns["env-2"]["tools"] == ()
+    return {t["envelope_id"]: t for t in journal.recent_turns(10)}["env-1"]
 
 
-def test_repeated_tool_calls_collapse_to_one_name(journal):
-    """同名重复只留一个。
+def test_recent_turns_carry_the_tool_exchanges_of_that_turn(journal):
+    """L0 的每一轮要带上**那一轮**的工具往返(调用 + 结果),配好对。"""
+    turn = _turn_with_calls(journal)
 
-    诊断里有一轮连调七次 `record_expense`(它在批量补课)。把「调了 7 次」照实渲进 L0
-    等于给模型示范"一轮可以补七笔",而这正是要纠正的行为。L0 是渲染不是流水账,
-    逐字真相在起居注里,`replay()` 一条不少。
+    assert [(e.name, e.result) for e in turn["exchanges"]] == [("record_expense", "记好了。")]
+
+
+def test_repeated_calls_are_not_collapsed(journal):
+    """同名重复**照实**渲染,不去重。
+
+    v1 折成一个,理由是"别示范批量补记";原生表示里每次调用必须配一条结果,
+    折掉就是在协议层撒谎,还会留下配不上对的 tool_call。批量补记要是回来了那是数据。
     """
-    journal.append("env-1", "envelope", {"content": "补记"})
-    for _ in range(7):
-        journal.append("env-1", "tool_call", {"tool": "record_expense", "args": {}})
-    journal.append("env-1", "reply", {"content": "都记上了。"})
+    turn = _turn_with_calls(journal, n=7)
 
-    assert journal.recent_turns(10)[0]["tools"] == ("record_expense",)
+    assert len(turn["exchanges"]) == 7
+    assert len({e.call_id for e in turn["exchanges"]}) == 7, "call_id 必须两两不同"
 
 
-def test_budget_accounts_for_the_tool_trace_line(journal):
-    """痕迹行进了上下文就要进预算——不算就是又一次"渲染后比原文贵"的低估。"""
-    bare = {"user": "打车 28", "assistant": "记好了。", "tools": ()}
-    traced = {**bare, "tools": ("read_skill", "record_expense")}
+def test_calls_without_a_result_are_dropped(journal):
+    """配不上结果的调用丢掉——发出去一个没配对的 tool_call,服务商直接报错。"""
+    journal.append("env-1", "envelope", {"content": "打车 28"})
+    journal.append(
+        "env-1", "tool_call", {"tool": "record_expense", "args": {}, "tool_call_id": "c0"}
+    )
+    journal.append("env-1", "reply", {"content": "记好了。"})
 
-    assert recent_turns_estimate(traced) > recent_turns_estimate(bare)
+    assert journal.recent_turns(10)[0]["exchanges"] == ()
+
+
+def test_budget_accounts_for_the_tool_exchanges(journal):
+    """工具往返是新的 token 支出,进了上下文就要进预算(不算就是又一次静默低估)。"""
+    from lararium.steward.assembler import ToolExchange
+
+    bare = {"user": "打车 28", "assistant": "记好了。", "exchanges": ()}
+    with_ex = {
+        **bare,
+        "exchanges": (
+            ToolExchange(name="record_expense", call_id="e-0", args="{}", result="记好了。"),
+        ),
+    }
+
+    assert recent_turns_estimate(with_ex) > recent_turns_estimate(bare)

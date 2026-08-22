@@ -132,3 +132,26 @@ async def test_a_monthly_arrangement_is_still_proposed(live_steward):
     print(f"\n[房租] → {tools}")
 
     assert "propose_fact" in tools, f"月级安排没被 propose,矫枉过正了。工具调用:{tools}"
+
+
+async def test_a_reply_that_claims_a_record_is_backed_by_a_real_tool_call(live_steward, tmp_path):
+    """**常驻断言**:回复声称记了 ⇒ 该轮起居注里必须有真实的 `record_expense` 调用。
+
+    原生表示(M4-5c v2)下模型伪造不出一次调用——调用在协议字段里,不在正文通道。
+    但它照样能在正文里用人话声称记了。这条守的就是那条缝:说了没做,用户看到"记上了",
+    账上什么都没有,而他不会再说第二遍。
+
+    这条以后一直留着,不随 M4 结束。
+    """
+    claims = ("记好了", "记上了", "记下了", "已记", "记了")
+    unbacked = []
+
+    for line in DAILY_EXPENSES:
+        reply, tools = await _say(live_steward, line)
+        if any(c in reply for c in claims) and "record_expense" not in tools:
+            unbacked.append((line, reply, tools))
+
+    print(f"\n[无凭证的声称] {len(unbacked)}/{len(DAILY_EXPENSES)}")
+    for line, reply, tools in unbacked:
+        print(f"  [{line}] tools={tools}\n      {reply}")
+    assert not unbacked, f"{len(unbacked)} 轮声称记了但没有真实调用:{[u[0] for u in unbacked]}"

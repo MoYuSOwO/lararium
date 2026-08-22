@@ -1,3 +1,4 @@
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,14 +28,35 @@ class Turn:
     # 该轮认领时冻结的话头快照(meta["open_threads"] 的形态:list[{topic,note}])。
     # 历史轮渲染的是**当时那份**,不是最新的——这是 append-only 成立的另一半。
     open_threads: list[dict[str, Any]] | None = None
-    # M4-5c:该轮调用过的工具名(去重、按首次调用顺序)。**只有名字**,见 render_tool_trace。
-    tools: tuple[str, ...] = ()
+    # M4-5c v2:该轮的工具往返(调用 + 结果),按发生顺序、**不去重**。
+    # 渲染成协议层的原生形状,不是正文里的一行字,见 assemble。
+    exchanges: tuple["ToolExchange", ...] = ()
+
+
+# 单条工具结果进 L0 的字符上限。结果是模型可控长度(search_history 能吐 20 条、
+# read_skill 能吐整份 SKILL.md),不封顶就是一次工具调用顶穿 L0。
+# 截断**必须看得见**:静默截断读起来和"就这些"一模一样,模型会拿残缺的结果下结论(M4-3)。
+MAX_TOOL_RESULT_CHARS = 200
+
+
+@dataclass(frozen=True)
+class ToolExchange:
+    """历史轮里的一次工具往返:一次调用配一条结果。
+
+    `call_id` 是**自己造的**(见 pair_tool_exchanges),不是服务商回的那串——那是
+    模型/服务商可控文本,而且要逐字节稳定(缓存)。args / result 都已经过刀。
+    """
+
+    name: str
+    call_id: str
+    args: str
+    result: str
 
 
 @dataclass(frozen=True)
 class AssembledContext:
     system_prompt: str
-    messages: list[dict[str, str]]
+    messages: list[dict[str, Any]]
 
 
 FENCE_OPEN = "<<<"
@@ -83,26 +105,67 @@ def render_open_threads(open_threads: list[dict[str, Any]] | None) -> str | None
     return "还在忙的事:" + "、".join(parts)
 
 
-def render_tool_trace(tools: tuple[str, ...]) -> str | None:
-    """把"这一轮调用过哪些工具"渲染成一行,挂在该轮回复正文之前。
+def neutralize_model_text(text: str) -> str:
+    """模型写的、会被重新喂给模型的文本,统一过这两刀:折行 + 中和分隔符。
 
-    **为什么要有这一行**(M4-5c):L0 只回放 user/reply,工具事件从不回来。于是模型每轮
-    看到的历史是「用户报一笔开销 → 助手回一句『记好了』」,**里面没有任何证据表明助手
-    调用过工具**。它照着这份被裁掉工具栏的成绩单往下做——2026-08-22 实测:同一个上下文
-    连报十笔只调 33/100 次工具,而每笔在全新上下文里跑是 50/50。上下文里的示范打不过
-    系统提示里的规定,所以只能把示范补回去。
-
-    **只带名字,不带参数、不带结果。** 理由不是省 token:工具名是注册表里的封闭词表
-    (调用方还要过白名单,见 `Steward._recent_turns`),注入面为零;而参数和结果里装着
-    模型转述的外部内容(finance 的 note 就是已登记给 M5 的那笔账),放进 L0 等于在一个
-    更难收拾的位置提前把它捅破。
-
-    放在正文**之前**:真实顺序就是先调工具后作答,示范要照着真实顺序给。
-    无工具返回 None(不输出这一行)——闲聊本来就不该有,那也是要示范的一半。
+    折行防的是"一条内容伪造出后续结构"(P1-2),中和防的是"正文里的围栏符提前闭合
+    围栏"(P1-3)。工具结果和调用参数都归这一类——**里面装的是模型转述的外部内容**
+    (finance 的 note 就是登记在案的那笔),它们进 L0 就得和不可信内容走同一套刀。
     """
-    if not tools:
-        return None
-    return f"[调用工具:{'、'.join(tools)}]"
+    return neutralize_fence(fold_text(text))
+
+
+def _neutralize_args(args: Any) -> str:
+    """把调用参数渲染成确定性的 JSON 字符串,字符串值逐个过刀。
+
+    参数不是可选项:原生表示里一次调用没有 args 就是残缺报文。但 args 里同样装着
+    模型转述的外部内容,所以进 L0 前照样过刀。sort_keys 保证字节稳定(缓存)。
+    """
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            return neutralize_model_text(args)
+    if not isinstance(args, dict):
+        return neutralize_model_text("" if args is None else str(args))
+    clean = {k: neutralize_model_text(v) if isinstance(v, str) else v for k, v in args.items()}
+    return json.dumps(clean, ensure_ascii=False, sort_keys=True)
+
+
+def build_tool_exchange(*, name: str, call_id: str, args: Any, result: str) -> ToolExchange:
+    """造一次往返:参数与结果都过刀,结果再按上限截断(截断看得见)。"""
+    text = neutralize_model_text(result or "")
+    if len(text) > MAX_TOOL_RESULT_CHARS:
+        dropped = len(text) - MAX_TOOL_RESULT_CHARS
+        text = f"{text[:MAX_TOOL_RESULT_CHARS]}…(还有 {dropped} 字未列出)"
+    return ToolExchange(name=name, call_id=call_id, args=_neutralize_args(args), result=text)
+
+
+def pair_tool_exchanges(
+    *, envelope_id: str, calls: list[dict[str, Any]], results: list[dict[str, Any]]
+) -> tuple[ToolExchange, ...]:
+    """把该轮的调用和结果配成对,**配不上的一律丢掉**。
+
+    协议要求每个 tool_call 都有一条 tool 结果消息,发出去一个没配对的,服务商直接报错
+    ——宁可少渲染一次往返,不许拼出非法报文。配对用起居注里记的服务商 id,
+    但**对外发出的 call_id 是自己造的**(`{envelope_id[:8]}-{序号}`):确定性、
+    零服务商文本。**不去重**:每次调用都要配一条结果,折掉就是在协议层撒谎。
+    """
+    by_id = {r.get("tool_call_id"): r for r in results if r.get("tool_call_id")}
+    out: list[ToolExchange] = []
+    for call in calls:
+        result = by_id.get(call.get("tool_call_id"))
+        if result is None:
+            continue
+        out.append(
+            build_tool_exchange(
+                name=str(call.get("tool") or ""),
+                call_id=f"{envelope_id[:8]}-{len(out)}",
+                args=call.get("args"),
+                result=str(result.get("content") or ""),
+            )
+        )
+    return tuple(out)
 
 
 def _render_user_text(
@@ -181,7 +244,7 @@ def assemble(
         persona=persona.strip(), directory=directory.strip(), ledger=ledger.strip()
     )
 
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     tz = ZoneInfo(timezone)
     if l1.strip():
         messages.append({"role": "user", "content": f"# 更早的对话摘要\n{l1.strip()}"})
@@ -204,9 +267,32 @@ def assemble(
                 ),
             }
         )
-        trace = render_tool_trace(turn.tools)
-        content = f"{trace}\n{turn.assistant}" if trace else turn.assistant
-        messages.append({"role": "assistant", "content": content})
+        # M4-5c v2:工具往返走**协议层的原生形状**——一条带 tool_calls 的 assistant
+        # 加每次调用一条 tool 结果消息。v1 是把工具名渲染成助手正文里的一行字,
+        # 实测模型学会了"写那一行"来代替"调那个工具"(5/5 漏出的痕迹行零真实调用):
+        # 文本通道里的记号,模型在同一个通道里写字就伪造得出来。原生字段伪造不出来。
+        # 简化了一处并如实说明:一轮里若有多次请求(调用→作答→再调用),这里把所有调用
+        # 收进同一条 assistant、结果依次跟在后面。逐字真相在起居注,replay() 一条不少(A6)。
+        if turn.exchanges:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": e.call_id, "name": e.name, "args": e.args} for e in turn.exchanges
+                    ],
+                }
+            )
+            for e in turn.exchanges:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": e.call_id,
+                        "name": e.name,
+                        "content": e.result,
+                    }
+                )
+        messages.append({"role": "assistant", "content": turn.assistant})
     messages.append({"role": "user", "content": _render_envelope(envelope, tz)})
 
     return AssembledContext(system_prompt=system_prompt, messages=messages)

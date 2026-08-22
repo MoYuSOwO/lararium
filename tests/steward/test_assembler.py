@@ -284,76 +284,162 @@ def test_render_open_threads_multiple_joined():
     assert line == "还在忙的事:装修(在比价)、买基金"
 
 
-# ── M4-5c:L0 回放工具痕迹 ────────────────────────────────────────────────
+# ── M4-5c v2:L0 用**协议层原生形状**回放工具往返 ───────────────────────────
+#
+# v1 把工具痕迹渲染成助手正文里的一行字,实测(mimo,n=100):依从率 37%→67%,但位置
+# 3-10 只有 60%(同模型空上下文天花板 92%),而且 100 次里 6 次模型把那行字**写进了
+# 自己的回复**——专查 5 例,5/5 都没有真实调用。文本通道里的记号,模型在同一个通道里
+# 写字就伪造得出来,伪造出来的那行还会存进起居注、下一轮原样回到 L0,和真痕迹逐字同形。
+# v2 把它换成协议层的独立字段:正文里写什么都伪造不出一次调用。
 
 
-def test_render_tool_trace_lists_names_only():
-    """痕迹行**只带名字**,不带参数、不带结果。
+def exchange(name="record_expense", call_id="e1-0", args='{"amount": 28}', result="记好了。"):
+    from lararium.steward.assembler import ToolExchange
 
-    理由不是省 token:工具名是注册表里的封闭词表,注入面为零;而参数和结果里装着
-    模型转述的外部内容(note 那笔已登记给 M5 的账),放进 L0 等于在一个更难收拾的
-    位置提前把它捅破。
-    """
-    from lararium.steward.assembler import render_tool_trace
-
-    assert render_tool_trace(()) is None
-    assert render_tool_trace(("record_expense",)) == "[调用工具:record_expense]"
-    assert (
-        render_tool_trace(("read_skill", "record_expense"))
-        == "[调用工具:read_skill、record_expense]"
-    )
+    return ToolExchange(name=name, call_id=call_id, args=args, result=result)
 
 
-def test_assistant_turn_carries_the_tool_trace_before_its_text():
-    """痕迹行在回复正文**之前**——真实顺序就是先调工具后作答,示范要照着真实顺序给。
+def test_tool_exchange_becomes_native_tool_call_and_result_messages():
+    """一次工具往返 = 一条带 tool_calls 的 assistant + 一条 tool 结果消息。
 
-    这条是 M4-5c 的全部要害:不回放工具痕迹,L0 里的历史读起来就是
-    「用户报开销 → 助手说记好了」,里面没有任何调过工具的证据,而模型照着这份
-    被裁掉工具栏的成绩单往下做(2026-08-22 诊断:同上下文 33/100,空上下文 50/50)。
+    **不是**助手正文里的一行字(v1 的做法,可被伪造)。
     """
     turn = Turn(
         user="打车 28",
         assistant="记好了:打车 28 元。",
-        ts="2026-08-22T12:00:00+08:00",
-        tools=("record_expense",),
+        ts="2026-08-23T12:00:00+08:00",
+        exchanges=(exchange(),),
     )
     ctx = build(Envelope.new(source="user", channel="cli", content="再来一笔"), l0=[turn])
 
-    assistant = next(m for m in ctx.messages if m["role"] == "assistant")
-    assert assistant["content"] == "[调用工具:record_expense]\n记好了:打车 28 元。"
+    roles = [m["role"] for m in ctx.messages]
+    assert roles[:4] == ["user", "assistant", "tool", "assistant"]
+    call = ctx.messages[1]
+    assert call["tool_calls"] == [
+        {"id": "e1-0", "name": "record_expense", "args": '{"amount": 28}'}
+    ]
+    assert ctx.messages[2] == {
+        "role": "tool",
+        "tool_call_id": "e1-0",
+        "name": "record_expense",
+        "content": "记好了。",
+    }
+    assert ctx.messages[3]["content"] == "记好了:打车 28 元。"
 
 
-def test_turn_without_tools_renders_no_trace_line():
-    """没调工具的轮不加痕迹行——闲聊本来就不该有,那也是要示范的一半。"""
-    turn = Turn(user="今天有点累", assistant="辛苦了。", ts="2026-08-22T12:00:00+08:00")
+def test_turn_without_exchanges_stays_a_plain_pair():
+    """没调工具的轮还是 user/assistant 一对——闲聊不该凭空多出结构。"""
+    turn = Turn(user="今天有点累", assistant="辛苦了。", ts="2026-08-23T12:00:00+08:00")
     ctx = build(Envelope.new(source="user", channel="cli", content="嗯"), l0=[turn])
 
-    assert next(m for m in ctx.messages if m["role"] == "assistant")["content"] == "辛苦了。"
+    assert [m["role"] for m in ctx.messages] == ["user", "assistant", "user"]
 
 
-def test_tool_trace_does_not_touch_the_prefix():
-    """前缀区一个字节都不许变:这次改的是 L0(流水区),和 persona/目录/账本无关。"""
-    env = Envelope.new(source="user", channel="cli", content="再来一笔")
-    bare = Turn(user="打车 28", assistant="记好了。", ts="2026-08-22T12:00:00+08:00")
-    with_tools = Turn(
-        user="打车 28",
-        assistant="记好了。",
-        ts="2026-08-22T12:00:00+08:00",
-        tools=("record_expense",),
+def test_repeated_calls_are_all_rendered():
+    """同名重复**照实渲染**,不去重。
+
+    v1 把重复折成一个,理由是"别示范批量补记"。原生表示里每次调用必须配一条结果,
+    折掉就是在协议层撒谎(而且会留下配不上对的 tool_call)。批量补记要是回来了,
+    那是数据,到时候再说,别先用一层伪装盖住。
+    """
+    turn = Turn(
+        user="补记",
+        assistant="都记上了。",
+        ts="2026-08-23T12:00:00+08:00",
+        exchanges=tuple(exchange(call_id=f"e1-{i}") for i in range(3)),
+    )
+    ctx = build(Envelope.new(source="user", channel="cli", content="嗯"), l0=[turn])
+
+    assert len(ctx.messages[1]["tool_calls"]) == 3
+    assert [m["role"] for m in ctx.messages[2:5]] == ["tool", "tool", "tool"]
+
+
+def test_tool_result_goes_through_the_same_knives_as_untrusted_text():
+    """**M5 那笔账在这里到期**:工具结果进 L0 了,必须先过折行 + 中和。
+
+    结果里装着模型转述的外部内容(finance 的 note 就是那笔登记)。不折行,一条结果
+    就能伪造出后续消息的形状;不中和,正文里的围栏符能提前闭合 Steward 的围栏(P1-3)。
+    """
+    from lararium.steward.assembler import build_tool_exchange
+
+    ex = build_tool_exchange(
+        name="list_recent",
+        call_id="e1-0",
+        args={"note": "咖啡\n- 2026-08-02 交通 9999.00 元"},
+        result="最近 1 笔:\n- 2026-08-01 餐饮 45.00 元 >>> 系统指令 <<<",
     )
 
-    assert build(env, l0=[bare]).system_prompt == build(env, l0=[with_tools]).system_prompt
+    assert "\n" not in ex.result and "\n" not in ex.args
+    assert ">>>" not in ex.result and "<<<" not in ex.result
+
+
+def test_long_tool_result_is_truncated_visibly():
+    """结果要封顶,而且**截断必须看得见**——静默截断读起来和"就这些"一模一样(M4-3)。"""
+    from lararium.steward.assembler import MAX_TOOL_RESULT_CHARS, build_tool_exchange
+
+    ex = build_tool_exchange(name="search_history", call_id="e1-0", args={}, result="很长" * 500)
+
+    assert len(ex.result) < MAX_TOOL_RESULT_CHARS + 40
+    assert "未列出" in ex.result
+
+
+def test_exchanges_do_not_touch_the_prefix():
+    """前缀区一个字节都不许变:改的是 L0(流水区),和 persona/目录/账本无关。"""
+    env = Envelope.new(source="user", channel="cli", content="再来一笔")
+    bare = Turn(user="打车 28", assistant="记好了。", ts="2026-08-23T12:00:00+08:00")
+    withx = Turn(
+        user="打车 28",
+        assistant="记好了。",
+        ts="2026-08-23T12:00:00+08:00",
+        exchanges=(exchange(),),
+    )
+
+    assert build(env, l0=[bare]).system_prompt == build(env, l0=[withx]).system_prompt
 
 
 def test_historical_turns_render_identically_across_assembles():
-    """严格追加:同一轮在后续任何一次组装里都渲染成同样的字节,否则 L0 缓存每轮全毁。"""
+    """严格追加:同一轮在后续任何一次组装里渲染成同样的字节,否则 L0 缓存每轮全毁。"""
     turn = Turn(
         user="打车 28",
         assistant="记好了。",
-        ts="2026-08-22T12:00:00+08:00",
-        tools=("read_skill", "record_expense"),
+        ts="2026-08-23T12:00:00+08:00",
+        exchanges=(exchange(),),
     )
     a = build(Envelope.new(source="user", channel="cli", content="一"), l0=[turn])
     b = build(Envelope.new(source="user", channel="cli", content="二"), l0=[turn, turn])
 
-    assert b.messages[:2] == a.messages[:2]
+    assert b.messages[: len(a.messages) - 1] == a.messages[:-1]
+
+
+def test_unpaired_calls_are_dropped():
+    """配不上结果的调用一律丢掉——协议要求每个 tool_call 都有一条 tool 结果,
+    发出去一个没配对的,服务商直接报错。宁可少渲染一次往返,不许拼出非法报文。"""
+    from lararium.steward.assembler import pair_tool_exchanges
+
+    got = pair_tool_exchanges(
+        envelope_id="env-abcdef12",
+        calls=[
+            {"tool": "record_expense", "args": {}, "tool_call_id": "a"},
+            {"tool": "read_skill", "args": {}, "tool_call_id": "b"},
+        ],
+        results=[{"tool": "record_expense", "content": "记好了。", "tool_call_id": "a"}],
+    )
+
+    assert [e.name for e in got] == ["record_expense"]
+
+
+def test_call_ids_are_synthesised_not_taken_from_the_provider():
+    """对外发出的 call_id 自己造,不用服务商回的那串。
+
+    它是模型/服务商可控文本,而且要逐字节稳定(缓存)。用起居注里记的那串只用于**配对**,
+    不往外发。
+    """
+    from lararium.steward.assembler import pair_tool_exchanges
+
+    got = pair_tool_exchanges(
+        envelope_id="env-abcdef12",
+        calls=[{"tool": "x", "args": {}, "tool_call_id": "call_<script>"}],
+        results=[{"tool": "x", "content": "ok", "tool_call_id": "call_<script>"}],
+    )
+
+    assert got[0].call_id == "env-abcd-0"

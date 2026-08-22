@@ -159,6 +159,8 @@ class PydanticAIClient:
             ModelResponse,
             SystemPromptPart,
             TextPart,
+            ToolCallPart,
+            ToolReturnPart,
             UserPromptPart,
         )
 
@@ -170,10 +172,35 @@ class PydanticAIClient:
         # 这个语义加的参数,HTTP body 逐字节相同(实测)。哪天升级后本写法失效,那是退路。
         agent = Agent(self._model, tools=tools, toolsets=mcp_servers)
 
+        # M4-5c v2:历史里的工具往返走**协议层原生形状**——assistant 带 tool_calls,
+        # 每次调用配一条 tool 结果消息。组装器给的是与服务商无关的 dict 形态
+        # (role/tool_calls/tool_call_id),映射成库内部表示是隔离盒的活(D2):
+        # 形状的细节只有这里该知道。
         history: list[ModelRequest | ModelResponse] = []
         for msg in ctx.messages[:-1]:
             if msg["role"] == "user":
                 history.append(ModelRequest(parts=[UserPromptPart(content=msg["content"])]))
+            elif msg["role"] == "tool":
+                history.append(
+                    ModelRequest(
+                        parts=[
+                            ToolReturnPart(
+                                tool_name=msg["name"],
+                                content=msg["content"],
+                                tool_call_id=msg["tool_call_id"],
+                            )
+                        ]
+                    )
+                )
+            elif msg.get("tool_calls"):
+                history.append(
+                    ModelResponse(
+                        parts=[
+                            ToolCallPart(tool_name=c["name"], args=c["args"], tool_call_id=c["id"])
+                            for c in msg["tool_calls"]
+                        ]
+                    )
+                )
             else:
                 history.append(ModelResponse(parts=[TextPart(content=msg["content"])]))
 
@@ -202,6 +229,9 @@ class PydanticAIClient:
                             "type": "tool_call",
                             "tool": part.tool_name,
                             "args": part.args,
+                            # M4-5c v2:配对要用它(L0 回放时把调用和结果配成对)。
+                            # 只用于配对,**不往外发**——发出去的 call_id 是自己造的。
+                            "tool_call_id": part.tool_call_id,
                         }
                     )
                 elif kind == "tool-return":
@@ -210,6 +240,7 @@ class PydanticAIClient:
                             "type": "tool_result",
                             "tool": part.tool_name,
                             "content": str(part.content),
+                            "tool_call_id": part.tool_call_id,
                         }
                     )
 
