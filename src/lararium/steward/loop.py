@@ -19,6 +19,18 @@ from lararium.steward.tools import BuiltinTools
 
 logger = logging.getLogger("lararium")
 
+
+def _jsonable(value: Any) -> Any:
+    """把工具参数收成能进 JSON 的形状。生产里它们本来就来自 JSON,这层只防意外。"""
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, str | int | float | bool) or value is None:
+        return value
+    return str(value)
+
+
 # L0 预算里给"工具 schema + 输出窗口"的固定留白(token)。工具 schema 实测约
 # 500/请求;输出要占窗口,单用户交互给足 8000。M3-6 的低水位也要继承这个估算口径。
 L0_RESERVE = 8000
@@ -72,8 +84,9 @@ class Steward:
         self.mcp_servers = mcp_servers or []
         # P0-1 纵深:本轮信封是否不可信(认领时定格);不可信轮任何 propose 强制降档。
         self._active_untrusted = False
-        # M4-5d 断点续跑:上一次尝试已确立的工具结果序列 + 本轮回放到哪一步了。
+        # M4-5d 断点续跑:上一次尝试已确立的工具结果序列、逐条消费标记、位置游标。
         self._resume_queue: list[tuple[str, str]] = []
+        self._resume_consumed: list[bool] = []
         self._resume_cursor = 0
         self._active_envelope_id = ""
         self.tools = BuiltinTools(
@@ -106,9 +119,20 @@ class Steward:
     def _resumable(self, original: Callable[..., Any]) -> Callable[..., Any]:
         """重试时按顺序回放上一次已成功的调用,只从断点之后开始真执行(M4-5d)。
 
+        **位置优先,配不上就在剩余队列里向后按名字找。** 第 k 次调用先对上一次的第 k 次;
+        对不上,再从游标往后找第一个同名且未消费的条目顶上。
+
         为什么**不是**按 (工具名, 参数) 去重:用户真在一轮里报两笔一模一样的 45 元午饭
-        是合法的,去重会把第二笔吃掉。按顺序回放没有这个假阳性——第 k 次调用对上一次的
-        第 k 次,对不上(模型改了主意)就停止回放、从这里开始真跑。
+        是合法的,去重会把第二笔吃掉——位置优先没有这个假阳性。
+        为什么要有向后查找:第二次尝试是从同一份上下文重新生成的,调用大体相同、顺序或
+        参数略有漂移;裸 positional 在第一个对不上的位置就整段作废,后面每一次都真执行、
+        每一样都重复。向后查找严格更优——没有任何场景比裸 positional 差。
+
+        **残余风险,别当它解决了**:若重试把某个早先的调用换成了另一个同名、事实上是
+        另一件事的调用,向后查找会拿旧结果把它顶掉,那件新事永远不会执行——**这是丢,
+        不是重**。裸 positional 在同一场景下是全量重执行(重)。两边都不干净;选这条是因为
+        "模型既丢掉一个早先调用、又补上一个同名新调用"比"顺序/参数漂移"少见得多。
+        分叉留痕见 `_journal_resume_divergence`。
 
         不论回放还是真执行都落一条 `tool_executed`:下一次重试要的是**累计**序列,
         而且查重复记账时得分得清哪一次真跑过。这条 kind 不进 L0、不进检索索引。
@@ -123,21 +147,69 @@ class Steward:
                 self.journal.append(
                     self._active_envelope_id,
                     "tool_executed",
-                    {"tool": name, "result": str(result), "replayed": replayed is not None},
+                    {
+                        "tool": name,
+                        # 审计要参数:"这一轮到底记了什么"光看 result 拼不出来;
+                        # 而且哪天要换配对口径,数据是现成的。配对暂时不用它。
+                        "args": _jsonable(kwargs),
+                        "positional": [str(a) for a in args],
+                        "result": str(result),
+                        "replayed": replayed is not None,
+                    },
                 )
             return result
 
         return resumable
 
     def _take_resumed_result(self, name: str) -> str | None:
-        """第 k 次调用对上一次的第 k 次;对不上就整段作废(分叉后一律真执行)。"""
-        if self._resume_cursor < len(self._resume_queue):
-            recorded_name, recorded_result = self._resume_queue[self._resume_cursor]
-            if recorded_name == name:
-                self._resume_cursor += 1
-                return recorded_result
-            self._resume_queue = []  # 模型改了主意,后面全按新的来
+        """位置优先,配不上就在剩余队列里向后按名字找;都没有就返回 None(真执行)。
+
+        **如实交代:位置优先那一支目前是行为冗余的。** 游标之前的条目必然已消费
+        (while 只跳已消费的,位置命中会消费掉当前条),所以"从游标扫"和"从第一个未消费扫"
+        是同一件事——只按名字匹配时,这两支的结果永远相同(变异检查里删掉位置分支,
+        测试全绿,而且这次是真的等价,不是测试没咬住)。
+        留着它不是摆设:一旦配对口径引入参数比较(`tool_executed` 现在已经记了 args),
+        "第 k 次优先"就会和"同名任取"分开,那时这一支才真正开始起作用。
+        在那之前它是零成本的语义声明。
+        """
+        while (
+            self._resume_cursor < len(self._resume_queue)
+            and self._resume_consumed[self._resume_cursor]
+        ):
+            self._resume_cursor += 1
+        if (
+            self._resume_cursor < len(self._resume_queue)
+            and self._resume_queue[self._resume_cursor][0] == name
+        ):
+            self._resume_consumed[self._resume_cursor] = True
+            self._resume_cursor += 1
+            return self._resume_queue[self._resume_cursor - 1][1]
+        # 位置对不上:往后找同名未消费的顶上。**不移动游标**——被跳过的条目留在原地,
+        # 后面的调用还能配上它们(这正是"顺序漂移也能兜住"的那一半)。
+        for i in range(self._resume_cursor, len(self._resume_queue)):
+            if not self._resume_consumed[i] and self._resume_queue[i][0] == name:
+                self._resume_consumed[i] = True
+                return self._resume_queue[i][1]
         return None
+
+    def _journal_resume_divergence(self, envelope_id: str) -> None:
+        """一轮结束时队列里还有没被消费的条目 = 发生了分叉,记一条(不改行为,只留痕)。
+
+        理由和「静默截断读起来和『就这些』一样」是同一条:既然不把坏行为钉成规格,
+        至少让它留下痕迹——真丢了一笔的那天,得有地方查。
+        """
+        left = [
+            self._resume_queue[i][0]
+            for i in range(len(self._resume_queue))
+            if not self._resume_consumed[i]
+        ]
+        if not left:
+            return
+        self.journal.append(
+            envelope_id,
+            "resume_diverged",
+            {"unconsumed": left, "total": len(self._resume_queue)},
+        )
 
     def _guard_propose_fact(self, original: Callable[..., str]) -> Callable[..., str]:
         @functools.wraps(original)
@@ -173,6 +245,7 @@ class Steward:
 
         # M4-5d:**必须赶在记本次 envelope 事件之前**取——那个事件是尝试之间的分界线。
         self._resume_queue = self.journal.last_attempt_tool_results(env.id)
+        self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
 
@@ -220,7 +293,11 @@ class Steward:
                 },
             )
 
-            reply = await self.model.run(ctx, self.all_tools(), self.mcp_servers)
+            try:
+                reply = await self.model.run(ctx, self.all_tools(), self.mcp_servers)
+            finally:
+                # 成功与失败都要留痕:失败那轮的分叉同样是"上一次确立过、这次没走到"。
+                self._journal_resume_divergence(env.id)
 
             for event in reply.tool_events:
                 payload = {k: v for k, v in event.items() if k != "type"}

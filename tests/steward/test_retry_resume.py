@@ -231,3 +231,58 @@ async def test_replay_follows_the_recorded_sequence_across_different_tools(syste
         ("current_time", True),
         ("record_expense", True),
     ]
+
+
+async def test_replay_falls_back_to_a_later_entry_with_the_same_name(system, tmp_path):
+    """**位置优先,配不上就在剩余队列里向后按名字找**(M4-5d 补)。
+
+    第二次尝试是从同一份上下文重新生成的,调用大体相同、顺序或参数略有漂移——
+    裸 positional 在第一个对不上的位置就整段作废,于是后面每一次都真执行、每一样都重复。
+    向后查找严格更优:没有任何场景比裸 positional 差,而它覆盖了这个机制真正要对付的情况。
+
+    这里:上一轮 [propose_fact, record_expense] 都跑过了才失败,重试换成
+    [record_expense, propose_fact] —— 两次都该走回放,两样都不许重复。
+    """
+    steward, _model, gate, ledger = system([[ALLERGY, LUNCH], [LUNCH, ALLERGY]], fail_on={1})
+    steward.submit(Envelope.new(source="user", channel="cli", content="午饭 45,我对花生过敏"))
+
+    await steward.process_next()
+    await steward.process_next()
+    gate.settle()
+
+    assert len(rows(tmp_path)) == 1, "乱序重试把流水记重了"
+    assert ledger.read().count("对花生过敏") == 1, ledger.read()
+
+
+async def test_an_unconsumed_replay_entry_is_journalled_as_divergence(system, tmp_path):
+    """分叉必须**可观测**:一轮结束时队列里还有没被消费的条目,就记一条事件。
+
+    不改行为,只让它别是静默的——理由和"静默截断读起来和『就这些』一样"是同一条。
+    真丢了一笔的那天,得有地方查。
+    """
+    steward, _model, _gate, _ledger = system([[("current_time", (), {})], [LUNCH]], fail_on={1})
+    env = Envelope.new(source="user", channel="cli", content="午饭 45")
+    steward.submit(env)
+
+    await steward.process_next()
+    await steward.process_next()
+
+    diverged = [e for e in steward.journal.replay(env.id) if e["kind"] == "resume_diverged"]
+    assert len(diverged) == 1
+    assert diverged[0]["payload"]["unconsumed"] == ["current_time"]
+
+
+async def test_tool_executed_records_the_arguments(system, tmp_path):
+    """`tool_executed` 要带参数:审计"这一轮到底记了什么",光看 result 拼不出来。
+
+    配对暂时不用它,但哪天要换配对口径,数据是现成的。这条 kind 不进 L0、不进检索索引。
+    """
+    steward, _model, _gate, _ledger = system([[LUNCH]], fail_on=set())
+    env = Envelope.new(source="user", channel="cli", content="午饭 45")
+    steward.submit(env)
+
+    await steward.process_next()
+
+    executed = next(e for e in steward.journal.replay(env.id) if e["kind"] == "tool_executed")
+    assert executed["payload"]["args"]["amount"] == 45
+    assert executed["payload"]["args"]["category"] == "餐饮"
