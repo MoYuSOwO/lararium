@@ -72,6 +72,10 @@ class Steward:
         self.mcp_servers = mcp_servers or []
         # P0-1 纵深:本轮信封是否不可信(认领时定格);不可信轮任何 propose 强制降档。
         self._active_untrusted = False
+        # M4-5d 断点续跑:上一次尝试已确立的工具结果序列 + 本轮回放到哪一步了。
+        self._resume_queue: list[tuple[str, str]] = []
+        self._resume_cursor = 0
+        self._active_envelope_id = ""
         self.tools = BuiltinTools(
             journal,
             registry,
@@ -83,8 +87,13 @@ class Steward:
     def all_tools(self) -> list[Callable]:
         """内置工具在前、bundle 工具在后,顺序固定——工具 schema 是前缀第0层。
 
-        P0-1 纵深:propose_fact 包一层,本轮信封不可信时把模型传的 provenance 强制降档
-        untrusted(`user_stated` 自动放行,不可信轮绝不能自动放行)。
+        两层包装,都不动签名与 docstring(`functools.wraps` + 转发调用),所以**工具
+        schema 逐字节不变**——有报文级测试钉住。
+
+        - P0-1 纵深:propose_fact 包一层,本轮信封不可信时把模型传的 provenance 强制降档
+          untrusted(`user_stated` 自动放行,不可信轮绝不能自动放行)。
+        - M4-5d:**所有**工具再包一层断点续跑。放最外层是必须的——回放时连内层的
+          propose 守卫都不该走到,因为那次调用这一轮压根没发生。
         """
         tools = list(self.tools.as_tool_functions())
         for t in self.bundle_tools:
@@ -92,7 +101,43 @@ class Steward:
                 tools.append(self._guard_propose_fact(t))
             else:
                 tools.append(t)
-        return tools
+        return [self._resumable(t) for t in tools]
+
+    def _resumable(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        """重试时按顺序回放上一次已成功的调用,只从断点之后开始真执行(M4-5d)。
+
+        为什么**不是**按 (工具名, 参数) 去重:用户真在一轮里报两笔一模一样的 45 元午饭
+        是合法的,去重会把第二笔吃掉。按顺序回放没有这个假阳性——第 k 次调用对上一次的
+        第 k 次,对不上(模型改了主意)就停止回放、从这里开始真跑。
+
+        不论回放还是真执行都落一条 `tool_executed`:下一次重试要的是**累计**序列,
+        而且查重复记账时得分得清哪一次真跑过。这条 kind 不进 L0、不进检索索引。
+        """
+
+        @functools.wraps(original)
+        def resumable(*args: Any, **kwargs: Any) -> Any:
+            name = getattr(original, "__name__", "")
+            replayed = self._take_resumed_result(name)
+            result = original(*args, **kwargs) if replayed is None else replayed
+            if self._active_envelope_id:
+                self.journal.append(
+                    self._active_envelope_id,
+                    "tool_executed",
+                    {"tool": name, "result": str(result), "replayed": replayed is not None},
+                )
+            return result
+
+        return resumable
+
+    def _take_resumed_result(self, name: str) -> str | None:
+        """第 k 次调用对上一次的第 k 次;对不上就整段作废(分叉后一律真执行)。"""
+        if self._resume_cursor < len(self._resume_queue):
+            recorded_name, recorded_result = self._resume_queue[self._resume_cursor]
+            if recorded_name == name:
+                self._resume_cursor += 1
+                return recorded_result
+            self._resume_queue = []  # 模型改了主意,后面全按新的来
+        return None
 
     def _guard_propose_fact(self, original: Callable[..., str]) -> Callable[..., str]:
         @functools.wraps(original)
@@ -125,6 +170,11 @@ class Steward:
         # 都会被降档成 untrusted(门控不建立在"渲染永远不出错"的假设上——这次就是
         # 渲染没被走到才出的安全洞)。
         self._active_untrusted = bool(env.meta.get("untrusted", False))
+
+        # M4-5d:**必须赶在记本次 envelope 事件之前**取——那个事件是尝试之间的分界线。
+        self._resume_queue = self.journal.last_attempt_tool_results(env.id)
+        self._resume_cursor = 0
+        self._active_envelope_id = env.id
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。

@@ -369,6 +369,31 @@ class Journal:
             }
         return out
 
+    def last_attempt_tool_results(self, envelope_id: str) -> list[tuple[str, str]]:
+        """上一次尝试里**已经确立**的工具结果,按调用顺序(M4-5d)。
+
+        取的是最后一个 `envelope` 事件之后的 `tool_executed` —— 每次 claim 都会先记一条
+        `envelope`,所以"最后一个之后"正好是上一次尝试那一段。**必须在本次 claim 记
+        envelope 事件之前调用**,否则取到的是空段。
+
+        为什么不用 `tool_result`:那是 `model.run` **成功返回之后**才记的,
+        而这里要的恰好是"跑失败了、但工具已经执行掉"的那一批。
+        """
+        rows = self._conn.execute(
+            "SELECT kind, payload FROM journal WHERE envelope_id=? ORDER BY seq", (envelope_id,)
+        ).fetchall()
+        start = 0
+        for i, r in enumerate(rows):
+            if r["kind"] == "envelope":
+                start = i + 1
+        out: list[tuple[str, str]] = []
+        for r in rows[start:]:
+            if r["kind"] != "tool_executed":
+                continue
+            payload = json.loads(r["payload"])
+            out.append((str(payload.get("tool")), str(payload.get("result", ""))))
+        return out
+
     def recent_turns(self, limit: int) -> list[dict[str, Any]]:
         """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。
 

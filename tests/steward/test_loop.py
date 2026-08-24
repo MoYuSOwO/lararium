@@ -681,3 +681,48 @@ async def test_l0_only_replays_registered_tool_names(steward_factory):
     turns = steward._recent_turns("", "")
 
     assert [[e.name for e in t.exchanges] for t in turns] == [["current_time"]]
+
+
+async def test_wrapping_tools_does_not_change_the_tool_schema(steward_factory, http_spy_factory):
+    """★ A1 回归:两层包装(P0-1 守卫 + M4-5d 断点续跑)**不许动工具 schema**。
+
+    工具 schema 是前缀第 0 层——变一个字节,所有轮的缓存全毁。包装用的是
+    `functools.wraps` + 转发调用,`inspect.signature` 会跟着 `__wrapped__` 走,
+    所以理论上不变;但这条不信理论,只信**真正发出去的 HTTP body**
+    (补1b 的教训:库内部表示看不出适配器干了什么)。
+    """
+    import json
+
+    import httpx
+
+    steward, _ = steward_factory()
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "1",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    client = http_spy_factory(handler)
+    ctx = AssembledContext(system_prompt="P", messages=[{"role": "user", "content": "你好"}])
+
+    bare = [*steward.tools.as_tool_functions(), *steward.bundle_tools]
+    await client.run(ctx, bare, [])
+    await client.run(ctx, steward.all_tools(), [])
+
+    assert bodies[0]["tools"] == bodies[1]["tools"], "包装改了工具 schema —— 前缀第0层被动了"
