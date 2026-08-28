@@ -58,6 +58,20 @@ def _assemble_bundle_tools(data_dir: Path, gate: Any, timezone: str) -> list[Cal
     return tools
 
 
+def _push_notifier(steward: Steward) -> Any:
+    """三处调用点共用的通知器构造。渠道走配置(`LARARIUM_PUSH_CHANNEL`),不再写死 "cli"
+    ——M5 双通道下推送若掉进没人看的窗口,等于没推(M3 结转第 2 条)。"""
+    from lararium.steward.sweep import make_daily_notifier
+
+    return make_daily_notifier(
+        journal=steward.journal,
+        outbox=steward.outbox,
+        conn=steward.outbox.conn,
+        timezone=steward.settings.timezone,
+        channel=steward.settings.push_channel,
+    )
+
+
 def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
     """组装 Steward。这是全系统唯一允许 import bundles 的地方之一(组装根)。
 
@@ -149,9 +163,8 @@ def create_app(
         # M3-6:空闲自动压缩——compactor 用真 Gate 造好(Steward 的 GatePort 不放 propose)。
         # P1-3:注入带日限的通知器,压缩被屏障停/归拢提提案时用户能收到消息(别堵死没人知)。
         from lararium.steward.compact import make_compactor
-        from lararium.steward.sweep import make_daily_notifier
 
-        notify = make_daily_notifier(steward.outbox, steward.outbox.conn, steward.settings.timezone)
+        notify = _push_notifier(steward)
         compactor = make_compactor(
             steward.settings,
             steward.journal,
@@ -306,11 +319,9 @@ def create_app(
             from datetime import datetime as _dt
             from datetime import timedelta as _td
 
-            from lararium.steward.sweep import make_daily_notifier, make_sweeper
+            from lararium.steward.sweep import make_sweeper
 
-            notify = make_daily_notifier(
-                steward.outbox, steward.outbox.conn, steward.settings.timezone
-            )
+            notify = _push_notifier(steward)
             now = _dt.now(_UTC)
             sweeper = make_sweeper(
                 steward.settings,
@@ -329,11 +340,8 @@ def create_app(
             # M3-6 压缩:手动触发(占时,需要模型)。compactor 用真 Gate 造好(Steward 的
             # GatePort 不放 propose,单写者编进类型);上下文未顶满时 no-op。
             from lararium.steward.compact import make_compactor
-            from lararium.steward.sweep import make_daily_notifier
 
-            notify = make_daily_notifier(
-                steward.outbox, steward.outbox.conn, steward.settings.timezone
-            )
+            notify = _push_notifier(steward)
             compactor = make_compactor(
                 steward.settings,
                 steward.journal,

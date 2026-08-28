@@ -29,7 +29,13 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from lararium.db import transaction
+from lararium.envelope import Envelope
 from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, fold_text, neutralize_fence
+
+# 推送信封的"由头"正文。**固定常量**:它每次都一样,进 L0 后逐字稳定;
+# 写成"系统自己开口"的形态,而不是把推送正文塞进这里——正文是**回复**,由头是**触发**。
+PUSH_TRIGGER = "(到点了,把攒下的事跟他说一声)"
 
 logger = logging.getLogger("lararium")
 
@@ -282,19 +288,46 @@ def make_sweeper(
     )
 
 
-def make_daily_notifier(outbox: Any, conn: Any, timezone: str) -> Callable[[str], None]:
-    """每天最多一条 notice 的通知器(P1-3)。
+def make_daily_notifier(
+    *, journal: Any, outbox: Any, conn: Any, timezone: str, channel: str
+) -> Callable[[str], None]:
+    """每天最多一条 notice 的通知器(P1-3),并且**把这一条推送落成一轮完整的对话**。
 
-    压缩被屏障停下、归拢提出提案都要让用户知道;但这类"有 N 条待审"的话一天说一次
-    就够,别刷屏。节流状态落 notice_log(重启不重投)。投到 cli 渠道(本部署默认用户渠道)。
+    以前它用假信封 id `notice-{uuid}` 投出件箱,起居注里什么都不写。而 L0 靠
+    `envelope` + `reply` 成对取(`_turns_by_id`),两样都没有——于是早上推
+    「这个月餐饮 1240」,用户切过来说「太多了吧」,**模型没有任何上下文**。
+    那不是体验问题,是**系统失忆**(擦边 A6 与不可协商第 3 条)。M4 之前只有 cli
+    一个渠道,推送与对话落在同一个窗口,这个断层看不出来。
+
+    现在:造一个 `source="sweep"` 的信封当**由头**,推送正文当**回复**,两者都落起居注、
+    都进 L0。渲染走 `_render_user_text` 的「(系统触发 · sweep/渠道)」那一支——
+    不伪装成用户说的话(P1-1 的老账不在新路径上重犯)。**没有新发明形状**:
+    `Turn.source` 本来就支持非 user 值,那一支本来就在。
+
+    节流状态落 `notice_log`;整件事(占名额 + 起居注两条 + 出件箱一条)在**同一个事务**里
+    ——半条比没有更坏:模型以为自己说过,用户什么都没收到,当天的名额还被占掉了。
     """
     tz = ZoneInfo(timezone)
 
     def notify(text: str) -> None:
         today = datetime.now(tz).date().isoformat()
-        cur = conn.execute("INSERT OR IGNORE INTO notice_log (date) VALUES (?)", (today,))
-        if cur.rowcount == 0:
-            return  # 今天已经投过(DB 是唯一的判据,跨进程/重启都防)
-        outbox.put(f"notice-{uuid.uuid4().hex}", "cli", text, kind="notice")
+        with transaction(conn):
+            cur = conn.execute("INSERT OR IGNORE INTO notice_log (date) VALUES (?)", (today,))
+            if cur.rowcount == 0:
+                return  # 今天已经投过(DB 是唯一的判据,跨进程/重启都防)
+            env = Envelope.new(source="sweep", channel=channel, content=PUSH_TRIGGER)
+            journal.append(
+                env.id,
+                "envelope",
+                {
+                    "content": env.content,
+                    "source": env.source,
+                    "channel": env.channel,
+                    "meta": env.meta,
+                    "ts": env.ts.isoformat(),
+                },
+            )
+            journal.append(env.id, "reply", {"content": text})
+            outbox.put(env.id, channel, text, kind="notice")
 
     return notify

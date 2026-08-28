@@ -298,12 +298,159 @@ async def test_p1_sweep_notifies_when_suggesting(sweeper_factory):
 def test_p1_daily_notifier_dedupes(tmp_path):
     """P1-3:make_daily_notifier 每天最多一条——同一天第二次不重投(DB 是唯一判据)。"""
     from lararium.db import connect
+    from lararium.steward.journal import Journal
     from lararium.steward.outbox import Outbox
     from lararium.steward.sweep import make_daily_notifier
 
     conn = connect(tmp_path / "n.sqlite")
     outbox = Outbox(conn)
-    notify = make_daily_notifier(outbox, conn, "Asia/Shanghai")
+    notify = make_daily_notifier(
+        journal=Journal(conn), outbox=outbox, conn=conn, timezone="Asia/Shanghai", channel="cli"
+    )
     notify("第一条")
     notify("第二条")
     assert [i.content for i in outbox.take("cli", 0)] == ["第一条"], "同一天只投一条"
+
+
+# ── M4-7:主动推送要留痕、要进 L0 ─────────────────────────────────────────
+#
+# 推送原来用假信封 id、不往起居注写任何东西;而 L0 靠 envelope + reply 成对取,
+# 两样都没有。于是早上推「这个月餐饮 1240」,用户回一句「太多了吧」,模型没有任何
+# 上下文——不是体验问题,是**系统失忆**(擦边 A6 与不可协商第 3 条)。
+# M4 之前只有 cli 一个渠道,推送与对话落在同一个窗口,看不出断层。
+
+
+def _notifier(tmp_path, channel="wecom", outbox=None):
+    from lararium.db import connect
+    from lararium.steward.journal import Journal
+    from lararium.steward.outbox import Outbox
+    from lararium.steward.sweep import make_daily_notifier
+
+    conn = connect(tmp_path / "push.sqlite")
+    journal = Journal(conn)
+    outbox = outbox or Outbox(conn)
+    notify = make_daily_notifier(
+        journal=journal, outbox=outbox, conn=conn, timezone="Asia/Shanghai", channel=channel
+    )
+    return notify, journal, outbox, conn
+
+
+def _l0(journal):
+    """照 loop 的口径把 L0 组装出来:起居注 → Turn → assemble。"""
+    from lararium.envelope import Envelope
+    from lararium.steward.assembler import Turn, assemble
+
+    turns = [
+        Turn(
+            user=r["user"],
+            assistant=r["assistant"],
+            source=r.get("source", "user"),
+            channel=r.get("channel", "cli"),
+            untrusted=r.get("untrusted", False),
+            ts=r.get("ts"),
+            exchanges=r.get("exchanges", ()),
+        )
+        for r in journal.recent_turns_within_budget(max_tokens=100000)
+    ]
+    return assemble(
+        persona="P",
+        directory="D",
+        ledger="L",
+        l1="",
+        l0=turns,
+        envelope=Envelope.new(source="user", channel="cli", content="太多了吧"),
+        timezone="Asia/Shanghai",
+    )
+
+
+def test_a_push_is_journalled_as_a_full_turn(tmp_path):
+    """主动推送要落成**一轮完整的对话**:envelope 与 reply 都在起居注里,同一个信封 id。
+
+    只有出件箱里有一条不算——L0 靠 `envelope` + `reply` 成对取,少一样这轮就不存在。
+    """
+    notify, journal, outbox, _conn = _notifier(tmp_path)
+    notify("这个月餐饮 1240")
+
+    env_id = outbox.take("wecom", 0)[0].envelope_id
+    kinds = [e["kind"] for e in journal.replay(env_id)]
+    assert kinds == ["envelope", "reply"]
+    assert journal.replay(env_id)[1]["payload"]["content"] == "这个月餐饮 1240"
+
+
+def test_the_pushed_text_is_visible_in_the_next_turns_l0(tmp_path):
+    """★ 要害:推送内容必须**真的出现在下一轮组装出的 L0 里**。
+
+    不是"出件箱里有一条"就算——用户切过来说「太多了吧」时,模型得看得见自己早上说了什么。
+    """
+    notify, journal, _outbox, _conn = _notifier(tmp_path)
+    notify("这个月餐饮 1240")
+
+    ctx = _l0(journal)
+
+    assert any("这个月餐饮 1240" in m["content"] for m in ctx.messages), ctx.messages
+
+
+def test_the_push_renders_as_a_system_trigger_not_as_the_user(tmp_path):
+    """渲染要走「系统触发」那一支,不能伪装成用户说的话。
+
+    P1-1 的老账:外部/系统来源和用户原话同形,模型就分不出谁在说话。别在新路径上重犯。
+    """
+    notify, journal, _outbox, _conn = _notifier(tmp_path)
+    notify("这个月餐饮 1240")
+
+    ctx = _l0(journal)
+    trigger = ctx.messages[0]
+
+    assert trigger["role"] == "user"
+    assert "(系统触发 · sweep/wecom)" in trigger["content"]
+    assert ctx.messages[1] == {"role": "assistant", "content": "这个月餐饮 1240"}
+
+
+def test_the_push_goes_to_the_configured_channel(tmp_path):
+    """渠道来自配置,不是写死的 "cli"(M3 结转第 2 条,一次修掉)。
+
+    数据面的回复落在来源渠道上没人看——推送尤其如此:它是系统主动开口,
+    必须落在用户真正在看的那个窗口。
+    """
+    notify, _journal, outbox, _conn = _notifier(tmp_path, channel="wecom")
+    notify("这个月餐饮 1240")
+
+    assert [i.content for i in outbox.take("wecom", 0)] == ["这个月餐饮 1240"]
+    assert outbox.take("cli", 0) == [], "不该再落到写死的 cli 上"
+
+
+def test_a_throttled_push_writes_nothing_at_all(tmp_path):
+    """被节流时一个字都不许留:起居注不多一轮,出件箱不多一条。"""
+    notify, _journal, outbox, conn = _notifier(tmp_path)
+    notify("第一条")
+    before = conn.execute("SELECT count(*) FROM journal").fetchone()[0]
+
+    notify("第二条")
+
+    assert conn.execute("SELECT count(*) FROM journal").fetchone()[0] == before
+    assert [i.content for i in outbox.take("wecom", 0)] == ["第一条"]
+
+
+def test_a_failed_push_leaves_no_half_turn(tmp_path):
+    """投递写不进去时,不许留下"信封在起居注、内容没发出去"的半条。
+
+    半条比没有更坏:模型以为自己说过,用户什么都没收到,而且当天的名额还被占掉了。
+    """
+
+    class ExplodingOutbox:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def put(self, *_a, **_k):
+            raise RuntimeError("投递炸了")
+
+    from lararium.db import connect
+
+    conn = connect(tmp_path / "push.sqlite")
+    notify, _journal, _outbox, conn = _notifier(tmp_path, outbox=ExplodingOutbox(conn))
+
+    with pytest.raises(RuntimeError):
+        notify("这个月餐饮 1240")
+
+    assert conn.execute("SELECT count(*) FROM journal").fetchone()[0] == 0, "留下了半条"
+    assert conn.execute("SELECT count(*) FROM notice_log").fetchone()[0] == 0, "名额被白占了"

@@ -7516,3 +7516,79 @@ outbox.put(f"notice-{uuid.uuid4().hex}", "cli", text, kind="notice")
 
 **残余(不修,可接受)**:用户回看历史时是断的——对话侧翻不到早报,推送侧翻不到对话。
 这是"推送通知 vs App 内消息列表"的关系,职责不同,不强求统一。
+
+---
+
+## M4-7:主动推送要留痕、要进 L0
+
+### 一、修完之后,下一轮的 L0 长这样
+
+```
+[user]      [2026-08-28T21:39:20+08:00] (系统触发 · sweep/wecom) (到点了,把攒下的事跟他说一声)
+[assistant] 这个月餐饮 1240,比上个月多了三成
+[user]      [2026-08-28T21:39:21+08:00] 太多了吧
+
+出件箱:seq=1 kind=notice channel=wecom envelope_id=f62259d3bce5… 这个月餐饮 1240,比上个月多了三成
+```
+
+用户说「太多了吧」的时候,模型看得见自己早上说了什么,而且看得出**那是系统触发的、
+不是用户说的**。
+
+### 二、验收你盯的两件事
+
+**推送内容真的进了 L0**(不是"出件箱里有一条"就算):
+`test_the_pushed_text_is_visible_in_the_next_turns_l0` 走的是**真实口径**——
+起居注 → `recent_turns_within_budget` → `Turn` → `assemble`,断言组装出来的
+`messages` 里有那句话。
+
+**渲染走「系统触发」那一支**:`test_the_push_renders_as_a_system_trigger_not_as_the_user`
+断言首条消息含 `(系统触发 · sweep/wecom)`,且第二条正好是
+`{"role": "assistant", "content": "这个月餐饮 1240"}`。P1-1 的老账没在新路径上重犯。
+
+### 三、没新发明形状
+
+照你说的用现成的:`Turn.source` 本来就支持非 user 值,`_render_user_text` 那一支本来就在。
+推送落成**一轮完整的对话**——`source="sweep"` 的信封当**由头**,推送正文当**回复**。
+
+由头正文是固定常量 `PUSH_TRIGGER = "(到点了,把攒下的事跟他说一声)"`:每次一样,
+进 L0 后逐字稳定。**没有把推送正文塞进由头**——正文是回复,由头是触发,两者混起来
+就又分不清谁在说话了。
+
+`Source` 加了 `"sweep"`(原来是 `user|cron|module_event`)。**没有复用 `"cron"`**:
+它不是定时器触发的,是 worker 空闲跑完归拢/压缩之后触发的,写 cron 是小谎,
+而这个字段的全部作用就是让来源可分辨。
+
+`make_daily_notifier` 写死的 `"cli"` 换成 `settings.push_channel`
+(`LARARIUM_PUSH_CHANNEL`,默认 cli,单渠道部署行为不变),**M3 结转第 2 条一次修掉**。
+三处调用点收进 `_push_notifier(steward)`,加渠道不用改三遍。渠道名在
+`Settings.load` 里就校验(要能进 `Envelope.channel` 的 pattern)——**在启动时炸,
+别等到半夜推送在 worker 里炸,那时没人看日志**。
+
+### 四、撞上一个前置问题:`db.transaction` 不可重入
+
+反向那条("不许留下半条")要求占名额 + 起居注两条 + 出件箱一条**一起成或一起不成**。
+但 `Journal.append` **自带事务**,而 SQLite 不许嵌套 `BEGIN`——拼不出来。
+
+`transaction()` 改成**可重入**:已经在事务里就直接并入外层,不再 BEGIN。语义正是想要的
+那个(内层失败,外层一起回滚)。这不只是为了这一处:**不可重入等于禁止任何两个写库
+操作组合成一个原子动作**,那是限制不是保护。全仓只有两处用它,都不靠"内层独立回滚"。
+
+配了两条工具级测试:嵌套内层失败 → 外层一起回滚且 `in_transaction` 收干净;
+正常路径 → 内层出块不提前提交。
+
+### 五、变异检查 6 条,6 条被咬住
+
+```
+退回假信封 id、不落起居注 → 红    只落 envelope 不落 reply     → 红
+伪装成用户说的话           → 红    渠道退回写死 cli             → 红
+整件事不放同一事务         → 红    transaction 退回不可重入     → 红
+```
+
+### 六、别的
+
+- 节流路径现在**一个字都不留**(名额、起居注、出件箱都在事务里),被节流时提前 return,
+  连名额都不占——比原来更严:原来是先占名额再投,投失败名额就白占了。
+- `.env.example` 补了 `LARARIUM_PUSH_CHANNEL`,写清它在 M5 双通道下的意义。
+- 前缀区未动:改的是 L0 与出件箱。`Source` 加值不进前缀。
+
+**门禁**:349 passed + 5 skipped,mypy 31 files,4 kept 0 broken,ruff/format 全绿。

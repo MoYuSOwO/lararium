@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -22,6 +23,14 @@ def parse_tokens(raw: str) -> dict[str, str]:
     return tokens
 
 
+def _valid_channel(name: str) -> str:
+    """渠道名要能进 `Envelope.channel`(它有 pattern 校验)。在启动时炸,别等到半夜
+    推送时在 worker 里炸——那时没人在看日志。"""
+    if not re.fullmatch(r"[a-z0-9_-]{1,32}", name):
+        raise ValueError(f"LARARIUM_PUSH_CHANNEL 非法:{name!r},只能是 [a-z0-9_-]{{1,32}}")
+    return name
+
+
 @dataclass(frozen=True)
 class Settings:
     api_key: str
@@ -37,6 +46,7 @@ class Settings:
     compact: str
     compact_low_water: int
     compact_index_days: int
+    push_channel: str
     bind_host: str
     bind_port: int
     control_tokens: dict[str, str]
@@ -68,6 +78,9 @@ class Settings:
             compact=os.environ.get("LARARIUM_COMPACT", "on"),  # on | off(off 退回纯截断)
             compact_low_water=int(os.environ.get("LARARIUM_COMPACT_LOW_WATER", "150000")),
             compact_index_days=int(os.environ.get("LARARIUM_COMPACT_INDEX_DAYS", "90")),
+            # M4-7:主动推送落在哪个渠道。以前写死 "cli",于是 M5 双通道下推送会掉进
+            # 没人看的窗口(M3 结转第 2 条)。默认仍是 cli,单渠道部署行为不变。
+            push_channel=_valid_channel(os.environ.get("LARARIUM_PUSH_CHANNEL", "cli")),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
             # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。

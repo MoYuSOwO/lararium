@@ -4,7 +4,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-Source = Literal["user", "cron", "module_event"]
+# M4-7:主动推送(夜间归拢/压缩的提醒)是**系统自己开口**,来源必须能和用户原话分开
+# ——L0 渲染靠它走「(系统触发 · source/channel)」那一支。用现成的 "cron" 是小谎:
+# 它不是定时器触发的,是 worker 空闲跑完归拢/压缩之后触发的。
+Source = Literal["user", "cron", "module_event", "sweep"]
 
 
 class Envelope(BaseModel):

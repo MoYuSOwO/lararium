@@ -163,6 +163,14 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     必须显式 BEGIN/COMMIT。调用方别再伸手拿各对象的 _conn 去拼(违反 S3),把
     一个共享连接交给它即可。
     """
+    if conn.in_transaction:
+        # **可重入**:已经在事务里就直接并入外层,不再 BEGIN(SQLite 不许嵌套 BEGIN)。
+        # 语义正是想要的那个——内层失败,外层一起回滚。
+        # 加这一支是因为 M4-7 撞上了:`Journal.append` 自带事务,于是"起居注两条 + 出件箱
+        # 一条一起成或一起不成"根本拼不出来,只能留下半条。不可重入等于禁止任何两个
+        # 写库操作组合成一个原子动作,那是限制不是保护。
+        yield conn
+        return
     conn.execute("BEGIN")
     try:
         yield conn
