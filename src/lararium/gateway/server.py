@@ -27,6 +27,7 @@ from lararium.config import Settings
 from lararium.db import connect
 from lararium.envelope import Envelope
 from lararium.gateway.commands import handle_command
+from lararium.persona import assemble_persona, prefix_digest, record_prefix_change
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
@@ -80,15 +81,26 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
     放这里是它该在的位置。
     """
     conn = connect(settings.data_dir / "steward.sqlite")
+    registry = Registry.load(Path("bundles"))
+    # M4-8:人设(用户的)+ 纪律(系统的)。人设怎么改都不影响纪律,那是拆开的全部意义。
+    persona, warnings = assemble_persona(settings.data_dir)
+    for warning in warnings:
+        logger.warning(warning)
+    # 前缀变更留痕:改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么
+    # (不可协商第 1 条:缓存命中是设计约束,不是优化项)。
+    digest = prefix_digest(persona, registry.directory_lines(), ledger.read())
+    previous = record_prefix_change(conn, digest)
+    if previous is not None:
+        logger.warning("前缀区变了:%s → %s,本次启动缓存会重建一次", previous[:12], digest[:12])
     return Steward(
         settings=settings,
         inbox=Inbox(conn),
         journal=Journal(conn),
-        registry=Registry.load(Path("bundles")),
+        registry=registry,
         ledger=ledger,
         gate=gate,
         model=PydanticAIClient(settings),
-        persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
+        persona=persona,
         outbox=Outbox(conn),
         threads=Threads(conn),
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变

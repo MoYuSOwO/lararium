@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS notice_log (
 
 -- M3-6 压缩:M3-3 之后的命根子是 append-only(起居注只增不改),压缩**不删正文**,
 -- 只是把"已压成索引"的信封标记掉(退出 L0 一线),索引行单独一张表供 assemble 当 l1。
+-- M4-8:前缀区指纹的变更史。改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么
+-- ——「缓存命中是设计约束不是优化项」,那它什么时候变过就必须查得出来。
+CREATE TABLE IF NOT EXISTS prefix_log (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    digest     TEXT NOT NULL,
+    changed_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS l1_index (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     date        TEXT NOT NULL,      -- 索引行日期(供 90 天保留期剪枝)

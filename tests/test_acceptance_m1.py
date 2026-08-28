@@ -8,6 +8,7 @@ from bundles.memory.server import build_memory_components, memory_tool_functions
 from lararium.config import Settings
 from lararium.db import connect
 from lararium.envelope import Envelope
+from lararium.persona import assemble_persona
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
@@ -47,7 +48,7 @@ def system(tmp_path, monkeypatch):
             ledger=ledger,
             gate=gate,
             model=model,
-            persona=Path("prompts/persona.md").read_text(encoding="utf-8"),
+            persona=assemble_persona(tmp_path)[0],
             outbox=Outbox(conn),
             threads=Threads(conn),
             bundle_tools=memory_tool_functions(gate),
