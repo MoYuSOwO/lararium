@@ -7592,3 +7592,111 @@ outbox.put(f"notice-{uuid.uuid4().hex}", "cli", text, kind="notice")
 - 前缀区未动:改的是 L0 与出件箱。`Source` 加值不进前缀。
 
 **门禁**:349 passed + 5 skipped,mypy 31 files,4 kept 0 broken,ruff/format 全绿。
+
+---
+
+## M4-7:主动推送要留痕、要进 L0
+
+### 验收结论:**通过**(2026-08-28);`db.transaction` 的嵌套语义要补一刀,补完再进 M4-8
+
+**实跑复核**:
+
+```
+ruff ✓ / format 69 ✓ / mypy 31 ✓ / lint-imports 4 kept 0 broken / 349 passed + 5 skipped
+L0 那条走真口径:journal.recent_turns_within_budget → Turn → assemble,断言渲染后的 messages
+渲染那条:messages[0] 含「(系统触发 · sweep/wecom)」,messages[1] 正好是 assistant 的推送正文
+渠道来自配置且断言不再落到写死的 cli;渠道名在 Settings.load 就校验(启动时炸,不等半夜)
+```
+
+两条验收都盯到实处。`PUSH_TRIGGER` 用固定常量而非把推送正文塞进由头——「正文是回复,
+由头是触发」这个区分对,且顺带保证它进 L0 后逐字稳定。`source` 新加 `"sweep"` 不复用
+`"cron"`,理由(「不是定时器触发的,写 cron 是小谎,而这字段的全部作用就是让来源可分辨」)
+也对。
+
+#### 必补:可重入 `transaction` 的注释是无条件写的,语义却是有条件的
+
+注释称「内层失败,外层一起回滚」。实测两种情形:
+
+```
+[A] 无人中途 catch  → 表里剩:[]                                     ← 成立
+[B] 中间层吞掉异常 → 表里剩:['outer-before', 'inner-半条', 'outer-after']
+```
+
+```python
+with transaction(conn):                 # 外层
+    conn.execute("INSERT ... 'outer-before'")
+    try:
+        with transaction(conn):         # 内层:并入外层,什么都不做
+            conn.execute("INSERT ... 'inner-半条'")
+            raise RuntimeError
+    except RuntimeError:
+        pass                            # ← 吞掉,继续走
+    conn.execute("INSERT ... 'outer-after'")
+# 提交。inner-半条 跟着一起提交了。
+```
+
+**「内层失败一起回滚」只在没人中途 catch 时成立**,而注释无条件写。下一个读它的人会照着信。
+而这次改动修的恰恰是「不许留下半条」——换个姿势又能留下半条。
+
+**修法:SAVEPOINT**(复核方已实测,同样两种情形):
+
+```
+[A] 无人中途 catch  → []
+[B] 中间层吞掉异常 → ['outer-before', 'outer-after']    ← 内层回滚,外层留着
+```
+
+```python
+if conn.in_transaction:
+    sp = f"sp_{next(_counter)}"
+    conn.execute(f"SAVEPOINT {sp}")
+    try:
+        yield conn
+        conn.execute(f"RELEASE {sp}")
+    except BaseException:
+        conn.execute(f"ROLLBACK TO {sp}")
+        conn.execute(f"RELEASE {sp}")
+        raise
+    return
+```
+
+十行,且让注释那句话**无条件成立**。`except BaseException` 一并带过去(R3-1:Ctrl-C
+落在事务中间也得回滚)。
+
+**严重性说清楚:今天不可达。** 全仓只有两处 `with transaction(`(`loop.py:325`、
+`sweep.py:314`),都没有「中间层吞异常」的写法。所以不是 bug,是**核心原语里的一个陷阱**
+——而原语的用户是所有未来的代码。改它的理由(「不可重入等于禁止任何两个写库操作组合成
+原子动作,那是限制不是保护」)成立;**正因为要开放组合,才更该把组合的语义做对。**
+
+### M4-7 补:`db.transaction` 的嵌套改用 SAVEPOINT
+
+你实测的那两种情形我复现了,修完是这样:
+
+```
+[A] 无人中途 catch  → 表里剩:[]                               (原来也对)
+[B] 中间层吞掉异常 → 表里剩:['outer-before', 'outer-after']    (原来剩三条,含 inner-半条)
+```
+
+**问题不在结论,在前提。** 第一版"并入外层、什么都不做"得出的"内层失败一起回滚",
+只在异常一路冒到外层时成立;而我把那句注释**无条件**写了下来。下一个读它的人会照着信,
+而这次改动修的恰恰是"不许留下半条"——换个姿势又能留下。
+
+SAVEPOINT 让「内层失败只回滚内层、外层照常」**无条件成立**,注释不必再附加前提。
+`except BaseException` 一并带过去(R3-1 那条:Ctrl-C 落在中间也得回滚)。
+
+**一处按你的草稿改了:savepoint 名用常量,不用计数器。** 本函数只作为 `with` 块使用,
+嵌套必然严格配对,而 SQLite 对重名 savepoint 的规定就是"作用于最近的那一个"——
+正合严格嵌套的语义。用计数器要在模块级放可变状态(F5 禁止),为一个不存在的问题付代价。
+若你认为将来会有非 `with` 的用法,我换回计数器。
+
+**三条测试**(A / B / BaseException 版的 B),**四条变异全部被咬住**:
+
+```
+退回「并入外层什么都不做」 → 红    只 RELEASE 不 ROLLBACK TO → 红
+except 收窄成 Exception     → 红    内层顺带把外层也回滚      → 红
+```
+
+严重性照你说的记:**今天不可达**(全仓两处 `with transaction(`,都没有中间层吞异常的
+写法),不是 bug,是核心原语里的陷阱。而原语的用户是所有未来的代码——正因为这次是主动
+开放组合,才更该把组合的语义做对。
+
+**门禁**:352 passed + 5 skipped,mypy 31 files,4 kept 0 broken,ruff/format 全绿。

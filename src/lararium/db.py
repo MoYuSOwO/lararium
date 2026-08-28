@@ -155,6 +155,10 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+# 嵌套事务用的 savepoint 名。真常量(F5:模块级只允许不可变常量)。
+_NESTED_SAVEPOINT = "lararium_nested"
+
+
 @contextmanager
 def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """显式事务:with 块内**同一连接**的语句原子化,异常自动回滚。
@@ -164,12 +168,25 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     一个共享连接交给它即可。
     """
     if conn.in_transaction:
-        # **可重入**:已经在事务里就直接并入外层,不再 BEGIN(SQLite 不许嵌套 BEGIN)。
-        # 语义正是想要的那个——内层失败,外层一起回滚。
-        # 加这一支是因为 M4-7 撞上了:`Journal.append` 自带事务,于是"起居注两条 + 出件箱
-        # 一条一起成或一起不成"根本拼不出来,只能留下半条。不可重入等于禁止任何两个
-        # 写库操作组合成一个原子动作,那是限制不是保护。
-        yield conn
+        # **可重入**:已经在事务里就开一个 SAVEPOINT(SQLite 不许嵌套 BEGIN)。
+        #
+        # 第一版是"直接并入外层、什么都不做",看着也对——内层异常一路冒到外层,整体回滚。
+        # 但那个结论有前提:**没人中途 catch**。中间层要是把内层异常吞掉、外层继续走,
+        # 内层那半条就跟着外层一起提交了(实测:表里剩 outer-before / inner-半条 /
+        # outer-after)。而加这一支的初衷恰恰是"不许留下半条",换个姿势又能留下。
+        # SAVEPOINT 让「内层失败只回滚内层、外层照常」**无条件成立**,不必附加前提。
+        #
+        # 名字用常量不用计数器:本函数只作为 with 块使用,嵌套必然是严格配对的,而
+        # SQLite 对重名 savepoint 的规定就是"作用于最近的那一个"——正合严格嵌套的语义。
+        # 用计数器就得在模块级放可变状态(F5 禁止),为一个不存在的问题付代价。
+        conn.execute(f"SAVEPOINT {_NESTED_SAVEPOINT}")
+        try:
+            yield conn
+            conn.execute(f"RELEASE {_NESTED_SAVEPOINT}")
+        except BaseException:  # BaseException 的理由同下方外层:Ctrl-C 落在中间也得回滚
+            conn.execute(f"ROLLBACK TO {_NESTED_SAVEPOINT}")
+            conn.execute(f"RELEASE {_NESTED_SAVEPOINT}")
+            raise
         return
     conn.execute("BEGIN")
     try:
