@@ -21,8 +21,10 @@
 """
 
 import hashlib
+import inspect
 import os
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 # 人设的软上限。它每轮都在前缀里付钱,但**超了只警告不拒绝**——用户自己的机器,用户做主。
@@ -66,8 +68,25 @@ def assemble_persona(data_dir: Path) -> tuple[str, list[str]]:
     return f"{character.rstrip()}\n\n{load_discipline().strip()}\n", warnings
 
 
+def tool_schema_fingerprint(tools: list[Callable]) -> str:
+    """工具 schema 的指纹料:**按顺序**的 name + 签名 + docstring。
+
+    **docstring 就是 schema**——M4 全程盯得最紧的一条。顺序也是:工具顺序变了缓存全毁,
+    M4-1 起就冻结着。所以这三样任何一个动了,都是一次前缀重建,都必须被指纹看见。
+    """
+    return "\n".join(
+        f"{fn.__name__}{inspect.signature(fn)}\n{inspect.getdoc(fn) or ''}" for fn in tools
+    )
+
+
 def prefix_digest(*parts: str) -> str:
-    """前缀区的指纹。用来回答"它什么时候变过"——见 `record_prefix_change`。"""
+    """前缀区的指纹。用来回答"它什么时候变过"——见 `record_prefix_change`。
+
+    **输入是这次真正会发给模型的两样**:`render_system_prompt()` 的产出(自然含人设/
+    目录/账本以及模板本身)+ `tool_schema_fingerprint()`。第一版是枚举"已知重建点"
+    (人设/目录行/账本)——**漏了第 0 层的工具 schema**,改个 docstring 指纹纹丝不动,
+    而那正是 M4 全程盯得最紧的一条。按构造取,就不用维护一张必然会漏的清单。
+    """
     return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 

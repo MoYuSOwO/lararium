@@ -196,21 +196,106 @@ def test_a_changed_prefix_is_recorded_and_an_unchanged_one_is_not(tmp_path):
     assert conn.execute("SELECT count(*) FROM prefix_log").fetchone()[0] == 2
 
 
-def test_the_digest_covers_every_layer_of_the_prefix(tmp_path):
-    """指纹要盖住前缀的每一层:人设、目录行、账本——任何一层变了都得能查出来。
+def test_changing_a_tool_docstring_changes_the_digest():
+    """★ **改一个工具的 docstring,指纹必须变。**
 
-    注册表变更(加 bundle)、账本结算、人设改动,是三个已知的重建点,一个都不能漏。
+    docstring 就是 schema,schema 是前缀**第 0 层**——M4 全程盯得最紧的一条:M4-1 冻结
+    工具顺序、M4-3 为它专门拍过板、M4-4 那次改 docstring 是授权才动的、M4-5d 还写了
+    报文级测试去比真正发出去的字节。而留痕机制第一版**唯独看不见这一层**:
+    改 docstring 前后指纹一模一样。
+
+    失效形态正是它存在理由的反面:有人改了个 docstring,缓存从 90% 掉到 0,
+    而 `prefix_log` 一声不吭——**没有记录不是"没变过",但读的人会当成没变过**。
+    """
+    from lararium.persona import tool_schema_fingerprint
+
+    def record_expense(amount: float, category: str) -> str:
+        """记一笔支出。"""
+        return ""
+
+    before = tool_schema_fingerprint([record_expense])
+    record_expense.__doc__ = "记一笔支出。category 必须是固定类目之一。"
+
+    assert tool_schema_fingerprint([record_expense]) != before
+
+
+def test_changing_a_tool_signature_changes_the_digest():
+    """签名同理:加一个参数就是改 schema。
+
+    两个函数**同名同 docstring**,只差签名——第一版写成 `f` 和 `g`,光靠名字就能区分开,
+    于是"指纹料里不含签名"这个 bug 照样绿。测一个维度就得把别的维度按住。
+    """
+    from lararium.persona import tool_schema_fingerprint
+
+    def one_arg(a: int) -> str:
+        """同一段说明。"""
+        return ""
+
+    def two_args(a: int, b: str = "x") -> str:
+        """同一段说明。"""
+        return ""
+
+    two_args.__name__ = one_arg.__name__ = "same_name"
+
+    assert tool_schema_fingerprint([one_arg]) != tool_schema_fingerprint([two_args])
+
+
+def test_reordering_tools_changes_the_digest():
+    """顺序也是 schema 的一部分——工具顺序变了缓存全毁,M4-1 起就冻结着。"""
+    from lararium.persona import tool_schema_fingerprint
+
+    def a() -> str:
+        """A。"""
+        return ""
+
+    def b() -> str:
+        """B。"""
+        return ""
+
+    assert tool_schema_fingerprint([a, b]) != tool_schema_fingerprint([b, a])
+
+
+def test_the_digest_is_computed_from_what_is_actually_sent(tmp_path):
+    """指纹的输入是**这次真正会发给模型的两样**:system_prompt + 工具 schema。
+
+    不再枚举"已知重建点"——枚举法今天就已经漏了第 0 层,而且 `_SYSTEM_TEMPLATE` 里的
+    固定脚手架文字改了,三层同样一个都不动。按构造取就不用维护那张清单。
     """
     from lararium.persona import prefix_digest
+    from lararium.steward.assembler import render_system_prompt
 
-    base = prefix_digest("人设", "目录", "账本")
-    assert prefix_digest("人设!", "目录", "账本") != base
-    assert prefix_digest("人设", "目录!", "账本") != base
-    assert prefix_digest("人设", "目录", "账本!") != base
+    base = prefix_digest(
+        render_system_prompt(persona="人设", directory="目录", ledger="账本"), "工具"
+    )
+
+    assert (
+        prefix_digest(
+            render_system_prompt(persona="人设!", directory="目录", ledger="账本"), "工具"
+        )
+        != base
+    )
+    assert (
+        prefix_digest(
+            render_system_prompt(persona="人设", directory="目录!", ledger="账本"), "工具"
+        )
+        != base
+    )
+    assert (
+        prefix_digest(
+            render_system_prompt(persona="人设", directory="目录", ledger="账本!"), "工具"
+        )
+        != base
+    )
+    assert (
+        prefix_digest(
+            render_system_prompt(persona="人设", directory="目录", ledger="账本"), "工具!"
+        )
+        != base
+    )
 
 
-def test_the_digest_cannot_be_fooled_by_moving_text_across_layers(tmp_path):
+def test_the_digest_cannot_be_fooled_by_moving_text_across_parts(tmp_path):
     """拼接要有分隔:("ab","c") 和 ("a","bc") 不能撞成同一个指纹。"""
     from lararium.persona import prefix_digest
 
-    assert prefix_digest("ab", "c", "") != prefix_digest("a", "bc", "")
+    assert prefix_digest("ab", "c") != prefix_digest("a", "bc")

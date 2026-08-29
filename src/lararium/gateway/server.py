@@ -27,7 +27,13 @@ from lararium.config import Settings
 from lararium.db import connect
 from lararium.envelope import Envelope
 from lararium.gateway.commands import handle_command
-from lararium.persona import assemble_persona, prefix_digest, record_prefix_change
+from lararium.persona import (
+    assemble_persona,
+    prefix_digest,
+    record_prefix_change,
+    tool_schema_fingerprint,
+)
+from lararium.steward.assembler import render_system_prompt
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
@@ -86,13 +92,7 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
     persona, warnings = assemble_persona(settings.data_dir)
     for warning in warnings:
         logger.warning(warning)
-    # 前缀变更留痕:改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么
-    # (不可协商第 1 条:缓存命中是设计约束,不是优化项)。
-    digest = prefix_digest(persona, registry.directory_lines(), ledger.read())
-    previous = record_prefix_change(conn, digest)
-    if previous is not None:
-        logger.warning("前缀区变了:%s → %s,本次启动缓存会重建一次", previous[:12], digest[:12])
-    return Steward(
+    steward = Steward(
         settings=settings,
         inbox=Inbox(conn),
         journal=Journal(conn),
@@ -106,6 +106,20 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
         bundle_tools=_assemble_bundle_tools(settings.data_dir, gate, settings.timezone),
     )
+    # 前缀变更留痕:改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么
+    # (不可协商第 1 条:缓存命中是设计约束,不是优化项)。
+    # **按真正发出去的东西算**,不枚举"已知重建点"——那张清单第一版就漏了工具 schema。
+    # 放在 Steward 造好之后,是因为要拿 all_tools()(第 0 层就在那里面)。
+    digest = prefix_digest(
+        render_system_prompt(
+            persona=persona, directory=registry.directory_lines(), ledger=ledger.read()
+        ),
+        tool_schema_fingerprint(steward.all_tools()),
+    )
+    previous = record_prefix_change(conn, digest)
+    if previous is not None:
+        logger.warning("前缀区变了:%s → %s,本次启动缓存会重建一次", previous[:12], digest[:12])
+    return steward
 
 
 def create_app(

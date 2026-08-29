@@ -225,6 +225,19 @@ def _render_envelope(envelope: Envelope, tz: ZoneInfo) -> str:
     )
 
 
+def render_system_prompt(*, persona: str, directory: str, ledger: str) -> str:
+    """前缀区(system_prompt)的全部内容:人格 + 目录 + 账本,套在固定模板里。
+
+    提成公开函数是为了让**算前缀指纹的人和真正发出去的那一份共用同一段代码**
+    (M4-8 补)。指纹第一版是枚举"已知重建点"再拼哈希,漏了第 0 层的工具 schema;
+    而且 `_SYSTEM_TEMPLATE` 里的脚手架文字改了,枚举的那几层同样一个都不动。
+    按构造取,就不用维护一张必然会漏的清单。
+    """
+    return _SYSTEM_TEMPLATE.format(
+        persona=persona.strip(), directory=directory.strip(), ledger=ledger.strip()
+    )
+
+
 def assemble(
     *,
     persona: str,
@@ -240,9 +253,7 @@ def assemble(
     前缀区(system_prompt)只含人格、目录、账本三样,任何随轮次变化的东西
     (时间、消息内容)都不许出现在这里,否则前缀缓存每轮全 miss。
     """
-    system_prompt = _SYSTEM_TEMPLATE.format(
-        persona=persona.strip(), directory=directory.strip(), ledger=ledger.strip()
-    )
+    system_prompt = render_system_prompt(persona=persona, directory=directory, ledger=ledger)
 
     messages: list[dict[str, Any]] = []
     tz = ZoneInfo(timezone)
