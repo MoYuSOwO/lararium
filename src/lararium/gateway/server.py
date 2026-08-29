@@ -25,7 +25,7 @@ from starlette.routing import Route
 
 from lararium.config import Settings
 from lararium.db import connect
-from lararium.envelope import Envelope
+from lararium.envelope import MAX_ATTACHMENTS, Attachment, Envelope
 from lararium.gateway.commands import handle_command
 from lararium.persona import (
     assemble_persona,
@@ -229,6 +229,16 @@ def create_app(
             return JSONResponse({"error": "缺 content 字段"}, status_code=400)
         if len(content) > MAX_CONTENT:
             return JSONResponse({"error": "content 超出 16KB 上限"}, status_code=413)
+        # M5-4:附件是**引用**,字节在 `{data_dir}/media/` 下。校验立在 Attachment
+        # 的类型上(sha256 必须是 64 位十六进制)——一个能自报路径的附件就是路径穿越
+        # 的入口。畸形是客户端问题 → 400,别把网络面打成 500。
+        raw_attachments = payload.get("attachments") or []
+        if not isinstance(raw_attachments, list) or len(raw_attachments) > MAX_ATTACHMENTS:
+            return JSONResponse({"error": "attachments 必须是列表且不超过 8 个"}, status_code=400)
+        try:
+            attachments = [Attachment.model_validate(a) for a in raw_attachments]
+        except ValidationError:
+            return JSONResponse({"error": "attachments 形状不对"}, status_code=400)
 
         # P0-1 安全洞:入口按 token scope 定信封形状。数据面(短信/邮件转发)投进来的
         # 内容是不可信来源——信封必须带 untrusted,否则被当用户亲口说渲染、被自动放行。
@@ -245,6 +255,7 @@ def create_app(
                 source=source,
                 channel=channel,
                 content=content,
+                attachments=attachments,
                 meta=meta,
                 id=payload.get("id"),  # None → 服务端生成;给了就构造时带上,让信封自己把关
             )

@@ -15,6 +15,11 @@ dependencies = [
     "uvicorn>=0.52",      # M2-4 服务运行器
     "sqlite-vec>=0.1.9",  # M3-4 语义检索:纯扩展零依赖,vec0 最近邻
     "model2vec>=0.5",     # M3-4 本地中文 embedding(不拖 torch/transformers)
+    # M5-4 微信 CDN 附件是 AES-128-ECB 密文。D1 说少于 200 行就自己写,但两点让它不适用:
+    # 一是这个库**本来就在依赖树里**(mcp 拉的),显式声明不增加任何安装/维护面(D:
+    # 直接 import 就显式声明);二是拿 150 行自己搓的 AES 换掉一个被反复审计过的实现,
+    # 省的是依赖账上的一行,赔的是没人会再复核的位运算。
+    "cryptography>=43",
 ]
 
 [dependency-groups]

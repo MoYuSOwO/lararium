@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS inbox (
     source       TEXT NOT NULL,
     channel      TEXT NOT NULL,
     content      TEXT NOT NULL,
+    attachments  TEXT NOT NULL DEFAULT '[]',
     meta         TEXT NOT NULL,
     ts           TEXT NOT NULL,
     state        TEXT NOT NULL DEFAULT 'pending',
@@ -143,6 +144,25 @@ def _load_vec_extension(conn: sqlite3.Connection) -> bool:
         return False
 
 
+# 给**已存在的**库补新列。`CREATE TABLE IF NOT EXISTS` 对老库是空操作:新字段只写进
+# SCHEMA 的话,老库永远看不到它,而症状是"新装的机器好使,你自己那台不好使"——
+# 最难查的那一类。每项是 (探测语句, 列名, 补列语句),三个都是完整字面量:
+# 拼 SQL 字符串是 S608 要防的东西,而这里根本不需要拼。
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "PRAGMA table_info(inbox)",
+        "attachments",
+        "ALTER TABLE inbox ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+    ),
+)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    for probe, column, ddl in _ADDED_COLUMNS:
+        if column not in {row[1] for row in conn.execute(probe)}:
+            conn.execute(ddl)
+
+
 def connect(path: Path) -> sqlite3.Connection:
     """isolation_level=None:自己管事务,claim 要用 BEGIN IMMEDIATE。
 
@@ -160,6 +180,7 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA + (_VEC_SCHEMA if vec_ok else ""))
+    _add_missing_columns(conn)
     return conn
 
 

@@ -1,5 +1,7 @@
 """db 层事务/连接的工具级测试。"""
 
+import sqlite3
+
 import pytest
 
 from lararium.db import connect, transaction
@@ -110,3 +112,34 @@ def test_a_swallowed_base_exception_also_rolls_back_the_inner_block(tmp_path):
         conn.execute("INSERT INTO t VALUES ('outer')")
 
     assert [r[0] for r in conn.execute("SELECT v FROM t")] == ["outer"]
+
+
+def test_an_old_database_gets_the_new_column(tmp_path):
+    """老库要能补上新列。
+
+    `CREATE TABLE IF NOT EXISTS` 对已存在的表是空操作——新字段只写进 SCHEMA 的话,
+    **新装的机器好使,你自己那台不好使**,而且症状出现在运行时(写入报 no such column),
+    不在启动时。这是最难查的那一类,所以补列要机械化、启动时就做。
+    """
+    path = tmp_path / "old.sqlite"
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE inbox (id TEXT PRIMARY KEY, source TEXT NOT NULL, channel TEXT NOT NULL,"
+        " content TEXT NOT NULL, meta TEXT NOT NULL, ts TEXT NOT NULL,"
+        " state TEXT NOT NULL DEFAULT 'pending', error TEXT, claimed_at TEXT,"
+        " completed_at TEXT, attempts INTEGER NOT NULL DEFAULT 0)"
+    )
+    old.execute(
+        "INSERT INTO inbox (id, source, channel, content, meta, ts)"
+        " VALUES ('a', 'user', 'cli', '老消息', '{}', '2026-01-01T00:00:00+00:00')"
+    )
+    old.commit()
+    old.close()
+
+    conn = connect(path)
+
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(inbox)")}
+    assert "attachments" in columns
+    # 老行也要能读回来:补列带了默认值,不是留一堆 NULL 等着在 json.loads 里炸
+    assert conn.execute("SELECT attachments FROM inbox WHERE id='a'").fetchone()[0] == "[]"
+    assert connect(path) is not None, "补列要幂等,第二次启动不许报 duplicate column"

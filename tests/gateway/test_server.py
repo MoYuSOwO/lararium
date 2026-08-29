@@ -480,3 +480,65 @@ def test_r2_1_bad_command_args_via_http_no_500(server):
         "/v1/commands", json={"line": "/approve"}, headers={"Authorization": "Bearer tok-cli"}
     )
     assert bare.status_code == 200 and "需要一个参数" in bare.json()["text"]
+
+
+# ── M5-4 附件入站 ───────────────────────────────────────────────────────
+
+
+def test_attachments_survive_the_round_trip_into_the_inbox(server):
+    """附件引用要一路活到 worker 认领信封那一刻。
+
+    `CREATE TABLE IF NOT EXISTS` 对老库是空操作,新列不补的话症状是"新装的机器好使,
+    你自己那台不好使";而这里丢字段的后果是 M5-5 的读图**永远没有输入**,却没人报错。
+    """
+    app, steward = server
+    client = TestClient(app)
+    digest = "ab" * 32
+    r = client.post(
+        "/v1/messages",
+        json={
+            "content": "这是啥\n(图片 · media/abababababab…)",
+            "attachments": [{"kind": "image", "sha256": digest, "media_type": "image/jpeg"}],
+        },
+        headers={"Authorization": "Bearer tok-cli"},
+    )
+    assert r.status_code == 202
+
+    env = steward.inbox.claim_next()
+    assert env is not None
+    assert [(a.kind, a.sha256) for a in env.attachments] == [("image", digest)]
+    assert env.attachments[0].path == f"media/{digest}.jpg"
+
+
+@pytest.mark.parametrize(
+    "attachments",
+    [
+        [
+            {
+                "kind": "image",
+                "sha256": "../../prompts/character.default.md",
+                "media_type": "image/jpeg",
+            }
+        ],
+        [{"kind": "shell", "sha256": "ab" * 32, "media_type": "image/jpeg"}],
+        [{"kind": "image", "sha256": "ab" * 32, "media_type": "../../x"}],
+        "not-a-list",
+        [{"kind": "image", "sha256": f"{i:064x}", "media_type": "image/jpeg"} for i in range(99)],
+    ],
+)
+def test_malformed_attachments_are_400_and_never_reach_the_db(server, attachments):
+    """畸形附件是客户端问题 → 400,不许打成 500,更不许落库。
+
+    第一条是重点:一个能自报路径的附件字段就是路径穿越的入口,而它指向的
+    `prompts/character.default.md` 一旦能被写/被读回,人设就成了对话可改的
+    ——之后**每一轮**都听新的(不可协商第 1 条)。
+    """
+    app, steward = server
+    client = TestClient(app)
+    r = client.post(
+        "/v1/messages",
+        json={"content": "x", "attachments": attachments},
+        headers={"Authorization": "Bearer tok-cli"},
+    )
+    assert r.status_code == 400
+    assert steward.inbox.conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0] == 0

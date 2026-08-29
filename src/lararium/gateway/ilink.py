@@ -21,16 +21,32 @@
 
 我们的处置:因为头由一处构造、每次全带(有报文级测试钉着),-14 只剩"token 真的失效"
 一种解释 → 报 `stale_token=True`,让上层去重连(重新扫码)。**这里没有任何停机状态。**
+
+## 媒体走的是另一台主机(M5-4)
+
+图片/语音/文件/视频的字节不在 iLink 上,在微信 CDN 上,而且是 AES-128-ECB 密文。
+照官方 `src/cdn/`(`cdn-url.ts` / `aes-ecb.ts` / `pic-decrypt.ts`)与 `src/media/
+media-download.ts` 重新实现。两件事值得单独记:
+
+- **CDN 请求不带 iLink 的头**。官方用的是裸 `fetch`;把 `Authorization` 发到另一台
+  主机就是**把 bot_token 泄给第三方**。
+- **`aes_key` 有两种编码**,认漏一种就是"某类附件永远解不开":base64(16 原始字节)
+  走图片,base64(32 个 ASCII 十六进制字符)走文件/语音/视频。
 """
 
 import base64
+import binascii
 import json
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 # iLink-App-Id:官方 package.json 的 ilink_appid 字段。
 APP_ID = "bot"
@@ -40,11 +56,21 @@ _VERSION = (2, 4, 6)
 CLIENT_VERSION = (_VERSION[0] << 16) | (_VERSION[1] << 8) | _VERSION[2]
 CHANNEL_VERSION = ".".join(str(p) for p in _VERSION)
 
-# 官方 types.ts 的常量。message_type: 1=USER 2=BOT;message_state: 2=FINISH;
-# item type: 1=TEXT(其余是图片/语音/文件/视频与工具调用,M5 只做文本)。
+# 官方 types.ts 的常量。message_type: 1=USER 2=BOT;message_state: 2=FINISH。
 _MESSAGE_TYPE_BOT = 2
 _MESSAGE_STATE_FINISH = 2
 _ITEM_TYPE_TEXT = 1
+# item type → 附件种类。**11/12(TOOL_CALL_START/RESULT)不在表里是有意的**:
+# 它们是机器人自己的工具调用回显,不是用户递来的东西——认成附件就是把模型说过的话
+# 当成用户递来的再喂回去(P1-1 那一族)。
+_ITEM_MEDIA_KINDS: dict[int, str] = {2: "image", 3: "voice", 4: "file", 5: "video"}
+# 每种附件的字段前缀,官方 types.ts:image_item / voice_item / file_item / video_item。
+_ITEM_FIELDS: dict[str, str] = {
+    "image": "image_item",
+    "voice": "voice_item",
+    "file": "file_item",
+    "video": "video_item",
+}
 
 # 扫码登录用的 bot_type。官方这一档构建固定用 3。
 _BOT_TYPE = "3"
@@ -54,6 +80,16 @@ LONG_POLL_TIMEOUT = 35.0
 _API_TIMEOUT = 15.0
 
 _STALE_TOKEN_CODE = -14
+
+# 官方 auth/accounts.ts 的 CDN_BASE_URL。服务端多数时候会直接给 full_url,
+# 给不了才拼这个(官方 ENABLE_CDN_URL_FALLBACK 默认也是开的)。
+CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
+# 单个附件的上限。官方是 100 MB,**这里砍到 16 MB**:目标机 2C2G,一个百兆附件
+# 整块读进内存就是把 Steward 一起 OOM 掉,而失效形态会是"半夜没了"。
+MAX_MEDIA_BYTES = 16 * 1024 * 1024
+_MEDIA_TIMEOUT = 60.0
+_AES_BLOCK_BITS = 128
+_HEX_KEY_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
 
 class ILinkError(RuntimeError):
@@ -109,6 +145,23 @@ class QrStatus:
 
 
 @dataclass(frozen=True)
+class MediaRef:
+    """一份附件在 CDN 上的**位置和钥匙**——还没下载。
+
+    分成两步(先拿引用、再决定下不下载)不是为了优雅:下载要走另一台主机、可能几十兆、
+    可能失败,而收信这一批必须先把游标推进去。把它揉进 `get_updates` 的话,一次 CDN
+    抖动就能把整条通道钉住。
+    """
+
+    kind: str
+    encrypted_query_param: str
+    full_url: str
+    # base64 编码的密钥;空串表示这份是明文(官方 downloadPlainCdnBuffer 那一支)。
+    aes_key_b64: str
+    file_name: str = ""
+
+
+@dataclass(frozen=True)
 class InboundMessage:
     """一条收到的文本消息。
 
@@ -120,6 +173,9 @@ class InboundMessage:
     from_user_id: str
     text: str
     context_token: str
+    # M5-4:附件引用。**纯附件消息的 text 是空串,它照样是一条消息**——
+    # 原来空文本就 `continue`,于是一条纯图片消息在协议层就人间蒸发了。
+    media: tuple[MediaRef, ...] = ()
 
 
 def _random_uin() -> str:
@@ -143,6 +199,75 @@ def _text_of(item_list: Any) -> str:
         if isinstance(item, dict) and item.get("type") == _ITEM_TYPE_TEXT
     ]
     return "".join(p for p in parts if p)
+
+
+def _media_refs(item_list: Any) -> tuple[MediaRef, ...]:
+    """把 item_list 里的附件条目转成引用。不认识的类型跳过,和文本那支同一个理由。"""
+    if not isinstance(item_list, list):
+        return ()
+    refs = []
+    for item in item_list:
+        if not isinstance(item, dict):
+            continue
+        kind = _ITEM_MEDIA_KINDS.get(item.get("type", 0), "")
+        if not kind:
+            continue
+        body = item.get(_ITEM_FIELDS[kind]) or {}
+        media = body.get("media") or {}
+        if not (media.get("encrypt_query_param") or media.get("full_url")):
+            continue
+        refs.append(
+            MediaRef(
+                kind=kind,
+                encrypted_query_param=str(media.get("encrypt_query_param") or ""),
+                full_url=str(media.get("full_url") or ""),
+                aes_key_b64=_aes_key_b64(body, media),
+                file_name=str(body.get("file_name") or ""),
+            )
+        )
+    return tuple(refs)
+
+
+def _aes_key_b64(body: dict[str, Any], media: dict[str, Any]) -> str:
+    """图片优先用 `image_item.aeskey`(十六进制字符串),其余用 `media.aes_key`。
+
+    照官方 media-download.ts:它把 hex 转成 base64 再交给 parseAesKey。两边编码不同
+    是真机事实,不是冗余——挑错一个的后果是那类附件**永远解不开**。
+    """
+    hex_key = str(body.get("aeskey") or "")
+    if hex_key and _HEX_KEY_RE.match(hex_key):
+        return base64.b64encode(bytes.fromhex(hex_key)).decode("ascii")
+    return str(media.get("aes_key") or "")
+
+
+def _parse_aes_key(aes_key_b64: str) -> bytes:
+    """照官方 `parseAesKey`:两种编码都认,认不出就报错而不是拿半把钥匙去解。"""
+    try:
+        decoded = base64.b64decode(aes_key_b64, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ILinkError(f"aes_key 不是合法 base64:{exc}", code=0) from exc
+    if len(decoded) == 16:
+        return decoded
+    if len(decoded) == 32 and _HEX_KEY_RE.match(decoded.decode("ascii", "ignore")):
+        return bytes.fromhex(decoded.decode("ascii"))
+    raise ILinkError(
+        f"aes_key 解出来是 {len(decoded)} 字节,既不是 16 原始字节也不是 32 位十六进制", code=0
+    )
+
+
+def _decrypt_aes_ecb(ciphertext: bytes, key: bytes) -> bytes:
+    """AES-128-ECB + PKCS7,照官方 `aes-ecb.ts`。
+
+    ECB 是微信那头定的,不是我们选的——所以 `noqa: S305` 是"照协议办事"而不是
+    "图省事"(G4:抑制要最小范围 + 写明理由)。
+    """
+    decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()  # noqa: S305
+    unpadder = padding.PKCS7(_AES_BLOCK_BITS).unpadder()
+    plain = decryptor.update(ciphertext) + decryptor.finalize()
+    try:
+        return unpadder.update(plain) + unpadder.finalize()
+    except ValueError as exc:
+        raise ILinkError(f"附件解密失败(填充不对,多半是密钥不匹配):{exc}", code=0) from exc
 
 
 class ILinkClient:
@@ -256,7 +381,10 @@ class ILinkClient:
         messages = []
         for raw in payload.get("msgs") or []:
             text = _text_of(raw.get("item_list"))
-            if not text:
+            media = _media_refs(raw.get("item_list"))
+            # 文本和附件**都**空才是一条什么也没有的消息(比如只有工具回显)。
+            # 只看 text 的话,纯图片消息会在这里被静默丢掉。
+            if not text and not media:
                 continue
             messages.append(
                 InboundMessage(
@@ -264,9 +392,36 @@ class ILinkClient:
                     from_user_id=str(raw.get("from_user_id", "")),
                     text=text,
                     context_token=str(raw.get("context_token", "")),
+                    media=media,
                 )
             )
         return messages, str(payload.get("get_updates_buf") or cursor)
+
+    async def download_media(self, ref: MediaRef) -> bytes:
+        """把一份附件取下来并解密,返回明文字节。
+
+        **不带 iLink 的头**:CDN 是另一台主机,把 Authorization 发过去等于把 bot_token
+        泄给第三方(官方那边用的也是裸 fetch)。超限当场拒——见 MAX_MEDIA_BYTES。
+        """
+        url = (
+            ref.full_url
+            or f"{CDN_BASE_URL}/download?encrypted_query_param={quote(ref.encrypted_query_param, safe='')}"
+        )
+        chunks: list[bytes] = []
+        size = 0
+        async with self._http.stream("GET", url, timeout=_MEDIA_TIMEOUT) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > MAX_MEDIA_BYTES:
+                    raise ILinkError(
+                        f"附件超过 {MAX_MEDIA_BYTES // 1024 // 1024} MB 上限,不下载", code=0
+                    )
+                chunks.append(chunk)
+        data = b"".join(chunks)
+        if not ref.aes_key_b64:
+            return data  # 官方 downloadPlainCdnBuffer 那一支:没有密钥就是明文
+        return _decrypt_aes_ecb(data, _parse_aes_key(ref.aes_key_b64))
 
     async def send_text(self, *, to_user_id: str, text: str, context_token: str) -> None:
         """回一条文本。body 照官方形状:`from_user_id` 空串由服务端推断,

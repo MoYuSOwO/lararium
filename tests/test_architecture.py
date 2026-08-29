@@ -70,6 +70,10 @@ def test_only_the_ledger_module_writes_files() -> None:
         # 两遍同一句回复,比没收到还糟)。同样是**客户端自己的状态文件**:
         # wechat.py 是纯 HTTP 客户端,`.importlinter` 钉着它 import 不到 steward/bundles,
         # 结构上就够不着账本。
+        # M5-4 起它还写 `{data_dir}/media/<sha256>.<ext>`:附件字节。文件名**由内容哈希
+        # 算出来**(`Attachment.path`,sha256 有 pattern 校验),对方给的文件名一个字节
+        # 都不参与——不然一个叫 `../../prompts/character.default.md` 的附件就是人设的
+        # 写入口,而人设被改是之后每一轮都听新的。
         Path("src/lararium/gateway/wechat.py"),
     }
     offenders: list[str] = []

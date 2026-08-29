@@ -9,6 +9,20 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _row_values(env: Envelope) -> tuple[str, str, str, str, str, str, str]:
+    """一条信封落库的那几列。**两条 INSERT 共用**——分成两份的那天,加字段的人
+    只会记得改一处,而另一处静默丢字段(附件没了 = M5-5 的读图永远没有输入)。"""
+    return (
+        env.id,
+        env.source,
+        env.channel,
+        env.content,
+        json.dumps([a.model_dump() for a in env.attachments], ensure_ascii=False),
+        json.dumps(env.meta, ensure_ascii=False),
+        env.ts.isoformat(),
+    )
+
+
 class Inbox:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -21,15 +35,9 @@ class Inbox:
 
     def put(self, env: Envelope) -> None:
         self._conn.execute(
-            "INSERT INTO inbox (id, source, channel, content, meta, ts) VALUES (?,?,?,?,?,?)",
-            (
-                env.id,
-                env.source,
-                env.channel,
-                env.content,
-                json.dumps(env.meta, ensure_ascii=False),
-                env.ts.isoformat(),
-            ),
+            "INSERT INTO inbox (id, source, channel, content, attachments, meta, ts) "
+            "VALUES (?,?,?,?,?,?,?)",
+            _row_values(env),
         )
 
     def put_idempotent(self, env: Envelope) -> bool:
@@ -39,16 +47,9 @@ class Inbox:
         客户端重发同 id,消息只在库里留一行(DESIGN §9 ingress)。
         """
         cur = self._conn.execute(
-            "INSERT OR IGNORE INTO inbox (id, source, channel, content, meta, ts) "
-            "VALUES (?,?,?,?,?,?)",
-            (
-                env.id,
-                env.source,
-                env.channel,
-                env.content,
-                json.dumps(env.meta, ensure_ascii=False),
-                env.ts.isoformat(),
-            ),
+            "INSERT OR IGNORE INTO inbox (id, source, channel, content, attachments, meta, ts) "
+            "VALUES (?,?,?,?,?,?,?)",
+            _row_values(env),
         )
         return cur.rowcount == 1
 
@@ -81,6 +82,7 @@ class Inbox:
             source=row["source"],
             channel=row["channel"],
             content=row["content"],
+            attachments=json.loads(row["attachments"]),
             meta=json.loads(row["meta"]),
             ts=datetime.fromisoformat(row["ts"]),
         )

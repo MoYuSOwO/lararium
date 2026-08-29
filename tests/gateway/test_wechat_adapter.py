@@ -9,6 +9,7 @@
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ import httpx
 import pytest
 
 from lararium.gateway import wechat
-from lararium.gateway.ilink import Credentials, ILinkError, InboundMessage, QrStatus
+from lararium.gateway.ilink import Credentials, ILinkError, InboundMessage, MediaRef, QrStatus
 from lararium.gateway.wechat import State, WeChatAdapter
 
 
@@ -69,6 +70,7 @@ def adapter(tmp_path, ilink, handler, **state):
         lararium=lararium(handler),
         token="tok-wechat",
         state=State(path=path, **state),
+        media_dir=tmp_path / "media",
     )
 
 
@@ -136,7 +138,7 @@ async def test_an_inbound_message_is_posted_to_lararium(tmp_path):
 
     assert seen[0].url.path == "/v1/messages"
     assert seen[0].headers["authorization"] == "Bearer tok-wechat"
-    assert json.loads(seen[0].content) == {"content": "打车 28"}
+    assert json.loads(seen[0].content) == {"content": "打车 28", "attachments": []}
 
 
 async def test_the_cursor_and_context_token_are_persisted_after_each_batch(tmp_path):
@@ -582,3 +584,215 @@ def test_the_adapter_knows_no_command_verbs():
     code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
     leaked = sorted(v for v in verbs if f'"{v}"' in code or f"'{v}'" in code)
     assert not leaked, f"适配器自己认起了命令动词 {leaked}——那就是第二份分派"
+
+
+# ── M5-4 媒体入站与"不堵通道" ───────────────────────────────────────────
+
+
+class FakeCdn:
+    """按 MediaRef 回字节;可以指定某一条下载失败。"""
+
+    def __init__(self, blobs=None, fail=False):
+        self._blobs = blobs or {}
+        self.fail = fail
+        self.asked: list[str] = []
+
+    async def download_media(self, ref):
+        self.asked.append(ref.encrypted_query_param)
+        if self.fail:
+            raise ILinkError("CDN 502", code=502)
+        return self._blobs.get(ref.encrypted_query_param, b"\xff\xd8\xff\xe0jpeg-bytes")
+
+
+class FakeILinkWithCdn(FakeILink, FakeCdn):
+    def __init__(self, batches=(), blobs=None, fail_download=False):
+        FakeILink.__init__(self, batches=batches)
+        FakeCdn.__init__(self, blobs=blobs, fail=fail_download)
+
+
+def image(query="q1"):
+    return MediaRef(kind="image", encrypted_query_param=query, full_url="", aes_key_b64="")
+
+
+async def test_a_text_message_behind_an_image_still_arrives(tmp_path):
+    """★ 本步真正的理由:**一条纯图片消息不许把它后面的所有文字消息一起堵死。**
+
+    失效形态不是"图片不支持",是**助手整个哑掉**——那条消息卡在队首,用户在微信这头
+    只看到"发什么都没反应",而日志里是同一条消息每三秒重来一遍。
+    """
+    delivered: list[str] = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        delivered.append(body["content"])
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            (
+                [
+                    InboundMessage(1, "u1@im.wechat", "", "ctx", media=(image(),)),
+                    InboundMessage(2, "u1@im.wechat", "刚发的那张", "ctx"),
+                ],
+                "cursor-2",
+            )
+        ]
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert "刚发的那张" in delivered, "图片后面那条文字消息没送达——通道被堵住了"
+    assert State.load(a.state.path).cursor == "cursor-2", "游标没推进,下一轮会再收同一批"
+
+
+async def test_one_poisoned_message_does_not_stop_the_batch(tmp_path):
+    """**任何**一条投递失败都要跳过并推进游标,不只是图片。
+
+    今天是图片,明天是超 16KB 的长文(服务端 413)、或者服务端抖一下。一条毒消息
+    能永久堵死通道的话,恢复手段只剩人工进库删行——而没人会知道要去删。
+    """
+    delivered: list[str] = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        if body["content"].startswith("毒"):
+            return httpx.Response(413, json={"error": "content 超出 16KB 上限"})
+        delivered.append(body["content"])
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            (
+                [
+                    InboundMessage(1, "u1@im.wechat", "毒" * 3, "ctx"),
+                    InboundMessage(2, "u1@im.wechat", "后面这条", "ctx"),
+                ],
+                "cursor-2",
+            )
+        ]
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert delivered == ["后面这条"]
+    assert State.load(a.state.path).cursor == "cursor-2", "毒消息把游标钉住了"
+
+
+async def test_an_image_is_stored_under_its_content_hash_exactly_once(tmp_path):
+    """按内容哈希命名:同一张图发两次只存一份,而且文件名不由对方决定。"""
+    ilink = FakeILinkWithCdn(
+        batches=[
+            ([InboundMessage(1, "u1@im.wechat", "", "ctx", media=(image("q1"),))], "c1"),
+            ([InboundMessage(2, "u1@im.wechat", "", "ctx", media=(image("q2"),))], "c2"),
+        ]
+    )
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(202, json={"envelope_id": "e"}))
+
+    await a.pump_inbound_once()
+    await a.pump_inbound_once()
+
+    files = sorted(p.name for p in (tmp_path / "media").iterdir())
+    digest = hashlib.sha256(b"\xff\xd8\xff\xe0jpeg-bytes").hexdigest()
+    assert files == [f"{digest}.jpg"]
+
+
+async def test_the_envelope_gets_a_reference_and_a_readable_line_not_bytes(tmp_path):
+    """信封带的是**引用**,`content` 是一行人话——下游一切按文本走的东西都不用动。"""
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[([InboundMessage(1, "u1@im.wechat", "这是啥", "ctx", media=(image(),))], "c1")]
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    digest = hashlib.sha256(b"\xff\xd8\xff\xe0jpeg-bytes").hexdigest()
+    assert posted[0]["content"] == f"这是啥\n(图片 · media/{digest[:12]}…)"
+    assert posted[0]["attachments"] == [
+        {"kind": "image", "sha256": digest, "media_type": "image/jpeg"}
+    ]
+    assert "jpeg-bytes" not in json.dumps(posted[0]), "字节被塞进信封了"
+
+
+async def test_a_failed_download_is_plain_words_and_the_message_still_lands(tmp_path):
+    """CDN 挂了 / 解密失败 → 走 E2 人话,消息照样投,泵不许崩。
+
+    图取不到是常事(CDN 抖动、密钥编码没见过);为此丢掉整条消息的话,用户发的那句
+    "这个多少钱"也跟着没了。
+    """
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            ([InboundMessage(1, "u1@im.wechat", "这个多少钱", "ctx", media=(image(),))], "c1")
+        ],
+        fail_download=True,
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert posted[0]["content"].startswith("这个多少钱")
+    assert "没能取到" in posted[0]["content"]
+    assert posted[0]["attachments"] == []
+    assert State.load(a.state.path).cursor == "c1"
+    # 成没成功**只有适配器知道**:模型看到的那行文本里没有"下载失败"这个信息,
+    # 所以回执必须分两种说法,不能一律"已存下来"。
+    assert "没取到" in ilink.sent[0][1], f"下载失败却回了句报喜的:{ilink.sent}"
+
+
+async def test_the_user_is_told_the_image_arrived(tmp_path):
+    """收到图要回一句人话。读图是 M5-5,这一步模型对着一行文本答不出内容
+    ——不吭声的话用户只会以为又没反应。"""
+    ilink = FakeILinkWithCdn(
+        batches=[([InboundMessage(1, "u1@im.wechat", "", "ctx", media=(image(),))], "c1")]
+    )
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(202, json={"envelope_id": "e"}))
+
+    await a.pump_inbound_once()
+
+    assert ilink.sent, "收到图之后什么都没回"
+    assert "收到" in ilink.sent[0][1]
+
+
+async def test_media_is_written_atomically(tmp_path, monkeypatch):
+    """和 `State.save` / `ledger.py` 同一份 R3-1 标准:同目录 .tmp → fsync → replace。
+
+    半张图留在 `media/` 下、名字却是完整哈希的话,以后**每一次**都会拿它当那张图,
+    而它永远不会自己修好。
+
+    **锚点是那对系统调用,不是"目录里没有 .tmp"**:直接 `open(path,"wb")` 写下去也
+    不会留 .tmp,那样断言等于什么都没测(T6 第五种假绿)。原子性从外面看不出差别,
+    所以只能钉实现——这是 T1 的例外,写在这里免得下一个人以为是疏忽。
+    """
+    fsynced: list[int] = []
+    replaced: list[str] = []
+    real_fsync, real_replace = os.fsync, Path.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (fsynced.append(fd), real_fsync(fd))[1])
+    monkeypatch.setattr(
+        Path,
+        "replace",
+        lambda self, target: (replaced.append(self.name), real_replace(self, target))[1],
+    )
+
+    ilink = FakeILinkWithCdn(
+        batches=[([InboundMessage(1, "u1@im.wechat", "", "ctx", media=(image(),))], "c1")]
+    )
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(202, json={"envelope_id": "e"}))
+
+    await a.pump_inbound_once()
+
+    assert not [p for p in (tmp_path / "media").iterdir() if p.suffix == ".tmp"]
+    assert fsynced, "附件没 fsync:rename 是原子的,内容却可能还在页缓存里"
+    assert [n for n in replaced if n.endswith(".jpg.tmp")], "附件不是经临时文件改名落位的"

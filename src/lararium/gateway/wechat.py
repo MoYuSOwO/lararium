@@ -24,9 +24,20 @@
 (官方实现里它没有过期逻辑,收到新消息就覆盖),丢了它早报就发不出去。
 
 单用户助手,所以只记**最后一个**说话的人(`peer`)。多用户是另一个设计,不在这里假装支持。
+
+## 一条投递失败不许堵住它后面的所有人(M5-4)
+
+原来一批消息是"逐条投,最后统一推游标"。任何一条投递失败(超 16KB 的长文 → 413、
+服务端抖一下、以后的图片 → 空 content 400)都会让异常穿出去,**游标一格都不推**,
+三秒后拿旧游标又取到同一批 —— 那条毒消息卡在队首,它后面所有消息一起进不来。
+用户在微信这头看到的是"发什么都没反应",日志里是同一条消息每三秒重来一遍。
+
+所以现在是**逐条兜住、照常推进游标**:投不进去的那条落一行日志然后跳过。丢一条消息
+比哑掉整个助手轻得多,而且丢的那条至少在日志里有名有姓。
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -37,7 +48,8 @@ from typing import ClassVar
 
 import httpx
 
-from lararium.gateway.ilink import Credentials, ILinkClient, ILinkError, InboundMessage
+from lararium.envelope import Attachment, kind_word
+from lararium.gateway.ilink import Credentials, ILinkClient, ILinkError, InboundMessage, MediaRef
 
 logger = logging.getLogger("lararium.wechat")
 
@@ -51,6 +63,21 @@ _QR_LIFETIME = 180.0
 # 轮询下界。服务端正常会把请求挂住(长轮询),但异常时会立刻返回——没有这一行,
 # 那就是热循环。
 _POLL_FLOOR = 1.0
+
+# 落盘时按字节的**魔数**认类型,不信对方给的文件名——文件名是外部输入,而这里的
+# 结果会变成磁盘上的后缀。认不出来就 octet-stream,不去猜。
+_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"GIF8", "image/gif"),
+    (b"RIFF", "image/webp"),
+)
+# 魔数认不出来时按种类兜底。语音是 SILK(官方要转码成 wav,那不是这一步的事)。
+_FALLBACK_MEDIA_TYPES: dict[str, str] = {
+    "voice": "audio/silk",
+    "video": "video/mp4",
+}
+_DEFAULT_MEDIA_TYPE = "application/octet-stream"
 
 
 @dataclass
@@ -118,11 +145,13 @@ class WeChatAdapter:
         lararium: httpx.AsyncClient,
         token: str,
         state: State,
+        media_dir: Path,
     ) -> None:
         self.ilink = ilink
         self.lararium = lararium
         self.token = token
         self.state = state
+        self.media_dir = media_dir
 
     @property
     def ilink_token(self) -> str | None:
@@ -146,7 +175,18 @@ class WeChatAdapter:
 
         for message in messages:
             self._remember(message)
-            await self._route(message.text)
+            try:
+                await self._deliver(message)
+            except Exception as exc:
+                # **故意兜住所有异常并继续**(E1 的例外,理由写在模块 docstring):
+                # 不兜的话一条投不进去的消息会把它后面的全部堵死,而恢复手段只剩
+                # 人工进库删行。这里丢的那条在日志里有名有姓;哑掉的助手没有。
+                logger.warning(
+                    "消息 %s 没能投进 Lararium,跳过:%s: %s",
+                    message.message_id,
+                    type(exc).__name__,
+                    exc,
+                )
         if cursor != self.state.cursor:
             self.state.cursor = cursor
             self.state.save()
@@ -156,6 +196,85 @@ class WeChatAdapter:
         self.state.context_token = message.context_token or self.state.context_token
         self.state.peer = message.from_user_id or self.state.peer
         self.state.save()
+
+    async def _deliver(self, message: InboundMessage) -> None:
+        """把一条微信消息变成一个信封投进去;有附件就先取下来存好。
+
+        **附件先落盘,信封里放引用**——把字节塞进信封等于把它塞进每一次序列化和
+        每一行日志,而 `content` 仍是字符串这条纪律不许绕(它是所有外部输入的入口)。
+        """
+        if not message.media:
+            await self._route(message.text)
+            return
+        attachments, lines = [], []
+        for ref in message.media:
+            saved = await self._save_media(ref)
+            if saved is None:
+                lines.append(f"({kind_word(ref.kind)} · 没能取到)")
+                continue
+            attachments.append(saved)
+            lines.append(saved.as_line())
+        content = "\n".join(part for part in [message.text, *lines] if part)
+        await self._post_message(content, attachments)
+        await self._say(self._media_receipt(attachments, len(message.media)))
+
+    def _media_receipt(self, saved: list[Attachment], total: int) -> str:
+        """收到附件当场回一句人话。
+
+        读图是 M5-5,这一步模型对着一行文本答不出图里有什么——不吭声的话用户只会
+        以为"又没反应"(这正是本步要治的那个症状)。而**成没成功只有这里知道**:
+        模型看到的那行文本里没有"下载失败"这个信息。
+        """
+        if len(saved) == total:
+            return f"收到 {total} 个附件,已存下来。"
+        return f"收到 {total} 个附件,其中 {total - len(saved)} 个没取到内容。"
+
+    async def _save_media(self, ref: MediaRef) -> Attachment | None:
+        """下载、解密、按内容哈希落盘。取不到就返回 None(E2:人话,不是异常)。
+
+        图取不到是常事(CDN 抖动、密钥编码没见过)。为此丢掉整条消息的话,用户同时
+        发的那句"这个多少钱"也跟着没了。
+        """
+        try:
+            data = await self.ilink.download_media(ref)
+        except (ILinkError, httpx.HTTPError, ValueError) as exc:
+            logger.warning("附件没取到(%s):%s: %s", ref.kind, type(exc).__name__, exc)
+            return None
+        attachment = Attachment(
+            kind=ref.kind,
+            sha256=hashlib.sha256(data).hexdigest(),
+            media_type=_sniff(data, ref.kind),
+        )
+        self._write_once(attachment, data)
+        return attachment
+
+    def _write_once(self, attachment: Attachment, data: bytes) -> None:
+        """按内容哈希命名:同一张图发两次只存一份,已经在了就不重写。
+
+        原子写和 `State.save` / `ledger.py` 是同一份 R3-1 标准——半张图留在 `media/` 下、
+        名字却是完整哈希的话,以后**每一次**都会拿它当那张图,而它永远不会自己修好。
+        """
+        path = self.media_dir / Path(attachment.path).name
+        if path.exists():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        with temp.open("wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        temp.replace(path)
+
+    async def _post_message(self, content: str, attachments: list[Attachment]) -> None:
+        response = await self.lararium.post(
+            "/v1/messages",
+            json={
+                "content": content,
+                "attachments": [a.model_dump() for a in attachments],
+            },
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        response.raise_for_status()
 
     async def _route(self, text: str) -> None:
         """以 `/` 开头的走命令端点,别的走消息端点。
@@ -173,12 +292,7 @@ class WeChatAdapter:
         if line.startswith("/"):
             await self._run_command(line)
             return
-        response = await self.lararium.post(
-            "/v1/messages",
-            json={"content": text},
-            headers={"Authorization": f"Bearer {self.token}"},
-        )
-        response.raise_for_status()
+        await self._post_message(text, [])
 
     async def _run_command(self, line: str) -> None:
         """把命令原样转给 `/v1/commands`,把返回的文本回给用户。
@@ -339,6 +453,7 @@ async def main() -> None:
         ),
         token=token,
         state=state,
+        media_dir=data_dir / "media",
     )
     if not state.bot_token:
         await adapter.relogin()
@@ -347,3 +462,11 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+def _sniff(data: bytes, kind: str) -> str:
+    """按魔数认类型。**不信对方给的文件名**——它是外部输入,而结果会变成磁盘上的后缀。"""
+    for magic, media_type in _MAGIC:
+        if data.startswith(magic):
+            return media_type
+    return _FALLBACK_MEDIA_TYPES.get(kind, _DEFAULT_MEDIA_TYPE)
