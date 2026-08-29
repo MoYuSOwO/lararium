@@ -21,7 +21,7 @@ _KIND_WORDS: dict[str, str] = {
 }
 # media_type → 落盘后缀。后缀只是给人和文件管理器看的,**权威是 media_type**;
 # 认不出来就 .bin,不去猜。
-_SUFFIXES: dict[str, str] = {
+SUFFIXES: dict[str, str] = {
     "image/jpeg": "jpg",
     "image/png": "png",
     "image/gif": "gif",
@@ -30,12 +30,26 @@ _SUFFIXES: dict[str, str] = {
     "video/mp4": "mp4",
 }
 _DEFAULT_SUFFIX = "bin"
+# 反查方向。**由正查表算出来,不另抄一份**——抄一份反过来写的那天两边就开始漂,
+# 而漂的表现是"某种附件被当成另一种送出去"(M5-5 补:`tools._media_type_of` 当场
+# 犯了这个,一段语音和一份 PDF 都被贴上 image/jpeg 交给了模型)。
+_MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {v: k for k, v in SUFFIXES.items()}
 # 正文里那行只放短 id。全长 64 位十六进制会**永久地**乘进后续每一轮 L0 的成本,
 # 而 L0 的预算算术对图片一无所知(M5-5 约束 1)。12 位十六进制 = 48 bit,
 # 单用户助手一辈子的图也撞不上,同时它还得当"把那张图取回来"的键用。
 SHORT_ID_CHARS = 12
 # 一条消息最多挂几个附件。信封是所有外部输入的入口,列表长度也是输入。
 MAX_ATTACHMENTS = 8
+
+
+def media_type_of_suffix(suffix: str) -> str | None:
+    """从磁盘上的后缀反推 media_type。**认不出返回 None,绝不猜。**
+
+    猜一个类型出去,等于把"我不知道这是什么"变成"我确定这是 JPEG",而下游没有任何人
+    能再纠正它——服务商只会回一句 `invalid image format`,用户看到的是助手当场死了
+    这一轮,错误里全是 provider 的黑话。
+    """
+    return _MEDIA_TYPE_BY_SUFFIX.get(suffix.lstrip("."))
 
 
 def kind_word(kind: str) -> str:
@@ -69,7 +83,16 @@ class Attachment(BaseModel):
     @property
     def path(self) -> str:
         """相对 `data_dir` 的存放位置。**由哈希算出来,不是外面传进来的。**"""
-        return f"media/{self.sha256}.{_SUFFIXES.get(self.media_type, _DEFAULT_SUFFIX)}"
+        return f"media/{self.sha256}.{SUFFIXES.get(self.media_type, _DEFAULT_SUFFIX)}"
+
+    @property
+    def is_image(self) -> bool:
+        """能不能送进模型的**唯一**判据。
+
+        **按 media_type 判,不按 kind。** 微信那头 type=IMAGE 的条目,字节嗅不出来时
+        落的是 `application/octet-stream`——按 kind 判就会把一份 PDF 当图片送进去。
+        """
+        return self.media_type.startswith("image/")
 
     def as_line(self) -> str:
         """正文里代表这份附件的那一行人话。

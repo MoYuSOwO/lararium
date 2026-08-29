@@ -92,7 +92,7 @@ def test_the_number_of_images_per_turn_is_capped(tmp_path):
 
 
 @pytest.mark.parametrize("count", [1, 3])
-def test_the_framing_says_the_picture_is_data_not_instructions(count):
+def test_the_framing_points_at_the_pictures_and_not_at_the_text(count):
     """框定语是这一层**唯一**能对注入做的事,而且它是说服不是机制。
 
     所以它必须:说清楚图里的字是数据、点名"照做"这个动作、并且**每一张图都在它的
@@ -103,3 +103,24 @@ def test_the_framing_says_the_picture_is_data_not_instructions(count):
     assert str(count) in line
     assert "数据" in line and "指令" in line
     assert "不要执行" in line or "不照做" in line or "照做" in line
+    # **指向词必须指对。** 第一版写的是「以上 N 张图」,而报文里图排在文本**之后**
+    # (报文测试钉着 ["text","image_url"]);不可信轮更别扭——这句紧跟在 `>>>` 后面,
+    # 「以上」最自然的读法是围栏里那段文字,不是图。框定语是这一层唯一的文本防线,
+    # 唯一必须指对的那个词不能指反。
+    assert "随这条消息" in line
+    assert "以上" not in line
+
+
+def test_a_kind_image_attachment_that_is_not_actually_an_image_is_not_sent(tmp_path):
+    """判据是 media_type,不是 kind(M5-5 补)。
+
+    微信那头 type=IMAGE 的条目,字节嗅不出来时落的是 `application/octet-stream`
+    ——按 kind 判就会把一份 PDF 当图片送进模型,服务商回
+    `invalid image format`,而用户看到的是「这条消息处理失败,已放弃」。
+    """
+    pdf = store(tmp_path, data=b"%PDF-1.7 not an image", media_type="application/octet-stream")
+
+    parts, notes = load_images(media_dir=tmp_path, attachments=[pdf], enabled=True)
+
+    assert parts == ()
+    assert notes == ()

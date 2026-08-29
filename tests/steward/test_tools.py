@@ -375,3 +375,34 @@ def test_look_at_image_degrades_when_the_model_cannot_see(tmp_path):
     out = blind.look_at_image(DIGEST[:12])
 
     assert isinstance(out, str) and "看不了图" in out
+
+
+@pytest.mark.parametrize(
+    ("suffix", "blob", "word"),
+    [
+        (".silk", b"#!SILK_V3 xxxx", "语音"),
+        (".mp4", b"\x00\x00\x00 ftypmp42", "视频"),
+        (".bin", b"%PDF-1.7 not an image", "文件"),
+    ],
+)
+def test_look_at_image_refuses_anything_that_is_not_a_picture(tmp_path, tools, suffix, blob, word):
+    """★ M5-5 补:**两个出口,同一条规则。**
+
+    `load_images` 那边挡住了非图片,`look_at_image` 这边原来一个种类判断都没有;
+    再撞上"认不出就按 jpeg 送"的兜底,一段语音、一份 PDF 都会被贴上 `image/jpeg`
+    交出去。真模型自己就走进去了:发一份 PDF 问「里面最大的一笔是多少」,它调
+    `look_at_image` → 服务商 400 `invalid image format` → 这一轮当场死掉,
+    用户看到的是一句全是黑话的「处理失败,已放弃」。
+
+    而这个教训就写在 `envelope._KIND_WORDS` 上方、同一个里程碑里
+    ——「两个出口各写一套词,总有一个先漂」。所以这条测试必须落在**这条路**上,
+    不是只落在 `load_images` 上。
+    """
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(blob).hexdigest()
+    (tmp_path / "media" / f"{digest}{suffix}").write_bytes(blob)
+
+    out = tools.look_at_image(digest[:12])
+
+    assert isinstance(out, str), f"{suffix} 居然被当成图片交出去了:{out!r}"
+    assert word in out and "看不了" in out

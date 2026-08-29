@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from lararium.envelope import Attachment, Envelope
+from lararium.envelope import SUFFIXES, Attachment, Envelope, media_type_of_suffix
 
 
 def test_channel_rejects_free_text():
@@ -103,3 +103,43 @@ def test_attachments_are_capped():
     ]
     with pytest.raises(ValidationError):
         Envelope.new(source="user", channel="wechat", content="x", attachments=many)
+
+
+def test_the_suffix_table_is_one_table_read_both_ways():
+    """后缀表只有一份,正查反查取的是同一份(M5-5 补)。
+
+    抄一份反过来写的那天,两边就开始漂——而漂的表现是"某种附件被当成另一种送出去"。
+    这个教训就写在 `_KIND_WORDS` 上方,而 `tools._media_type_of` 当场犯了它。
+    """
+    for media_type, suffix in SUFFIXES.items():
+        assert media_type_of_suffix(suffix) == media_type
+        assert media_type_of_suffix(f".{suffix}") == media_type
+
+
+def test_an_unknown_suffix_is_unknown_not_a_guess():
+    """**认不出就是认不出。** 猜一个类型出去,等于把"我不知道这是什么"变成
+    "我确定这是 JPEG",而下游没有任何人能再纠正它——服务商只会回一句
+    `invalid image format`,用户看到的是助手当场死了这一轮。"""
+    assert media_type_of_suffix("bin") is None
+    assert media_type_of_suffix(".pdf") is None
+    assert media_type_of_suffix("") is None
+
+
+@pytest.mark.parametrize(
+    ("media_type", "expected"),
+    [
+        ("image/jpeg", True),
+        ("image/webp", True),
+        ("audio/silk", False),
+        ("video/mp4", False),
+        ("application/octet-stream", False),
+    ],
+)
+def test_is_image_is_the_single_rule_for_what_may_reach_the_model(media_type, expected):
+    """判据是 **media_type**,不是 kind。
+
+    微信那头 type=IMAGE 的条目,字节嗅不出来时落的是 `application/octet-stream`
+    ——按 kind 判就会把它当图片送进模型,而它可能是一份 PDF。
+    """
+    a = Attachment(kind="image", sha256="ab" * 32, media_type=media_type)
+    assert a.is_image is expected

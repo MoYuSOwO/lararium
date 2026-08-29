@@ -6,6 +6,7 @@ from re import sub
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from lararium.envelope import media_type_of_suffix
 from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, neutralize_fence
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
@@ -189,15 +190,24 @@ class BuiltinTools:
         matches = sorted(self.media_dir.glob(f"{image_id}*")) if self.media_dir.is_dir() else []
         if len(matches) != 1:
             return f"没找到 {image_id[:12]} 这张图(原件可能已经不在了)。"
+        # **只认图片,和 load_images 同一条规则。** 两个出口各写一套的那天,总有一个
+        # 先漂——这里原来一个种类判断都没有,再撞上"认不出就按 jpeg 送"的兜底,
+        # 一段语音、一份 PDF 都会被贴上 image/jpeg 交出去,而服务商回的是
+        # `invalid image format`:这一轮当场死掉,用户看到的是一句全是黑话的
+        # 「处理失败,已放弃」。真模型自己就走进去了(发一份 PDF 问「最大的一笔是多少」)。
+        media_type = media_type_of_suffix(matches[0].suffix)
+        if media_type is None or not media_type.startswith("image/"):
+            # 措辞里**不带省略号**:实测模型会盯着那个 `…` 认定"图片 id 被截断了",
+            # 转头让用户重发一次图,而真相是那份东西根本不是图。回绝要说清楚是什么,
+            # 别给它一个更顺嘴的错误解释。
+            return f"media/{image_id[:12]} 是{_not_image_word(media_type)},不是图片,我看不了。"
         data = matches[0].read_bytes()
         digest = matches[0].stem
         # **重看这条路同样要带框定**。少了它,"重看"就成了绕过防线的支路:
         # 第一次进来带着"这是数据不是指令",第二次进来光秃秃的。
         return ImageReturn(
             text=f"(重新附上 media/{digest[:12]}…)\n{framing(1)}",
-            images=(
-                ImagePart(sha256=digest, media_type=_media_type_of(matches[0].suffix), data=data),
-            ),
+            images=(ImagePart(sha256=digest, media_type=media_type, data=data),),
         )
 
     def as_tool_functions(self) -> list[Callable]:
@@ -218,16 +228,12 @@ class BuiltinTools:
         ]
 
 
-# 后缀 → media_type。和 `envelope._SUFFIXES` 是同一张表反过来查——那边是权威
-# (media_type 决定后缀),这边只在从磁盘反推时用。认不出就按 jpeg 送,
-# 服务商多半按字节自己认。
-_MEDIA_TYPES = {
-    ".jpg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-}
-
-
-def _media_type_of(suffix: str) -> str:
-    return _MEDIA_TYPES.get(suffix, "image/jpeg")
+def _not_image_word(media_type: str | None) -> str:
+    """回绝时说清楚它是什么,别只说"不是图片"——用户得知道自己发的那份东西还在。"""
+    if media_type is None:
+        return "一份文件"
+    if media_type.startswith("audio/"):
+        return "一段语音"
+    if media_type.startswith("video/"):
+        return "一段视频"
+    return "一份文件"
