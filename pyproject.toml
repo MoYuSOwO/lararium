@@ -2,6 +2,8 @@
 name = "lararium"
 version = "0.1.0"
 description = "自部署个人生活助手"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9",
