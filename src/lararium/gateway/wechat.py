@@ -11,7 +11,7 @@
 `cli.py` 是"发一条 → 长轮询等这条的回复"。这里不行:M4-7 的主动推送(早报、待审提醒)
 不对应任何一条用户消息,一问一答的形状接不住它。所以拆成两个独立的泵:
 
-    收:iLink getupdates ──→ POST /v1/messages
+    收:iLink getupdates ──→ POST /v1/messages(以 / 开头的走 /v1/commands)
     发:GET /v1/outbox   ──→ iLink sendmessage
 
 发的那个泵不关心消息从哪来,回复也好推送也好一律照发——M4-7 把推送做成了一轮完整的
@@ -146,7 +146,7 @@ class WeChatAdapter:
 
         for message in messages:
             self._remember(message)
-            await self._deliver_to_lararium(message.text)
+            await self._route(message.text)
         if cursor != self.state.cursor:
             self.state.cursor = cursor
             self.state.save()
@@ -157,13 +157,61 @@ class WeChatAdapter:
         self.state.peer = message.from_user_id or self.state.peer
         self.state.save()
 
-    async def _deliver_to_lararium(self, content: str) -> None:
+    async def _route(self, text: str) -> None:
+        """以 `/` 开头的走命令端点,别的走消息端点。
+
+        **任务书原话是「IM 按钮回调」,但这条通道上没有按钮**:官方 `types.ts` 的
+        `MessageItemType` 只有 NONE/TEXT/IMAGE/VOICE/FILE/VIDEO/TOOL_CALL_*,
+        全库 grep 不到 button/card/inline_keyboard;官方自己处理斜杠命令也是
+        `trimmed.startsWith("/")`。所以审批在微信里就是**打一行 `/approve <id>`**。
+
+        **先 strip 再判**(R2-1 的另一半):手机输入法很容易带前导空格,
+        ` /approve abc` 要是被当成普通消息喂给模型,用户会以为"批准了",
+        而账本纹丝不动——CLI 有 `input().strip()` 兜着,这里没有。
+        """
+        line = text.strip()
+        if line.startswith("/"):
+            await self._run_command(line)
+            return
         response = await self.lararium.post(
             "/v1/messages",
-            json={"content": content},
+            json={"content": text},
             headers={"Authorization": f"Bearer {self.token}"},
         )
         response.raise_for_status()
+
+    async def _run_command(self, line: str) -> None:
+        """把命令原样转给 `/v1/commands`,把返回的文本回给用户。
+
+        **只判"是不是以 / 开头",具体动词一个都不认**——认了就是第二份分派,
+        而两份实现必然漂移,而这条路上放的是**账本的批准权**。分派只有一套:
+        服务端的 `handle_command`(它当初就是为这个抽出来的)。有测试钉着
+        这个文件里不出现任何命令动词。
+
+        审批必须走这条代码路径,这是门控的全部意义:**模型手上没有批准工具,
+        那是故意的**——把 `/approve` 当普通消息喂给模型,等于把批准权交回给它。
+        """
+        try:
+            response = await self.lararium.post(
+                "/v1/commands",
+                json={"line": line},
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            response.raise_for_status()
+            reply = str(response.json().get("text", ""))
+        except (httpx.HTTPError, ValueError) as exc:
+            # 打崩收信泵的后果是:用户打错一个命令,助手从此不再收消息,而他不知道为什么。
+            logger.warning("命令 %s 失败:%s: %s", line, type(exc).__name__, exc)
+            reply = f"这条命令没执行成功({type(exc).__name__})。再试一次,或者去日志里看看。"
+        await self._say(reply)
+
+    async def _say(self, text: str) -> None:
+        """直接回一句给用户。命令端点是同步返回的,没有信封,不走出件箱。"""
+        if not (self.state.peer and self.state.context_token and text):
+            return
+        await self.ilink.send_text(
+            to_user_id=self.state.peer, text=text, context_token=self.state.context_token
+        )
 
     # ── 发 ──────────────────────────────────────────────────────────────
 

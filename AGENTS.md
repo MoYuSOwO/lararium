@@ -96,6 +96,9 @@ uv run python -m lararium.gateway.wechat
 服务端那边要给它一个**渠道叫 wechat** 的控制端 token(`LARARIUM_TOKENS=wechat:tok-wx`),
 再把 `LARARIUM_PUSH_CHANNEL=wechat`,主动推送才落到微信而不是 cli。
 
+微信里**以 `/` 开头的消息走命令端点**(`/pending` `/approve <id>` …),和 CLI 同一套分派;
+别的当普通对话。ClawBot 没有按钮,审批就是打一行命令。
+
 注:`LARARIUM_TOKENS` 是控制端(全权:消息/出件箱/命令/健康),`LARARIUM_INGEST_TOKENS`
 是数据面(只准入站;命令端点是门控开关,数据面不许碰)。冒烟(真实 API)见 REVIEW M2-6。
 

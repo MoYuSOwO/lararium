@@ -8393,3 +8393,68 @@ ruff ✓ / format 76 ✓ / mypy 34 ✓ / lint-imports 4 kept 0 broken / 405 pass
 这是**验证方法本身出错**,而且导致**反向结论**。与上一轮那条「判红要看 returncode」
 同族:**判定读错了,不是测试没咬住**。两条已并入 `CONVENTIONS.md` 的 T6,作为第六种假绿
 ——前五种是"测试没咬住",第六种是"你把结果看反了",危害更大。
+
+---
+
+## M5-4:审批走同一套分派 —— 待验收
+
+### 一、先说一处与任务书不符的事实:**这条通道上没有按钮**
+
+任务书写的是「`/pending` `/approve` 走 IM 按钮回调」。查了官方 MIT 源码:
+
+```
+MessageItemType = { NONE:0, TEXT:1, IMAGE:2, VOICE:3, FILE:4, VIDEO:5,
+                    TOOL_CALL_START:11, TOOL_CALL_RESULT:12 }
+全库 grep:button / card / inline_keyboard / callback_data / quick_reply —— 零命中
+官方自己处理斜杠命令:src/messaging/slash-commands.ts → `trimmed.startsWith("/")`
+```
+
+**iLink 没有按钮、卡片、任何交互元素。** 所以"审批卡"在微信里的正确形态是:
+用户**打一行 `/approve <id>`**,适配器把它转给 `/v1/commands`。官方自己也是这么做的。
+
+这不改变你那条硬约束的实质——**分派仍然只有一套**(服务端的 `handle_command`),
+适配器只做路由,一个动词都不认。
+
+### 二、那条硬约束,做成了可执行的断言
+
+```python
+verbs = re.findall(r'verb == "(/[a-z]+)"', commands.py)   # 动词表**动态取**,不抄死
+assert len(verbs) >= 8                                     # 取不到就是空转
+assert 没有一个 verb 出现在 wechat.py 的**代码**里(注释除外)
+```
+
+`test_the_adapter_knows_no_command_verbs`。动态取动词表的好处:**新增命令时这条自动跟上**,
+不会因为"新命令没进白名单"而漏掉。变异「适配器自己认 `/approve`」被它咬住。
+
+### 三、路由的两条判断
+
+- **以 `/` 开头 → `/v1/commands`**,结果**直接回**给用户(命令端点同步返回,没有信封,
+  不走出件箱)。
+- **先 strip 再判**。R2-1 那条教训的另一半:手机输入法很容易带前导空格,
+  ` /approve abc` 要是被当成普通消息喂给模型,**用户会以为"批准了",而账本纹丝不动**。
+  CLI 有 `input().strip()` 兜着,这里没有。
+- **命令失败不打崩收信泵**:回一句人话。打崩的后果是"用户打错一个命令,助手从此不再
+  收消息",而他不会知道为什么。
+- **`/quit` 不许让适配器退出**:它在 CLI 里是"关掉我这个窗口",微信里没有窗口可关,
+  真退了就是助手下线,而用户只是手滑。服务端的 `/quit` 本来就是零副作用的(M2-5)。
+
+审批走代码路径这件事,顺带把门控的理由又落实了一次:**模型手上没有批准工具,那是故意的**
+(memory 的 SKILL.md 写着)——把 `/approve` 当普通消息喂给模型,等于把批准权交回给它。
+
+### 四、变异 5 条,5 条被咬住
+
+斜杠命令也走 `/v1/messages` / 判定不先 strip / 命令结果不回给用户 /
+命令失败往上抛 / 适配器自己认 `/approve`。
+
+**按上一轮的教训,这次逐条 grep 了我写进去的那几行确认没有残留**(各 1 处),
+不是看它旁边;harness 也是 v2(还原放 `finally`、逐条超时、判红看 returncode、
+断言变异已落地)。
+
+### 五、这一步没做的
+
+`/pending` 的输出目前是纯文本列表(服务端 `handle_command` 给什么就是什么)。
+微信里没有按钮,所以**没有"卡片"可做**;要更好用只能改 `handle_command` 的措辞
+(那是服务端的事,而且 CLI 会跟着变)。**没有在适配器里重排版**——那就是第二份分派的
+另一种形态。
+
+**门禁**:412 passed + 5 skipped,mypy 34 files,4 kept 0 broken,ruff/format 全绿。

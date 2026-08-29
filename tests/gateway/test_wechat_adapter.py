@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import json
 import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -461,3 +462,123 @@ async def test_a_qrcode_stuck_in_an_unknown_state_is_eventually_replaced(tmp_pat
 
     assert ilink.qr_issued == 3, "卡在未知状态时没有换码"
     assert a.ilink_token == "tok-new"
+
+
+# ── M5-4:审批走同一套分派 ───────────────────────────────────────────────
+#
+# **任务书写的是「IM 按钮回调」,但这条通道上没有按钮。** 官方 types.ts 的
+# MessageItemType 只有 NONE/TEXT/IMAGE/VOICE/FILE/VIDEO/TOOL_CALL_*,全库 grep 不到
+# button/card/inline_keyboard/callback_data;官方自己处理斜杠命令也是
+# `trimmed.startsWith("/")`。所以正确形态是:**以 / 开头的消息走 /v1/commands**,
+# 别的走 /v1/messages。分派仍然只有一套(服务端的 handle_command),没写第二份。
+
+
+def routed(tmp_path, text, *, response=None, status=200):
+    """把一条消息投进适配器,返回它发出去的所有 HTTP 请求。"""
+    seen: list[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(status, json=response if response is not None else {"text": "ok"})
+
+    ilink = FakeILink(batches=[([InboundMessage(1, "u1@im.wechat", text, "ctx-1")], "c2")])
+    a = adapter(tmp_path, ilink, handler, context_token="ctx-1", peer="u1@im.wechat")
+    return a, ilink, seen
+
+
+async def test_a_slash_command_goes_to_the_commands_endpoint(tmp_path):
+    """`/pending` 走 `/v1/commands`,不是 `/v1/messages`——不进模型,是代码路径。
+
+    审批必须走代码路径,这是门控的全部意义:**模型手上没有批准工具,这是故意的**
+    (memory 的 SKILL.md 写着)。要是把 `/approve` 当普通消息喂给模型,
+    等于把批准权交回给它。
+    """
+    a, _ilink, seen = routed(tmp_path, "/pending", response={"text": "有 1 条待审"})
+
+    await a.pump_inbound_once()
+
+    assert [r.url.path for r in seen] == ["/v1/commands"]
+    assert json.loads(seen[0].content) == {"line": "/pending"}
+    assert seen[0].headers["authorization"] == "Bearer tok-wechat"
+
+
+async def test_the_command_result_is_sent_straight_back(tmp_path):
+    """命令结果**直接回**给用户,不经出件箱——命令端点是同步返回的,没有信封。"""
+    a, ilink, _seen = routed(tmp_path, "/pending", response={"text": "有 1 条待审:abc123"})
+
+    await a.pump_inbound_once()
+
+    assert ilink.sent == [("u1@im.wechat", "有 1 条待审:abc123", "ctx-1")]
+
+
+async def test_ordinary_messages_still_go_to_the_model(tmp_path):
+    """不以 / 开头的还是走 `/v1/messages`。"""
+    a, _ilink, seen = routed(tmp_path, "打车 28", response={"envelope_id": "e1"})
+
+    await a.pump_inbound_once()
+
+    assert [r.url.path for r in seen] == ["/v1/messages"]
+
+
+async def test_leading_whitespace_still_counts_as_a_command(tmp_path):
+    """手机输入法很容易带前导空格。判定要在 **strip 之后**做。
+
+    R2-1 那条教训的另一半:CLI 有 `input().strip()` 兜着,这里没有——
+    ` /approve abc` 被当成普通消息喂给模型,用户会以为"批准了",而账本纹丝不动。
+    """
+    a, _ilink, seen = routed(tmp_path, "  /approve abc123  ", response={"text": "已批准"})
+
+    await a.pump_inbound_once()
+
+    assert [r.url.path for r in seen] == ["/v1/commands"]
+    assert json.loads(seen[0].content) == {"line": "/approve abc123"}
+
+
+async def test_a_failing_command_answers_in_plain_words(tmp_path):
+    """命令端点报错时回一句人话,**不打崩收信泵**。
+
+    打崩的后果是:用户打错一个命令,助手从此不再收消息——而他不会知道为什么。
+    """
+    a, ilink, _seen = routed(tmp_path, "/rollback 不存在", status=500)
+
+    await a.pump_inbound_once()
+
+    assert len(ilink.sent) == 1
+    assert "没执行成功" in ilink.sent[0][1]
+
+
+async def test_quit_does_not_kill_the_adapter(tmp_path):
+    """`/quit` 不许让适配器退出。
+
+    它在 CLI 里是"关掉我这个窗口",在微信里没有窗口可关——真退了就是助手下线,
+    而用户只是手滑。服务端的 `/quit` 本来就是零副作用的(M2-5)。
+    """
+    a, ilink, _seen = routed(tmp_path, "/quit", response={"text": "已退出客户端。"})
+
+    await a.pump_inbound_once()  # 不抛、不退出就算过
+
+    assert len(ilink.sent) == 1
+
+
+def test_the_adapter_knows_no_command_verbs():
+    """★ **不许写第二份分派。**
+
+    适配器只判"是不是以 / 开头",**具体动词一个都不许认**——认了就是第二份分派,
+    而两份实现必然漂移,而这条路上放的是**账本的批准权**。
+
+    动词表从 `commands.py` 动态取,不抄死:新增命令时这条自动跟上。
+    """
+    import re
+
+    verbs = set(
+        re.findall(
+            r'verb == "(/[a-z]+)"',
+            Path("src/lararium/gateway/commands.py").read_text(encoding="utf-8"),
+        )
+    )
+    assert len(verbs) >= 8, f"动词表没取到,这条测试是空转的:{verbs}"
+
+    source = Path("src/lararium/gateway/wechat.py").read_text(encoding="utf-8")
+    code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+    leaked = sorted(v for v in verbs if f'"{v}"' in code or f"'{v}'" in code)
+    assert not leaked, f"适配器自己认起了命令动词 {leaked}——那就是第二份分派"
