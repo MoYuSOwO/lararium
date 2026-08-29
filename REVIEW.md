@@ -7968,3 +7968,120 @@ dict)——"这个目录加载不了"是关于**那个目录**的事实,不是�
 - **顺带销掉 M7-2 的一半**:权重本地化之后,镜像直接 COPY 那三个文件,不用 VPS 首启拉 HF。
 
 **门禁**:373 passed + 5 skipped,mypy 32 files,4 kept 0 broken,ruff/format 全绿。
+
+---
+
+## M4-9:embedding 权重 fp16 + 本地 mmap 加载
+
+### 验收结论:**通过**(2026-08-29);一条补完 M4 收口
+
+**实跑复核**:
+
+```
+ruff ✓ / format 72 ✓ / mypy 32 ✓ / lint-imports 4 kept 0 broken / 373 passed + 5 skipped
+参照表确实在 float32 原始权重上量(脚本 64-65 行,转 fp16 之前)——不是自己跟自己比
+权重移走后:5 条红 1 条绿(退化那条),不是静默跳过
+```
+
+**三处做得比要求好**:
+
+- `test_loading_never_touches_the_network` 把 `StaticModel.from_pretrained` 换成炸弹,
+  而不是断言"没有 HTTP 请求"——**只要加载路径还会走到那个入口就红**,比数网络包难糊弄。
+- `test_the_matrix_is_fp16_and_memory_mapped` 断言 `isinstance(matrix, np.memmap)` 而非只断
+  dtype。理由成立:只断 dtype 挡不住"读进来再 astype",而那样峰值一点没降(1199 vs 955)。
+  **这条抓的正是本方案最容易被做歪的地方。**
+- **归因更正**:任务书写「慢 50%,因为 numpy fp16 没硬件加速」——他量出"慢 5%"觉得不对,
+  发现是一直编码同一句话、页早热了;换一千句不同内容重测才看出真分布:**页热后慢 8%
+  (那才是算术),首次触达多 ~60 µs(几乎全是缺页)**。复核方那个 50% 是拿七句话反复跑
+  得出的,同一个毛病。方向对、归因错,他改对了。
+
+「丢掉 L2 归一化」那条假绿也查得对:config 虽 `normalize:true`,但 fp16 舍入让模长是
+0.9994 而非 1.0,相似度回归对 0.06% 的模长误差不敏感;补一条直接钉 `|norm-1| < 1e-9`
+才红。**vec0 靠 `cos ≈ 1 - d²/2` 反推余弦,前提就是模长为 1**,该单独钉。
+
+缓存分键的 bug 是自己撞出来的,且是真的:权重路径改成运行时解析后,按进程分键意味着
+**谁先触发加载谁那一刻的 env 说了算,一次失败让整个进程此后再无语义检索,且无报错指向原因**。
+
+#### 必补:新克隆跑不了门禁
+
+权重在 `data/embedding/`,而 `data/` 被 gitignore。**任何人克隆下来第一次 `pytest`**:
+
+```
+5 failed, 1 passed        报错是 `assert None is not None`
+```
+
+不说少了什么,也不说该跑哪个脚本。
+
+「跳过的门禁等于没有」这句对,但反面同样成立:**一个因为与你的改动无关的原因常红的门禁,
+人会学会绕过它。** 而这个仓库刚开源——来改一个 typo 的人得先下 489 MB 权重才能看到绿色。
+
+修法:**skipif + 明确理由**,同 `live` 的形状:
+
+```python
+pytestmark = pytest.mark.skipif(
+    not (em.weights_dir() / "embedding.npy").exists(),
+    reason="需要本地 embedding 权重:uv run python scripts/build_embedding_weights.py",
+)
+```
+
+`test_missing_weights_degrade_instead_of_crashing` **不要加 skip**——它测的正是"权重不在
+时怎么办",没权重时才有意义,现在也确实是唯一绿的那条。
+
+(更漂亮的做法:把参照句用到的那几千行权重切一小片 committed,质量回归就能永远真跑。
+但要多一套机器,现在不值得;先 skipif,以后嫌不够再说。)
+
+#### 复核方自己的一次假绿(记账)
+
+第一次验"无权重会怎样"时,用 `LARARIUM_EMBEDDING_DIR` 指向空目录跑,6 条全绿,
+差点得出"测试不依赖权重"的结论。实际是 **conftest 的 autouse fixture 会清掉所有
+`LARARIUM_*`**,覆盖没生效——**第二种假绿:变异没落地**。改成真把 `data/embedding`
+移走才看到 5 红。T6 那张表又添一个真实实例。
+
+### M4-9 补:新克隆要能跑通门禁
+
+改完两种情况都干净:
+
+```
+有权重(开发机)   373 passed,  5 skipped,0 failed
+无权重(新克隆)   368 passed, 10 skipped,0 failed
+```
+
+跳过时给的是可执行的下一步,不是一句"缺依赖":
+
+```
+SKIPPED tests/steward/test_embeddings.py:39: 需要本地 embedding 权重:
+        uv run python scripts/build_embedding_weights.py
+```
+
+**你估的是 5 条,实际是 7 条。** 我先把权重整个挪走跑了一遍全量,才发现
+`test_tools.py` 那两条也在里面——`test_recall_multiline_untrusted_hit_cannot_forge_extra_list_items`
+和 `test_recall_untrusted_hit_cannot_close_the_fence_early`。
+
+**这两条我没加 skip,改成不依赖权重。** 它们测的是**渲染**(P1-2 折行 / P1-3 中和围栏),
+向量本来就是假的(`_fake_embed_memo`),只差一个 `embedding_available` 没 stub,
+于是白白去加载真权重。stub 掉之后它们在两种情况下都跑——
+**安全回归尤其不该因为外部资源缺席而不跑**,那正是最不该出现"这条没跑"的地方。
+现成的先例就在同一个文件里(`test_recall_returns_hint_when_vec_unavailable` 早就这么 stub)。
+
+`test_embeddings.py` 里要真权重的五条按条挂 `@needs_weights`,**不用模块级
+`pytestmark`**:`test_missing_weights_degrade_instead_of_crashing` 测的正是"权重不在时
+怎么办",没权重时它才有意义,不能跟着一起跳——你点到的这条,逐条挂才做得到。
+
+理由写进注释了,用的是你的话:一个因为跟你的改动无关的原因常红的门禁,人会学会绕过它;
+而这个仓库是开源的,来改一个 typo 的人不该先下 489 MB 才能看到绿色。
+
+#### 你那笔假绿,补一句方法上的教训
+
+你拿 `LARARIUM_EMBEDDING_DIR` 指空目录去验"无权重会怎样",6 条全绿,差点得出"测试根本
+不依赖权重"——实际是 conftest 的 autouse fixture 把所有 `LARARIUM_*` 清掉了,覆盖没生效。
+第二种假绿(变异没落地)的又一个实例,而且**形态值得单记**:
+
+> 这次"没落地"不是锚点没命中,是**被测系统主动把你的输入抹掉了**。
+> 环境变量、全局配置、模块级缓存这些"进程级旋钮"最容易这样——测试装置里往往正有一层
+> 专门在清理它们。**用环境变量做变异,先确认它真的到达了被测代码。**
+
+我这次是把 `data/embedding` 整个 `mv` 走的——绕过所有旋钮,直接动事实。
+两种做法的差别就是 6 绿和 7 红。
+
+**门禁**:373 passed + 5 skipped(开发机)/ 368 passed + 10 skipped(新克隆),
+mypy 32 files,4 kept 0 broken,ruff/format 全绿。

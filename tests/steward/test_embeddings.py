@@ -18,6 +18,16 @@ from lararium.steward import embeddings as em
 
 REFERENCE = Path("tests/embedding_reference.json")
 
+# 权重不进仓库(489 MB,`data/` 已 ignore),所以要真权重的测试得能跳过。
+# **和 live 那套一个形状**,理由也是一样的:一个因为跟你的改动无关的原因常红的门禁,
+# 人会学会绕过它——而这个仓库是开源的,来改一个 typo 的人不该先下 489 MB 才能看到绿色。
+# 逐条挂而不是模块级 `pytestmark`:下面那条"权重不在时怎么办"**正是没权重时才有意义**,
+# 它不能跟着一起跳。
+needs_weights = pytest.mark.skipif(
+    not (em.weights_dir() / "embedding.npy").exists(),
+    reason="需要本地 embedding 权重:uv run python scripts/build_embedding_weights.py",
+)
+
 
 @pytest.fixture(autouse=True)
 def _reset_module_state(monkeypatch):
@@ -26,6 +36,7 @@ def _reset_module_state(monkeypatch):
     monkeypatch.setattr(em, "_errors", {})
 
 
+@needs_weights
 def test_loading_never_touches_the_network(monkeypatch):
     """★ 加载只读本地文件,**一次网络都不碰**。
 
@@ -43,6 +54,7 @@ def test_loading_never_touches_the_network(monkeypatch):
     assert em.embed("今天天气不错") is not None
 
 
+@needs_weights
 def test_the_matrix_is_fp16_and_memory_mapped():
     """矩阵是 fp16,**而且不是全量读进内存**。
 
@@ -56,6 +68,7 @@ def test_the_matrix_is_fp16_and_memory_mapped():
     assert isinstance(matrix, np.memmap), f"矩阵被全量读进内存了:{type(matrix)}"
 
 
+@needs_weights
 def test_fp16_reproduces_the_float32_similarities():
     """质量回归:fp16 与 float32 的相似度差 < 0.01。
 
@@ -94,6 +107,7 @@ def test_missing_weights_degrade_instead_of_crashing(monkeypatch, tmp_path):
         em._load()
 
 
+@needs_weights
 def test_a_failure_for_one_directory_does_not_poison_another(monkeypatch, tmp_path):
     """★ 一个目录加载失败,**不许**把别的目录也判死。
 
@@ -112,6 +126,7 @@ def test_a_failure_for_one_directory_does_not_poison_another(monkeypatch, tmp_pa
     assert em.embedding_available() is True, "换回好目录之后还在拿上一次的失败当结论"
 
 
+@needs_weights
 def test_embed_returns_exactly_unit_vectors():
     """`embed()` 的契约是 **L2 归一化**,而且要精确到 1.0。
 

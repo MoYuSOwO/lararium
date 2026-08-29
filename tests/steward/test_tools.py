@@ -217,11 +217,18 @@ def _fake_embed_memo() -> dict:
 
 
 def test_recall_multiline_untrusted_hit_cannot_forge_extra_list_items(tools, monkeypatch):
-    """M3-4:语义路沿用词法路那条老规矩——不可信正文换行折掉,不能凭换行伪造列表项。"""
+    """M3-4:语义路沿用词法路那条老规矩——不可信正文换行折掉,不能凭换行伪造列表项。
+
+    向量全是假的(`_fake_embed_memo`),`embedding_available` 也 stub 掉:这条测的是
+    **渲染**,不是 embedding。不 stub 的话它会去加载真权重,而权重不进仓库——新克隆
+    第一次跑门禁就红,红的还是一条注入防线。**安全回归尤其不能因为外部资源缺席而不跑。**
+    """
+    import lararium.steward.embeddings as em
     import lararium.steward.journal as jmod
 
     memo = _fake_embed_memo()
     monkeypatch.setattr(jmod, "embed", lambda t: memo.get(t))
+    monkeypatch.setattr(em, "embedding_available", lambda: True)
     tools.journal.append(
         "env-attack",
         "envelope",
@@ -239,11 +246,16 @@ def test_recall_multiline_untrusted_hit_cannot_forge_extra_list_items(tools, mon
 
 
 def test_recall_untrusted_hit_cannot_close_the_fence_early(tools, monkeypatch):
-    """M3-4:语义路正文里的 >>> 必须被中和,不能提前闭合围栏(P1-3)。"""
+    """M3-4:语义路正文里的 >>> 必须被中和,不能提前闭合围栏(P1-3)。
+
+    同上:向量与可用性都是假的,这条只测渲染,不依赖真权重。
+    """
+    import lararium.steward.embeddings as em
     import lararium.steward.journal as jmod
 
     memo = _fake_embed_memo()
     monkeypatch.setattr(jmod, "embed", lambda t: memo.get(t))
+    monkeypatch.setattr(em, "embedding_available", lambda: True)
     tools.journal.append(
         "env-attack",
         "envelope",
