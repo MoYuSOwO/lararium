@@ -9008,3 +9008,56 @@ ftyp 不看 brand / 送不进去的格式静默丢掉 / 不判可送性 / SENDAB
 就永远修不了。
 
 **门禁**:486 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。
+
+### 判定(复核方):**M5-5 通过**
+
+两个方向都验了,嗅探不再说谎,送不出去的图不再无声消失:
+
+```
+样本          _sniff                    落盘    到达轮   到达轮的话 / look_at_image
+真 JPEG      image/jpeg                .jpg    1 张    —              / 交出字节
+真 PNG       image/png                 .png    1 张    —              / 交出字节
+真 WebP      image/webp                .webp   1 张    —              / 交出字节
+真 BMP       image/bmp                 .bmp    1 张    —              / 交出字节
+WAV 伪装      application/octet-stream  .bin    0 张    「格式我认不出来(看着像一份文件)」× 2 处
+AVI 伪装      application/octet-stream  .bin    0 张    同上
+HEIC 原图     image/heic                .heic   0 张    「是 image/heic,当前模型读不了这个格式」× 2 处
+HEIF mif1    image/heif                .heif   0 张    同上
+MP4 视频      video/mp4                 .mp4    0 张    —              / 「是一段视频,不是图片」
+语音 silk     audio/silk                .silk   0 张    —              / 「是一段语音,不是图片」
+只有 3 字节    application/octet-stream  .bin    0 张    —              / 「格式我认不出来」(不崩)
+```
+
+`RIFF` 不再被当成 WebP,`ftypisom` 不被当成 HEIC(brand 一起判是对的),真 WebP 照常认。
+语音/视频**不出现在到达轮的话里**也是对的——它们没打算进模型,提它反而是噪声;
+而 `kind == "image"` 却送不进去的那些必须有话,现在有了。
+
+真模型复验(mimo-v2.5,VISION=on),两种都给得出可操作的下一步、没有 400、没有静默:
+
+```
+HEIC   → 「这张图是 HEIC 格式,我这边读不了……你可以截个屏或者转成 JPG/PNG 再发给我」
+WAV 伪装 → 「系统存下来了但格式识别不出来,看着像是一份文件……能转成图片或者把关键内容打给我吗」
+```
+
+门禁我自己跑了:**486 passed + 7 skipped**,mypy 35 files,4 kept 0 broken。
+
+**两处比我要的更对**
+
+1. **「认得出 ≠ 送得进」是你自己发现的。** 我说的是"把 BMP 和 HEIC 补进魔数表"——
+   照我说的做,HEIC 会认出来然后送出去,再挨一个 400,**我要的修法会把打回的洞原样
+   造回来**。你实测出服务商不收 HEIC,把"认得出"和"送得进"拆成两件事、但只留
+   一个出处(`SENDABLE_IMAGE_TYPES` + `cannot_send()`,两个出口问同一个函数)。
+   这一步我给的指令是错的,你没照抄。
+2. **你删掉了自己上一轮写的那条断言 `notes == ()` 的测试。** 那条测试把这次打回的
+   静默行为**当规格钉住了**——T6 里"把坏行为钉成规格"那一类,而且是在自己的代码里
+   找出来的。测试绿着不等于测的是对的东西,这条比修复本身更难。
+
+**结论**:M5-5 三条约束成立,注入面的强度被如实分级(说服 / 机制),两个出口一条规则,
+四支降级都有话。**通过。** 往 CHANGELOG 追一行。
+
+**带走的(不阻塞,记在这里免得丢)**
+
+- `look_at_image` 允许模型反复重看同一张图,没堵(上一轮已自行登记)。要堵得先有
+  "本会话见过的名单",那份名单要从起居注扫。
+- 语音不转码、图片不按分辨率压缩——吃 token 目前只靠张数上限管。
+- `SENDABLE_IMAGE_TYPES` 是按**当前服务商**实测定的。换端点要重测,这一行就是那个开关。
