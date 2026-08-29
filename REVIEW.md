@@ -8867,3 +8867,68 @@ def media_type_of_suffix(suffix: str) -> str | None:
 上咬住就是这次打回的原样复发。逐条 grep 改动的那 6 行确认无残留(各 1 处)。
 
 **门禁**:476 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。
+
+### 判定(复核方):**再打回一次。规则修对了,它信的那个东西没修**
+
+打回的那条**确实修好了**,我复核过两个出口:
+
+```
+真 JPEG          look_at_image 交出字节 image/jpeg     到达轮 1 张图
+语音 silk        「是一段语音,不是图片,我看不了」      到达轮 0 张
+PDF(kind=file)  「是一份文件,不是图片,我看不了」      到达轮 0 张
+PDF 伪装成图片    「是一份文件,不是图片,我看不了」      到达轮 0 张   ← kind 判不出来,media_type 判得出来
+```
+
+门禁我自己跑了:476 passed + 7 skipped,4 kept 0 broken,数字对得上。
+
+**判据从 kind 换成 media_type 这一步比我要的更对。** 我只说"只认图片后缀",你看出了
+`kind=IMAGE` 但字节嗅不出时会落成 `application/octet-stream` ——按 kind 判,伪装成
+图片的 PDF 在**到达轮**那条路上照样进模型,而那条路我根本没打回。反查表由正查表算出来
+也是正解:手抄一份反过来的表,确实是 `_KIND_WORDS` 那条教训的另一种形态。
+回绝措辞里去掉省略号那条(模型盯着 `…` 认定"id 被截断了",转头让用户重发)是实测出来的,
+这种只有真跑才知道的细节值钱。
+
+**但这条规则现在整个压在 `_sniff` 上,而 `_sniff` 会说谎——两个方向都说。**
+
+`wechat.py:_MAGIC` 里 WebP 的魔数写的是 `b"RIFF"`。RIFF 不是 WebP,是一个**容器族**:
+WAV、AVI 全都以 RIFF 开头,WebP 是 `RIFF....WEBP`(第 8 字节起才是 `WEBP`)。
+
+```
+WAV 音频   RIFF….WAVE  → _sniff = image/webp → 落盘 .webp → is_image=True → 当图片送进模型
+AVI 视频   RIFF….AVI   → _sniff = image/webp → 落盘 .webp → is_image=True → 当图片送进模型
+```
+
+**打回的那个洞从另一扇门原样走回来了。** 守卫改对了,可它信的 `media_type` 是一个
+会把非图片认成图片的函数算出来的。你换用 media_type 的理由是"嗅不出时会落成
+octet-stream"——你假设了 `_sniff` 认不出就沉默,而它在 RIFF 这一支上是**过度声称**。
+
+反方向同时也漏:
+
+```
+BMP    BM…      → octet-stream → is_image=False → 到达轮 0 张图,**且 0 条提示**
+HEIC   ftypheic → octet-stream → is_image=False → 到达轮 0 张图,**且 0 条提示**
+```
+
+BMP 就写在服务商自己那句报错里(`only bmp/gif/png/jpeg/webp are supported`),
+HEIC 是 iPhone 发原图的默认格式。这两种进来,L0 那行照样写着 `(图片 · media/…)`,
+而模型什么都没收到、也没被告知少收了东西——它只能对着一行引用编,或者答"我看不见图"。
+
+**这一条比第一条更值得说:补做把一次响亮的失败换成了一次静默的失败。** 修之前 BMP/HEIC
+会被送出去、400、用户收到「处理失败,已放弃」——难看,但看得见。修之后它一声不响地
+消失了。而"静默截断读起来和'就这些'一模一样"这句话,就写在 `load_images` 自己的
+docstring 里,并且已经为张数上限那一支实现了——同一个函数,同一条规则,少了一支。
+
+**要补的**
+
+1. `_MAGIC` 不许过度声称。WebP 要连 `RIFF????WEBP` 一起认(偏移 8 起 4 字节),
+   别让 WAV/AVI 顶着 `image/webp` 走出去。顺带把 BMP(`BM`)和 HEIC/HEIF
+   (偏移 4 起 `ftyp`)补上——前者服务商明确支持,后者是 iPhone 原图的默认格式。
+2. `load_images` 里,`kind == "image"` 却 `is_image == False` 的附件必须**留一条话**
+   (「这张图的格式我认不出来,只存下来了」)。这一支的规则和张数上限那一支是同一条,
+   而那一支已经写对了。
+3. 测试要能同时咬住两个方向:**非图片被认成图片**(WAV → image/webp)和
+   **图片被认成非图片且静默**(BMP/HEIC)。只测一半,漏的就是另一半。
+
+**不用改的**
+
+`is_image` 按 media_type 判是对的,别退回 kind。要修的是 `_sniff` 的诚实度,不是判据。
