@@ -85,7 +85,7 @@
 需要 [uv](https://docs.astral.sh/uv/)。
 
 ```bash
-git clone <repo> && cd lararium
+git clone https://github.com/MoYuSOwO/lararium.git && cd lararium
 uv sync
 cp .env.example .env      # 填模型 API key(任意 OpenAI 兼容端点)
 

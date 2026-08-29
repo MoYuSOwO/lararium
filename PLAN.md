@@ -5597,6 +5597,51 @@ CPU 上没有硬件加速(算时先转 float32),mmap 再叠一点缺页开销。
 
 - **M5-2 用户主渠道路由**:推送渠道已在 **M4-7** 做掉(`LARARIUM_PUSH_CHANNEL`);
   本步只剩**数据面那一轮的回复**——收掉第四轮审计那条(数据面回复投回来源渠道 = 没人能读)。
+### ★ 有官方实现,而且是 MIT —— 照着它写,别再逆向
+
+`@tencent-weixin/openclaw-weixin` **v2.4.6,MIT,腾讯官方 npm scope**,带完整 TypeScript
+源码(`npm pack` 就能拿到)。SiverKing 那份 Python 是它的移植——`CHANNEL_VERSION="2.4.6"`、
+`ILINK_APP_CLIENT_VERSION=(2<<16)|(4<<8)|6` 版本号都对得上。
+
+**这解决了许可证问题**:官方包是 MIT,可以读、可以照着写、可以带署名引用其思路;
+那三个无许可证的社区仓库(SiverKing / x1ah / hao-ji-xing)**仍然不许抄代码**。
+
+M5-3 的正确做法:**读官方 TS 源码,用 Python 重新实现**。要读的文件:
+
+```
+src/api/api.ts            请求封装、头部
+src/api/session-guard.ts  -14 的官方语义与处置
+src/auth/login-qr.ts      扫码登录
+src/messaging/inbound.ts  收信、context_token 存取
+src/messaging/send.ts     发信
+src/storage/sync-buf.ts   getupdates 游标
+src/cdn/aes-ecb.ts        媒体加解密(M5 之后再说)
+```
+
+**一个官方实现里的坑,别照抄**:`session-guard.ts` 把 `-14` 当"token 过期",处置是
+**把该账号所有 API 调用暂停一小时**。但实测 **缺 HTTP 头时服务端返回的也是 `-14`**
+——补上头,同一个 token 立刻好使。这个错误码是**过载的**,照官方逻辑一个头写错就白停一小时。
+判 `-14` 之前先确认头发全了。
+
+### 主动推送:可以,官方支持,大概率不需要第二条通道
+
+社区博客普遍说 ClawBot「只能被动回复、24 小时窗口」。**三条证据都指向相反方向**:
+
+1. **实测**(2026-08-30):用 21 分钟前那条消息的 `context_token` 主动发,用户确认收到;
+2. **官方实现里 `context_token` 没有任何过期逻辑**——`setContextToken` 内存 + 落盘,
+   收到新消息就覆盖,否则一直留着(`src/messaging/inbound.ts`);
+3. **官方注释明写支持定时投递**:「infer the sending bot account from the recipient
+   address when accountId is not explicitly provided (**e.g. cron delivery**)」。
+
+官方 README 通篇没有"窗口""限频""只能回复"这类字样。
+
+**结论(待窗口探针确认)**:早报与提醒**走同一条微信通道**即可,**企业微信不做**——
+用户嫌两个入口不优雅,这个直觉是对的。适配器只要:每收到一条消息就刷新存着的
+`context_token`,推送失败留在出件箱等下次开口(M4-7 已做好)。
+
+窗口探针:`~/Code/ilink-probe/`,按 +1/6/12/20/25/30 小时各发一条,结果记
+`window_log.jsonl`。**若 +25h 那条仍送达,「24 小时窗口」之说即证伪,企业微信正式砍掉。**
+
 ### iLink 协议实测记录(2026-08-30,真机跑通收发闭环)
 
 **这一节是 M5-3 的规格,照着写,别再摸一遍。** 收发已验证:扫码 → 拿 token →
