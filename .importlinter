@@ -32,10 +32,12 @@ modules =
     bundles.finance
 
 [importlinter:contract:cli-is-pure-client]
-name = CLI 是纯 HTTP 客户端,不得 import bundles/steward(M2-6 客户端化后与 IM 适配器同级)
+name = 前端一律是纯 HTTP 客户端,不得 import bundles/steward(CLI 与 IM 适配器同级)
 type = forbidden
 source_modules =
     lararium.gateway.cli
+    lararium.gateway.ilink
+    lararium.gateway.wechat
 forbidden_modules =
     bundles
     lararium.steward

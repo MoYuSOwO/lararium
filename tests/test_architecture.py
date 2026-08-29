@@ -64,6 +64,13 @@ def test_only_the_ledger_module_writes_files() -> None:
         # "杀掉重开 after 用上次 seq → 不丢不重"。这是**客户端自己的状态文件**,
         # 不在服务端 data_dir、也不碰账本;cli.py 是纯 HTTP 客户端,拿不到 ledger。
         Path("src/lararium/gateway/cli.py"),
+        # 微信适配器(M5-3)要持久化自己的会话状态:收信游标 get_updates_buf、
+        # 出件箱位置 after、以及 bot_token 与 context_token。理由和 cli.py 一样,
+        # 而且更硬——游标不存会重收或漏收,after 不存会在重启后**重发**(用户收到
+        # 两遍同一句回复,比没收到还糟)。同样是**客户端自己的状态文件**:
+        # wechat.py 是纯 HTTP 客户端,`.importlinter` 钉着它 import 不到 steward/bundles,
+        # 结构上就够不着账本。
+        Path("src/lararium/gateway/wechat.py"),
     }
     offenders: list[str] = []
 

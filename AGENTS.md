@@ -86,6 +86,16 @@ export LARARIUM_SERVER_URL=http://127.0.0.1:8420 LARARIUM_CLIENT_TOKEN=tok-dev
 uv run python -m lararium.gateway.cli
 ```
 
+终端 C(可选)——微信适配器(M5-3,独立进程;第一次跑会打一条扫码链接):
+
+```bash
+export LARARIUM_SERVER_URL=http://127.0.0.1:8420 LARARIUM_CLIENT_TOKEN=tok-wx
+uv run python -m lararium.gateway.wechat
+```
+
+服务端那边要给它一个**渠道叫 wechat** 的控制端 token(`LARARIUM_TOKENS=wechat:tok-wx`),
+再把 `LARARIUM_PUSH_CHANNEL=wechat`,主动推送才落到微信而不是 cli。
+
 注:`LARARIUM_TOKENS` 是控制端(全权:消息/出件箱/命令/健康),`LARARIUM_INGEST_TOKENS`
 是数据面(只准入站;命令端点是门控开关,数据面不许碰)。冒烟(真实 API)见 REVIEW M2-6。
 

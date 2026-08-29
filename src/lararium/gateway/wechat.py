@@ -1,0 +1,259 @@
+"""微信适配器:上面接 iLink,下面调 Lararium 的 HTTP 接口。
+
+**和 `cli.py` 一个位置,只是换了个说话的对象**——纯客户端,只 import httpx 与协议那一层,
+不许 import steward/bundles(`.importlinter` 有契约钉着)。
+
+**独立进程,别塞进服务进程里。** 两条理由:iLink 会掉线要重连,而重启一次不该把 542 MB
+的 embedding 跟着重载一遍;微信那边抽风也不该让 Steward 跟着死。
+
+## 两个泵,不是一问一答
+
+`cli.py` 是"发一条 → 长轮询等这条的回复"。这里不行:M4-7 的主动推送(早报、待审提醒)
+不对应任何一条用户消息,一问一答的形状接不住它。所以拆成两个独立的泵:
+
+    收:iLink getupdates ──→ POST /v1/messages
+    发:GET /v1/outbox   ──→ iLink sendmessage
+
+发的那个泵不关心消息从哪来,回复也好推送也好一律照发——M4-7 把推送做成了一轮完整的
+对话,出件箱里它和普通回复长得一样,这里就不用分两条路。
+
+## 三样状态必须落盘
+
+`get_updates_buf`(收信游标)不存会重收或漏收;`outbox_after` 不存会在重启后**重发**
+——用户收到两遍同一句回复,比没收到还糟;`context_token` 是**主动推送的凭据**
+(官方实现里它没有过期逻辑,收到新消息就覆盖),丢了它早报就发不出去。
+
+单用户助手,所以只记**最后一个**说话的人(`peer`)。多用户是另一个设计,不在这里假装支持。
+"""
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import ClassVar
+
+import httpx
+
+from lararium.gateway.ilink import Credentials, ILinkClient, ILinkError, InboundMessage
+
+logger = logging.getLogger("lararium.wechat")
+
+DEFAULT_SERVER_URL = "http://127.0.0.1:8420"
+DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
+# 出件箱长轮询的等待秒数。和 cli.py 一个量级:短到掉线能快点发现,长到不至于空转刷屏。
+_OUTBOX_WAIT = 5
+
+
+@dataclass
+class State:
+    """落盘的适配器状态。字段少而关键,见模块 docstring。"""
+
+    path: Path
+    bot_token: str = ""
+    base_url: str = DEFAULT_BASE_URL
+    cursor: str = ""
+    context_token: str = ""
+    peer: str = ""
+    outbox_after: int = 0
+
+    # 会落盘的字段。ClassVar 而不是 dataclass 字段——它是这个类的规格,不是某个实例的数据。
+    PERSISTED: ClassVar[tuple[str, ...]] = (
+        "bot_token",
+        "base_url",
+        "cursor",
+        "context_token",
+        "peer",
+        "outbox_after",
+    )
+
+    @classmethod
+    def load(cls, path: Path) -> "State":
+        """读不出来就从零开始,**不打崩启动**。
+
+        最坏后果是重收一批消息(至少还能用);而崩在启动上的后果是助手整个不在了
+        ——用户什么都收不到,也不知道为什么。
+        """
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return cls(path=path)
+        if not isinstance(data, dict):
+            return cls(path=path)
+        known = {k: v for k, v in data.items() if k in cls.PERSISTED}
+        return cls(path=path, **known)
+
+    def save(self) -> None:
+        """先写临时文件再 rename:**半截的状态文件比没有更坏**——它能被 json 解析,
+        内容却是残缺的,而下一次启动会拿它当真。"""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {name: getattr(self, name) for name in self.PERSISTED}
+        temp = self.path.with_suffix(".json.tmp")
+        temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temp.replace(self.path)
+
+
+class WeChatAdapter:
+    """一个泵收、一个泵发。两边都做成"跑一次"的方法,好测也好在外面编排。"""
+
+    def __init__(
+        self,
+        *,
+        ilink: ILinkClient,
+        lararium: httpx.AsyncClient,
+        token: str,
+        state: State,
+    ) -> None:
+        self.ilink = ilink
+        self.lararium = lararium
+        self.token = token
+        self.state = state
+
+    @property
+    def ilink_token(self) -> str | None:
+        return self.ilink.token
+
+    # ── 收 ──────────────────────────────────────────────────────────────
+
+    async def pump_inbound_once(self) -> None:
+        """长轮询收一批,逐条投进 Lararium。空返回是常态,不当异常也不刷屏。"""
+        try:
+            messages, cursor = await self.ilink.get_updates(self.state.cursor)
+        except ILinkError as exc:
+            if not exc.stale_token:
+                raise  # 不是 -14 的错照样往上抛——吞掉等于把 bug 埋进日志(E1)
+            # -14:头由 ilink._headers() 一处构造、每次全带(报文级测试钉着),
+            # 所以它只剩"token 真的失效"一种解释 → 重连。**不停机**:官方那个
+            # 一小时暂停是照着"-14 = token 过期"写的,而这个错误码是过载的,
+            # 一个头写错就白停一小时,还完全查不出原因。
+            await self.relogin()
+            return
+
+        for message in messages:
+            self._remember(message)
+            await self._deliver_to_lararium(message.text)
+        if cursor != self.state.cursor:
+            self.state.cursor = cursor
+            self.state.save()
+
+    def _remember(self, message: InboundMessage) -> None:
+        """每收到一条就刷新回信凭据并落盘——它同时是主动推送要用的那一份。"""
+        self.state.context_token = message.context_token or self.state.context_token
+        self.state.peer = message.from_user_id or self.state.peer
+        self.state.save()
+
+    async def _deliver_to_lararium(self, content: str) -> None:
+        response = await self.lararium.post(
+            "/v1/messages",
+            json={"content": content},
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        response.raise_for_status()
+
+    # ── 发 ──────────────────────────────────────────────────────────────
+
+    async def pump_outbox_once(self) -> None:
+        """把出件箱里属于本渠道的条目发到微信,发一条推一条游标。
+
+        **发不出去就不推游标**:没有 `peer`/`context_token` 时(还没人跟它说过话),
+        条目留在出件箱里等用户开口——M4-7 说过失效形态该是"消息在等你",不是"发不出去就丢"。
+        """
+        response = await self.lararium.get(
+            f"/v1/outbox?after={self.state.outbox_after}&wait={_OUTBOX_WAIT}",
+            headers={"Authorization": f"Bearer {self.token}"},
+        )
+        response.raise_for_status()
+        for item in response.json().get("items", []):
+            if not (self.state.peer and self.state.context_token):
+                logger.warning("还没有可回信的会话,出件箱 seq=%s 留着等用户开口", item.get("seq"))
+                return
+            await self.ilink.send_text(
+                to_user_id=self.state.peer,
+                text=str(item.get("content", "")),
+                context_token=self.state.context_token,
+            )
+            self.state.outbox_after = int(item.get("seq", self.state.outbox_after))
+            self.state.save()
+
+    # ── 重连 ────────────────────────────────────────────────────────────
+
+    async def relogin(self) -> None:
+        """重新扫码。**把新二维码当消息发给用户**,否则每天都得 SSH 上服务器扫一次。"""
+        qrcode, image_url = await self.ilink.request_qrcode()
+        await self._announce_qrcode(image_url)
+        while True:
+            credentials = await self.ilink.poll_qrcode_status(qrcode)
+            if credentials is not None:
+                self._adopt(credentials)
+                return
+
+    async def _announce_qrcode(self, image_url: str) -> None:
+        """尽力而为:旧凭据要是已经彻底失效,这条发不出去——那就只能落日志。
+        **发不出去不许打断重连本身**,否则一次投递失败就把唯一的恢复路径也堵死了。"""
+        # 措辞要中立:这条在**首次登录**和**会话到期重连**两种情形下都会打。
+        # 冒烟时它把首次登录记成了"会话失效",第一次用的人会以为出了故障。
+        logger.warning("需要扫码连上微信:%s", image_url)
+        if not (self.state.peer and self.state.context_token):
+            return
+        try:
+            await self.ilink.send_text(
+                to_user_id=self.state.peer,
+                text=f"微信会话到期了,扫这个重新连上:{image_url}",
+                context_token=self.state.context_token,
+            )
+        except (ILinkError, httpx.HTTPError) as exc:
+            logger.warning("新二维码没发出去(%s),请到日志里取链接", exc)
+
+    def _adopt(self, credentials: Credentials) -> None:
+        self.ilink.token = credentials.bot_token
+        self.ilink.base_url = credentials.base_url.rstrip("/")
+        self.state.bot_token = credentials.bot_token
+        self.state.base_url = self.ilink.base_url
+        self.state.save()
+        logger.info("iLink 重连完成,bot_id=%s", credentials.bot_id)
+
+    # ── 编排 ────────────────────────────────────────────────────────────
+
+    async def run(self) -> None:
+        """两个泵各跑各的。一个挂了不该拖死另一个——收不到消息至少还能把推送发出去,
+        反过来也一样。"""
+
+        async def pump(once, label: str) -> None:
+            while True:
+                try:
+                    await once()
+                except Exception as exc:
+                    logger.warning("%s 出错(继续跑):%s: %s", label, type(exc).__name__, exc)
+                    await asyncio.sleep(3)
+
+        await asyncio.gather(
+            pump(self.pump_inbound_once, "收信"), pump(self.pump_outbox_once, "发信")
+        )
+
+
+async def main() -> None:
+    """入口。凭据没存过就先扫码;之后一直跑两个泵。"""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    data_dir = Path(os.environ.get("LARARIUM_DATA_DIR", "./data"))
+    token = os.environ.get("LARARIUM_CLIENT_TOKEN", "")
+    if not token:
+        raise SystemExit("LARARIUM_CLIENT_TOKEN 未设置(要一个渠道为 wechat 的控制端 token)")
+
+    state = State.load(data_dir / "wechat" / "state.json")
+    adapter = WeChatAdapter(
+        ilink=ILinkClient(base_url=state.base_url, token=state.bot_token or None),
+        lararium=httpx.AsyncClient(
+            base_url=os.environ.get("LARARIUM_SERVER_URL", DEFAULT_SERVER_URL).rstrip("/"),
+            timeout=httpx.Timeout(70.0, connect=5.0),
+        ),
+        token=token,
+        state=state,
+    )
+    if not state.bot_token:
+        await adapter.relogin()
+    await adapter.run()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
