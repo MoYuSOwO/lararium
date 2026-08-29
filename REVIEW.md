@@ -8085,3 +8085,64 @@ SKIPPED tests/steward/test_embeddings.py:39: 需要本地 embedding 权重:
 
 **门禁**:373 passed + 5 skipped(开发机)/ 368 passed + 10 skipped(新克隆),
 mypy 32 files,4 kept 0 broken,ruff/format 全绿。
+
+### 验收结论:**通过**(2026-08-30);**M4 正式收口**(tag m4 → b5e3aec)
+
+**实跑复核**:
+
+```
+有权重   373 passed /  5 skipped / 0 failed
+无权重   368 passed / 10 skipped / 0 failed     ← 新克隆的情形,复核方把 data/embedding 整个挪走验的
+跳过理由 "需要本地 embedding 权重:uv run python scripts/build_embedding_weights.py"
+ruff ✓ / format 72 ✓ / mypy 32 ✓ / lint-imports 4 kept 0 broken / tag m4 → b5e3aec
+```
+
+**两处判断比复核方给的方案好。**
+
+**一、复核方说 5 条,实际 7 条。** 复核方当时只跑 `test_embeddings.py` 得出 5;程序员把
+`data/embedding` 整个挪走跑**全量**,才看到 `test_tools.py` 里还有两条。这正是上一轮记下的
+那条教训(拿环境变量覆盖没生效)的正确做法——**动真的,别动开关**。
+
+**二、那两条没跟着加 skip,而是改成不依赖权重。** 这个区分是关键:
+
+```
+test_recall_multiline_untrusted_hit_cannot_forge_extra_list_items   ← P1-2 折行
+test_recall_untrusted_hit_cannot_close_the_fence_early              ← P1-3 中和围栏
+```
+
+**它们是注入防线的回归测试,向量本来就是假的**(`_fake_embed_memo`),只差一个
+`embedding_available` 没 stub,于是白白去加载真权重。stub 掉之后两种情况都跑。
+
+docstring 里那句话是对的:**「安全回归尤其不能因为外部资源缺席而不跑」**。若图省事跟着
+加 skip,结果就是**新克隆的人跑门禁时两条注入防线是灰的**——而那正是最不该在别人机器上
+失效的东西。
+
+按条挂 `@needs_weights` 而非模块级 `pytestmark`、把
+`test_missing_weights_degrade_instead_of_crashing` 留在外面,也对。
+
+---
+
+# M4 收口
+
+M4-1 到 M4-9,交付的是**第一个领域 bundle**(财务·对话侧):扔目录即发现、注册代码零改动;
+四条 import 契约全程 KEPT;工具铁律真机成立;账本与流水的边界不但守住,而且**是被理解的**
+(真机第 5 轮它主动说「房租 3800 我只是记成了固定安排,还没作为流水记账」)。
+
+**但 M4 最值钱的产出不是 finance,是它照出的五条主控缺陷**——全都是"只有一个 bundle 时
+永远不会暴露"的:
+
+| | 症状 |
+|---|---|
+| L0 裁掉工具事件 | 记账依从率 33%,而且它在教模型"说了就算数" |
+| 重试重复执行副作用 | 一次 503 能在账本里留下永久重复 |
+| 失败轮不落起居注 | A6 说的"可重建"是假的 |
+| 主动推送不留痕 | 推完模型自己不记得说过 |
+| 前缀变更无留痕 | 缓存从 90% 掉到 0,没有任何地方说得清为什么 |
+
+memory 的工具没有真副作用,所以前四条在 M1–M3 一次都没露头。
+**第一个真领域模块的价值,一半在它自己,一半在它照出来的东西。**
+
+方法上攒下的东西进了 `CONVENTIONS.md` 的 T6(五种假绿),**每一种都真实发生过一次**
+才写进去,不是想出来的。
+
+**结转 M5 的账**见 M4-6 收口那一节的清单;渠道选型与 iLink 协议实测记录见 `PLAN.md` 的 M5 节。

@@ -5597,6 +5597,74 @@ CPU 上没有硬件加速(算时先转 float32),mmap 再叠一点缺页开销。
 
 - **M5-2 用户主渠道路由**:推送渠道已在 **M4-7** 做掉(`LARARIUM_PUSH_CHANNEL`);
   本步只剩**数据面那一轮的回复**——收掉第四轮审计那条(数据面回复投回来源渠道 = 没人能读)。
+### iLink 协议实测记录(2026-08-30,真机跑通收发闭环)
+
+**这一节是 M5-3 的规格,照着写,别再摸一遍。** 收发已验证:扫码 → 拿 token →
+收到「你好哇」→ 回一条,微信里收到。
+
+**六个必带的头。少一个就报 `{"errcode":-14,"errmsg":"session timeout"}`——而这个错误
+信息是骗人的**(参考实现里那个字段甚至叫 `is_stale_token`,作者也这么理解)。复核时为它
+换过五种请求形态、怀疑过 token 过期、怀疑过"会话要靠持续轮询维持"、还写了脚本去验那个
+假设,全错。真实原因就是少了两个头:
+
+```
+Content-Type: application/json
+AuthorizationType: ilink_bot_token
+X-WECHAT-UIN: <base64(str(随机 32 位整数))>
+iLink-App-Id: bot
+iLink-App-ClientVersion: 132102          # (2<<16)|(4<<8)|6
+Authorization: Bearer <bot_token>
+```
+
+**登录(不需要任何认证)**:
+
+```
+GET  /ilink/bot/get_bot_qrcode?bot_type=3
+  → {"qrcode":"<t>", "qrcode_img_content":"https://liteapp.weixin.qq.com/q/…", "ret":0}
+GET  /ilink/bot/get_qrcode_status?qrcode=<t>          长轮询,没动静就空返回
+  → {"ret":0,"status":"confirmed","bot_token":"(58字符)","ilink_bot_id":"(19)",
+     "ilink_user_id":"(38)","baseurl":"https://ilinkai.weixin.qq.com"}
+```
+
+**凭据是平铺的,不是官方文档说的嵌在 `data` 里。文档与实际不符,以实测为准。**
+
+**收信**:
+
+```
+POST /ilink/bot/getupdates   body {"get_updates_buf": "<游标>"}     首次传 ""
+  → {"msgs":[…], "get_updates_buf":"<新游标>", "longpolling_timeout_ms": N}
+```
+
+**游标必须持久化**——不存就会重收或漏收。消息形状:
+
+```json
+{"seq":3, "message_id":…, "from_user_id":"…@im.wechat", "to_user_id":"…@im.bot",
+ "message_type":1, "context_token":"AARzJWAF…",
+ "item_list":[{"type":1,"text_item":{"text":"你好哇"}}]}
+```
+
+**回信**(`context_token` 从对应那条消息里取,决定路由到哪个会话):
+
+```
+POST /ilink/bot/sendmessage
+  body {"msg":{"from_user_id":"", "to_user_id":<对方 from_user_id>,
+               "client_id":<自造唯一串>, "message_type":2, "message_state":2,
+               "context_token":<那条消息的>,
+               "item_list":[{"type":1,"text_item":{"text":"…"}}]}}
+  → {"message_id": …}
+```
+
+**其他**:`POST /ilink/bot/getconfig` body `{"ilink_user_id":…}` → `{"ret":0,"typing_ticket":…}`,
+`sendtyping` 要这个 ticket。两个端点的错误信封还不一样(`ret`/`err_msg` vs `errcode`/`errmsg`),
+判错要两种都认。
+
+**会话 24 小时到期,到点要重连,而重连意味着重新扫码。** 参考实现的做法值得抄(思路,
+不是代码):**把新二维码当消息发给用户**——否则每天都得 SSH 上服务器扫一次。
+
+**许可证**:三个社区实现(SiverKing / x1ah / hao-ji-xing)**都没有许可证 = 保留所有权利**,
+代码不许抄进本仓库(本项目 MIT)。上面这些是端点、字段名、流程——**是事实不是表达**,
+照着独立实现是干净的。读它们理解协议正当,复制代码不正当。
+
 - **M5-3 IM 适配器**:与 CLI 同级的纯客户端(只 import httpx + 平台 SDK,`.importlinter`
   加一条禁入契约)。长轮询/长连接从内网连出去。
 - **M5-4 审批卡**:`/pending` `/approve` 走 IM 按钮回调 → `POST /v1/commands`。
