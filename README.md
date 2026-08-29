@@ -88,7 +88,13 @@
 git clone <repo> && cd lararium
 uv sync
 cp .env.example .env      # 填模型 API key(任意 OpenAI 兼容端点)
+
+# 语义检索的权重转一次(一次性,之后不再联网;不转也能跑,只是没有语义检索)
+uv run python scripts/build_embedding_weights.py
 ```
+
+> 权重转成 fp16 + mmap 加载,是为了能跑在 2C2G 的小机器上:加载峰值从 1772 MB 降到
+> 972 MB。质量代价实测为零(相似度漂移 0.00006,而判定阈值的决策余量是 0.09)。
 
 两个进程:常驻服务 + 客户端。
 

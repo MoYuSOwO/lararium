@@ -45,6 +45,13 @@ uv run pytest tests/steward/test_inbox.py -v
 uv sync && uv run pre-commit install
 ```
 
+语义检索的权重要转一次(一次性,离线;不转的话 `recall_similar` 一直回"暂不可用",
+词法检索照常):
+
+```bash
+uv run python scripts/build_embedding_weights.py
+```
+
 跑起来(M2 起是双进程:常驻服务 + 普通客户端,都需要先照 `.env.example` 配好 `.env`):
 
 终端 A——起服务(worker 在同一进程,lifespan 里起 task):

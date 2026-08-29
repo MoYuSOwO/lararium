@@ -77,6 +77,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "src/lararium/gateway/cli.py" = ["T201"]   # CLI 就是靠 print 说话
 "tests/**" = ["S", "T201"]                  # 测试里安全规则噪声大
+"scripts/**" = ["T201"]                     # 一次性运维脚本,print 就是它的输出界面
 
 # ─────────────────────────── mypy ───────────────────────────
 # 分层严格:自己拥有的契约严格,给别人的库做适配的地方宽松。
