@@ -65,12 +65,29 @@ _QR_LIFETIME = 180.0
 _POLL_FLOOR = 1.0
 
 # 落盘时按字节的**魔数**认类型,不信对方给的文件名——文件名是外部输入,而这里的
-# 结果会变成磁盘上的后缀。认不出来就 octet-stream,不去猜。
-_MAGIC: tuple[tuple[bytes, str], ...] = (
-    (b"\xff\xd8\xff", "image/jpeg"),
-    (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"GIF8", "image/gif"),
-    (b"RIFF", "image/webp"),
+# 结果会变成磁盘上的后缀,而后缀会一路决定 `Attachment.is_image`。
+#
+# **两个方向都要诚实,而两个方向都出过事:**
+#
+# - 过度声称:第一版 WebP 只认 `RIFF`。RIFF 不是 WebP,是**容器族**——WAV、AVI 全以它
+#   开头。一段 WAV 会顶着 `image/webp` 落盘成 `.webp`、`is_image` 为真、被当图片送进
+#   模型。"非图片不许当图片送"那个洞就从这扇门原样走回来了:守卫改对了没用,
+#   它信的类型是这个函数算出来的。所以 WebP 要连偏移 8 起的 `WEBP` 一起认。
+# - 声称不足:漏掉 BMP(服务商自己那句报错里就写着支持)和 HEIC(iPhone 原图默认格式)
+#   的话,它们会掉进 octet-stream,然后**一声不响地**不进模型。
+#
+# 每一项是「若干个 (偏移, 字节) 全都对上」→ media_type。`ftyp` 在偏移 4 处对 MP4 和
+# HEIC 都成立,分野在偏移 8 的 brand——所以 brand 必须一起判,一个格式一行,不玩花的。
+_MAGIC: tuple[tuple[tuple[tuple[int, bytes], ...], str], ...] = (
+    (((0, b"\xff\xd8\xff"),), "image/jpeg"),
+    (((0, b"\x89PNG\r\n\x1a\n"),), "image/png"),
+    (((0, b"GIF8"),), "image/gif"),
+    (((0, b"RIFF"), (8, b"WEBP")), "image/webp"),
+    (((0, b"BM"),), "image/bmp"),
+    (((4, b"ftyp"), (8, b"heic")), "image/heic"),
+    (((4, b"ftyp"), (8, b"heix")), "image/heic"),
+    (((4, b"ftyp"), (8, b"mif1")), "image/heif"),
+    (((4, b"ftyp"), (8, b"msf1")), "image/heif"),
 )
 # 魔数认不出来时按种类兜底。语音是 SILK(官方要转码成 wav,那不是这一步的事)。
 _FALLBACK_MEDIA_TYPES: dict[str, str] = {
@@ -466,7 +483,7 @@ if __name__ == "__main__":
 
 def _sniff(data: bytes, kind: str) -> str:
     """按魔数认类型。**不信对方给的文件名**——它是外部输入,而结果会变成磁盘上的后缀。"""
-    for magic, media_type in _MAGIC:
-        if data.startswith(magic):
+    for signature, media_type in _MAGIC:
+        if all(data[at : at + len(magic)] == magic for at, magic in signature):
             return media_type
     return _FALLBACK_MEDIA_TYPES.get(kind, _DEFAULT_MEDIA_TYPE)

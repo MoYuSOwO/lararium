@@ -31,6 +31,17 @@ from lararium.envelope import Attachment
 # ——不封顶就是一条消息顶穿整个窗口,症状还是"上下文超长"这种完全指不到图片的报错。
 MAX_IMAGES_PER_TURN = 4
 
+# 愿意送进模型的图片类型。服务商实测只收这几种,报错原文:
+# `invalid image format, only bmp/gif/png/jpeg/webp are supported`。
+# **认得出 ≠ 送得进**:HEIC 是 iPhone 发原图的默认格式,`_sniff` 认得出它,
+# 但送过去就是一个 400、整轮当场死掉。认出来并**说一句**,比认不出来静默丢掉强,
+# 也比送出去挨一个 400 强。哪天换了能读 HEIC 的服务商,改这一行就够。
+SENDABLE_IMAGE_TYPES = frozenset(
+    {"image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp"}
+)
+# 嗅不出魔数时落的那个类型。它的意思是"我不知道这是什么",不是"这是二进制文件"。
+_UNKNOWN_MEDIA_TYPE = "application/octet-stream"
+
 
 @dataclass(frozen=True)
 class ImagePart:
@@ -75,6 +86,31 @@ def framing(count: int) -> str:
     )
 
 
+def cannot_send(media_type: str | None) -> str | None:
+    """能不能把这份东西当图片送进模型?不能就返回**说给人听的那句原因**,能就返回 None。
+
+    **一个函数管两个出口**(到达轮的 `load_images`、重看的 `look_at_image`)。
+    分两处各写一遍的那天,总有一边先漂——这一步已经栽过一次了(`look_at_image` 当初
+    一个种类判断都没有,一段语音和一份 PDF 都被贴上 image/jpeg 交了出去)。
+    """
+    if media_type is None or media_type == _UNKNOWN_MEDIA_TYPE:
+        return "格式我认不出来(看着像一份文件)"
+    if not media_type.startswith("image/"):
+        return f"是{not_image_word(media_type)},不是图片"
+    if media_type not in SENDABLE_IMAGE_TYPES:
+        return f"是 {media_type},当前模型读不了这个格式"
+    return None
+
+
+def not_image_word(media_type: str) -> str:
+    """回绝时说清楚它到底是什么——别只说"不是图片",用户得知道自己发的那份东西还在。"""
+    if media_type.startswith("audio/"):
+        return "一段语音"
+    if media_type.startswith("video/"):
+        return "一段视频"
+    return "一份文件"
+
+
 def _suffix(attachment: Attachment) -> str:
     return attachment.path.rsplit(".", 1)[1]
 
@@ -84,19 +120,36 @@ def load_images(
 ) -> tuple[tuple[ImagePart, ...], tuple[str, ...]]:
     """把这一轮信封里的图片取成字节,返回 (图片, 要说给模型听的话)。
 
-    三种降级都走"话",不走异常(E2)——**不许崩**是这一步的硬要求:
+    **每一种降级都要留下一句话**,一个都不许静默——不许崩只是下限,不许悄悄消失才是要求:
     - 视觉关着:图照样存着,进上下文的是一行说明;
+    - 送不进去的格式(嗅不出、或者模型读不了):说清楚是哪一张、为什么;
     - 原件不在:明说这次重放不完整,并点名是哪一张;
-    - 超出张数上限:说清楚少了几张(静默截断读起来和"就这些"一模一样)。
+    - 超出张数上限:说清楚少了几张。
+
+    最后三条是**同一条规则的四支**,而它曾经少了一支:补做只挡住了送不进去的格式,
+    却让它一声不响地消失——L0 里那行照样写着 `(图片 · media/…)`,模型什么都没收到、
+    也没被告知少收了东西,只能对着一行引用编。**把一次响亮的失败换成一次静默的失败
+    不是修复。** 静默截断读起来和"就这些"一模一样。
+
+    候选是「是图片」**或者**「微信说它是图片」:后者才让"说是图片、字节却不是"这种
+    落进有话可说的那一支;而一条真正的语音/文件不该在这里被提起(它没打算进模型)。
     """
-    images = [a for a in attachments if a.is_image]
-    if not images:
+    candidates = [a for a in attachments if a.is_image or a.kind == "image"]
+    if not candidates:
         return (), ()
     if not enabled:
-        return (), (f"(当前模型看不了图,这 {len(images)} 张只存下来了)",)
+        return (), (f"(当前模型看不了图,这 {len(candidates)} 张只存下来了)",)
+
+    notes: list[str] = []
+    images: list[Attachment] = []
+    for attachment in candidates:
+        reason = cannot_send(attachment.media_type)
+        if reason is None:
+            images.append(attachment)
+        else:
+            notes.append(f"(media/{attachment.short}… {reason},只存下来了)")
 
     parts: list[ImagePart] = []
-    notes: list[str] = []
     for attachment in images[:MAX_IMAGES_PER_TURN]:
         path = media_dir / f"{attachment.sha256}.{_suffix(attachment)}"
         try:

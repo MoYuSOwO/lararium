@@ -11,7 +11,7 @@ from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, neutralize_fence
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
-from lararium.steward.vision import ImagePart, ImageReturn, framing
+from lararium.steward.vision import ImagePart, ImageReturn, cannot_send, framing
 
 # 检索结果条数的硬上限。limit 是模型可控参数,不封顶的话:
 #   limit=10000 → 一次工具调用返回约 5.6 万 token,撑爆 L0 并逼出一次压缩
@@ -196,11 +196,12 @@ class BuiltinTools:
         # `invalid image format`:这一轮当场死掉,用户看到的是一句全是黑话的
         # 「处理失败,已放弃」。真模型自己就走进去了(发一份 PDF 问「最大的一笔是多少」)。
         media_type = media_type_of_suffix(matches[0].suffix)
-        if media_type is None or not media_type.startswith("image/"):
+        reason = cannot_send(media_type)
+        if reason is not None or media_type is None:
             # 措辞里**不带省略号**:实测模型会盯着那个 `…` 认定"图片 id 被截断了",
             # 转头让用户重发一次图,而真相是那份东西根本不是图。回绝要说清楚是什么,
             # 别给它一个更顺嘴的错误解释。
-            return f"media/{image_id[:12]} 是{_not_image_word(media_type)},不是图片,我看不了。"
+            return f"media/{image_id[:12]} {reason},我看不了。"
         data = matches[0].read_bytes()
         digest = matches[0].stem
         # **重看这条路同样要带框定**。少了它,"重看"就成了绕过防线的支路:
@@ -226,14 +227,3 @@ class BuiltinTools:
             self.recall_similar,
             self.look_at_image,
         ]
-
-
-def _not_image_word(media_type: str | None) -> str:
-    """回绝时说清楚它是什么,别只说"不是图片"——用户得知道自己发的那份东西还在。"""
-    if media_type is None:
-        return "一份文件"
-    if media_type.startswith("audio/"):
-        return "一段语音"
-    if media_type.startswith("video/"):
-        return "一段视频"
-    return "一份文件"

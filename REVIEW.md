@@ -8932,3 +8932,79 @@ docstring 里,并且已经为张数上限那一支实现了——同一个函数
 **不用改的**
 
 `is_image` 按 media_type 判是对的,别退回 kind。要修的是 `_sniff` 的诚实度,不是判据。
+
+
+## M5-5 补2:魔数不许说谎,送不出去的图不许无声消失 —— 待验收
+
+判定我全接。这条打回指出的是**同一个洞从另一扇门走回来**:上一轮我把守卫改对了,
+可守卫信的 `media_type` 是一个两个方向都说谎的函数算出来的。
+
+### 一、`_MAGIC` 过度声称:RIFF 不是 WebP,是容器族
+
+```python
+(((0, b"RIFF"), (8, b"WEBP")), "image/webp"),   # 要连偏移 8 起的 WEBP 一起认
+```
+
+原来只认 `RIFF`,而 WAV、AVI 全以它开头。一段 WAV 会顶着 `image/webp` 落盘成 `.webp`、
+`is_image` 为真、被当图片送进模型——**打回的那个洞原样复发**。
+
+顺带补上 BMP(`BM`)和 HEIC/HEIF(偏移 4 起 `ftyp` + 偏移 8 起 brand)。
+`ftyp` 在偏移 4 处对 MP4 和 HEIC **都**成立,分野在 brand——所以 brand 必须一起判,
+一个格式一行,不玩花的(变异「ftyp 不看 brand」把 MP4 变成了图片,被咬住)。
+
+魔数结构从 `startswith` 换成「若干个 (偏移, 字节) 全都对上」。
+
+### 二、后半条更值钱:**别把响亮的失败换成静默的失败**
+
+这句判断我完全接受,而且它指出的是我上一次修复的副作用,不是原来的洞:
+
+| | 修之前 | 上一次补做之后 | 现在 |
+|---|---|---|---|
+| BMP / HEIC 进来 | 送出去 → 400 → 「处理失败,已放弃」 | **一声不响地没了** | 留一条话 |
+
+难看但看得见,比无声无息强。而且——**"静默截断读起来和'就这些'一模一样"这句话就写在
+`load_images` 自己的 docstring 里**,张数上限那一支已经照着做了。同一个函数、同一条
+规则,我少写了一支。docstring 里现在把四支并列写出来了,免得下一支再漏。
+
+### 三、"认得出"和"送得进"是两件事
+
+HEIC 认得出,但服务商实测不收(报错原文 `only bmp/gif/png/jpeg/webp are supported`)。
+所以判据拆成两层,**但只有一个出处**:
+
+```python
+SENDABLE_IMAGE_TYPES = frozenset({"image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp"})
+
+def cannot_send(media_type) -> str | None:
+    """不能就返回**说给人听的那句原因**,能就返回 None。一个函数管两个出口。"""
+```
+
+`load_images` 和 `look_at_image` 问的是同一个函数——上一轮栽在"两个出口各写一套"上,
+这次一开始就只写一份。`is_image` 没动,判据仍按 media_type,没退回 kind。
+
+### 四、真机复验:两种都不再消失,也不再 400
+
+mimo-v2.5 / `VISION=on`,微信声称 IMAGE、字节另说:
+
+```
+HEIC(iPhone 原图) → 到达轮正文:(media/66a5eb54cd67… 是 image/heic,当前模型读不了这个格式,只存下来了)
+                     图片数 0,replied:「这张图是 HEIC 格式的,我目前读不了…你可以转成 JPG 或 PNG 再发给我」
+WAV 伪装成图片     → 落盘 .bin,正文:(media/94ef2d960a1d… 格式我认不出来(看着像一份文件),只存下来了)
+                     图片数 0,replied:「系统存下来了但读不出内容…你可以直接把关键信息打给我」
+```
+
+模型拿到人话就给得出可操作的下一步。**图一张都没送出去,一句话都没少说。**
+
+### 五、变异 10 条,10 条被咬住
+
+WebP 退回只认 RIFF / 偏移判定退化成 startswith / 漏掉 BMP / 漏掉 HEIC /
+ftyp 不看 brand / 送不进去的格式静默丢掉 / 不判可送性 / SENDABLE 放开 /
+候选只看 is_image / `look_at_image` 不走同一个判据。
+
+前五条钉的是"魔数别说谎",后五条钉的是"别静默"——**两个方向各有覆盖**,这正是上一轮
+只测了一半吃的亏。逐条 grep 改动的那 9 行确认无残留(各 1 处)。
+
+顺带删掉一条我自己写的测试:上一轮那条 `test_a_kind_image_attachment_...is_not_sent`
+断言的是 `notes == ()`——它把这次打回的静默行为**当成规格钉住了**。留着它,这条打回
+就永远修不了。
+
+**门禁**:486 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。

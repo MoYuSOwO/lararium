@@ -26,6 +26,12 @@ SUFFIXES: dict[str, str] = {
     "image/png": "png",
     "image/gif": "gif",
     "image/webp": "webp",
+    "image/bmp": "bmp",
+    # HEIC/HEIF 是 iPhone 发原图的默认格式。认得出**不等于**送得进模型
+    # ——能不能送由 `vision.SENDABLE_IMAGE_TYPES` 说了算(服务商实测不收)。
+    # 这里只管它落盘叫什么。
+    "image/heic": "heic",
+    "image/heif": "heif",
     "audio/silk": "silk",
     "video/mp4": "mp4",
 }

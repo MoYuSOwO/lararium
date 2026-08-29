@@ -111,16 +111,42 @@ def test_the_framing_points_at_the_pictures_and_not_at_the_text(count):
     assert "以上" not in line
 
 
-def test_a_kind_image_attachment_that_is_not_actually_an_image_is_not_sent(tmp_path):
-    """判据是 media_type,不是 kind(M5-5 补)。
+@pytest.mark.parametrize(
+    ("media_type", "hint"),
+    [
+        # 微信说这是图片,字节却嗅不出来(伪装的 PDF、没见过的格式)
+        ("application/octet-stream", "认不出"),
+        # 认得出、但这个模型收不了。HEIC 是 iPhone 发原图的默认格式,
+        # 而服务商那句报错自己写着 only bmp/gif/png/jpeg/webp。
+        ("image/heic", "读不了"),
+    ],
+)
+def test_an_image_that_cannot_be_sent_leaves_a_note_instead_of_vanishing(
+    tmp_path, media_type, hint
+):
+    """★ 补2 的后半条,而且它比前半条更值钱:**别把响亮的失败换成静默的失败。**
 
-    微信那头 type=IMAGE 的条目,字节嗅不出来时落的是 `application/octet-stream`
-    ——按 kind 判就会把一份 PDF 当图片送进模型,服务商回
-    `invalid image format`,而用户看到的是「这条消息处理失败,已放弃」。
+    修之前 BMP/HEIC 会被送出去、400、用户收到「处理失败,已放弃」——难看,但**看得见**。
+    补做之后它一声不响地消失了:L0 里那行照样写着 `(图片 · media/…)`,而模型什么都
+    没收到、也没被告知少收了东西——它只能对着一行引用编,或者答"我看不见图"。
+
+    "静默截断读起来和'就这些'一模一样"这句话就写在本函数的 docstring 里,而且张数上限
+    那一支已经照着做了。同一个函数,同一条规则,不许少一支。
     """
-    pdf = store(tmp_path, data=b"%PDF-1.7 not an image", media_type="application/octet-stream")
+    a = Attachment(kind="image", sha256="ab" * 32, media_type=media_type)
 
-    parts, notes = load_images(media_dir=tmp_path, attachments=[pdf], enabled=True)
+    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=True)
 
     assert parts == ()
+    assert notes and hint in notes[0], f"这张图无声无息地没了:{notes}"
+    assert a.short in notes[0], "得说清楚是哪一张"
+
+
+def test_a_sendable_image_type_still_goes_through(tmp_path):
+    """反向守卫:别为了挡住 HEIC 把 BMP 也挡了——它在服务商支持的清单里。"""
+    bmp = store(tmp_path, data=b"BM\x36\x00\x0c\x00", media_type="image/bmp")
+
+    parts, notes = load_images(media_dir=tmp_path, attachments=[bmp], enabled=True)
+
+    assert [p.media_type for p in parts] == ["image/bmp"]
     assert notes == ()

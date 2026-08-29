@@ -796,3 +796,50 @@ async def test_media_is_written_atomically(tmp_path, monkeypatch):
     assert not [p for p in (tmp_path / "media").iterdir() if p.suffix == ".tmp"]
     assert fsynced, "附件没 fsync:rename 是原子的,内容却可能还在页缓存里"
     assert [n for n in replaced if n.endswith(".jpg.tmp")], "附件不是经临时文件改名落位的"
+
+
+# ── M5-5 补2:魔数不许过度声称 ───────────────────────────────────────────
+
+RIFF_WAV = b"RIFF\x24\x08\x00\x00WAVEfmt "
+RIFF_AVI = b"RIFF\x24\x08\x00\x00AVI LIST"
+RIFF_WEBP = b"RIFF\x24\x08\x00\x00WEBPVP8 "
+BMP = b"BM\x36\x00\x0c\x00\x00\x00\x00\x00"
+HEIC = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"
+MP4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"
+
+
+@pytest.mark.parametrize(
+    ("blob", "expected"),
+    [
+        # ★ RIFF 不是 WebP,是**容器族**:WAV、AVI 全以它开头,WebP 是 RIFF????WEBP。
+        # 只认 RIFF 就是过度声称——一段 WAV 会顶着 image/webp 落盘成 .webp、
+        # `is_image` 为真、被当图片送进模型,而"非图片不许当图片送"那个洞就从这扇门
+        # 原样走回来了。守卫改对了没用,它信的类型是这个函数算出来的。
+        (RIFF_WAV, "application/octet-stream"),
+        (RIFF_AVI, "application/octet-stream"),
+        (RIFF_WEBP, "image/webp"),
+        # 反方向:认得出的图片不许被当成"认不出"。BMP 就写在服务商自己那句报错里,
+        # HEIC 是 iPhone 发原图的默认格式——漏掉它们是**静默**丢图。
+        (BMP, "image/bmp"),
+        (HEIC, "image/heic"),
+        # ftyp 不等于图片:MP4 和 HEIC 都在偏移 4 处是 ftyp,分野在后面那个 brand。
+        (MP4, "application/octet-stream"),
+        (b"\xff\xd8\xff\xe0 jpeg", "image/jpeg"),
+    ],
+)
+def test_the_magic_table_does_not_overclaim_or_underclaim(blob, expected):
+    """魔数表两个方向都要诚实:认不出别硬说,认得出别装不认识。"""
+    assert wechat._sniff(blob, "image") == expected
+
+
+async def test_a_wav_pretending_to_be_an_image_does_not_land_as_webp(tmp_path):
+    """走完整条落盘路再看一次——单测 `_sniff` 只证明分类函数,证不了它真被用上了。"""
+    ilink = FakeILinkWithCdn(
+        batches=[([InboundMessage(1, "u1@im.wechat", "", "ctx", media=(image(),))], "c1")],
+        blobs={"q1": RIFF_WAV},
+    )
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(202, json={"envelope_id": "e"}))
+
+    await a.pump_inbound_once()
+
+    assert [p.suffix for p in (tmp_path / "media").iterdir()] == [".bin"]
