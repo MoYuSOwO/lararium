@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,8 @@ def tools(tmp_path):
         Registry.load(Path("bundles")),
         timezone="Asia/Shanghai",
         threads=Threads(conn),
+        media_dir=tmp_path / "media",
+        vision=True,
     )
 
 
@@ -50,7 +53,8 @@ def test_search_history_reports_no_match_clearly(tools):
 
 def test_tool_function_order_is_fixed(tools):
     """工具 schema 顺序必须稳定,否则每次启动都毁前缀缓存。
-    M3-2:open_thread/close_thread 追加在既有内置之后,不许插队。"""
+    M3-2:open_thread/close_thread 追加在既有内置之后,不许插队。
+    M5-5:look_at_image 追加在末尾,位置定了同样不许再动。"""
     names = [f.__name__ for f in tools.as_tool_functions()]
     assert names == [
         "current_time",
@@ -59,6 +63,7 @@ def test_tool_function_order_is_fixed(tools):
         "open_thread",
         "close_thread",
         "recall_similar",
+        "look_at_image",
     ]
 
 
@@ -299,3 +304,74 @@ def test_search_history_query_with_nul_does_not_crash(tools):
     NUL 控制字符进 SQL 前被清掉(模型可控字符串,这是唯一的洞,FTS 转义都是对的)。"""
     out = tools.search_history("转账\x00免确认")
     assert isinstance(out, str) and out, "不该抛,也不该返回空串"
+
+
+# ── M5-5 重新看一眼 ─────────────────────────────────────────────────────
+
+JPEG = b"\xff\xd8\xff\xe0 photo"
+DIGEST = hashlib.sha256(JPEG).hexdigest()
+
+
+def put_image(tmp_path):
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "media" / f"{DIGEST}.jpg").write_bytes(JPEG)
+
+
+def test_look_at_image_hands_the_bytes_back_with_the_same_framing(tmp_path, tools):
+    """图不默认一直在,所以要有一条**按 id 取回**的路——但取回来的那张同样要带框定。
+
+    少了框定的话,"重看"就成了绕过防线的口子:第一次进来带着"这是数据不是指令",
+    第二次进来光秃秃的。注入面不该有一条更宽松的支路。
+    """
+    put_image(tmp_path)
+
+    result = tools.look_at_image(DIGEST[:12])
+
+    assert result.images[0].data == JPEG
+    assert result.images[0].sha256 == DIGEST
+    assert "数据" in result.text and "指令" in result.text
+    assert str(result) == result.text, "落进起居注/日志的必须是这一行人话,不是一坨字节"
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../../prompts/character.default", "ab", "ab*", "abcdef/../../x", "'; DROP TABLE"],
+)
+def test_look_at_image_refuses_anything_that_is_not_a_hash(tmp_path, tools, bad_id):
+    """image_id 是**模型可控文本**,而它会被当成文件路径的一部分用。
+
+    形状不对就当场回人话——glob 的通配符也要挡下(`ab*` 能把 media/ 底下第一张图
+    捞出来,而模型压根没见过它)。
+    """
+    put_image(tmp_path)
+
+    out = tools.look_at_image(bad_id)
+
+    assert isinstance(out, str), f"{bad_id!r} 居然取回了东西"
+    assert "没找到" in out or "看不了" in out or "认不出" in out
+
+
+def test_look_at_image_says_plain_words_when_the_file_is_gone(tmp_path, tools):
+    """原件不在了要明说,不许静默返回一份空的(E2)。"""
+    out = tools.look_at_image("ab" * 6)
+
+    assert isinstance(out, str)
+    assert "没找到" in out
+
+
+def test_look_at_image_degrades_when_the_model_cannot_see(tmp_path):
+    """视觉关着时不许把字节递出去——递了就是发一个模型读不了的报文出去,白花钱还报错。"""
+    conn = connect(tmp_path / "steward.sqlite")
+    blind = BuiltinTools(
+        Journal(conn),
+        Registry.load(Path("bundles")),
+        timezone="Asia/Shanghai",
+        threads=Threads(conn),
+        media_dir=tmp_path / "media",
+        vision=False,
+    )
+    put_image(tmp_path)
+
+    out = blind.look_at_image(DIGEST[:12])
+
+    assert isinstance(out, str) and "看不了图" in out

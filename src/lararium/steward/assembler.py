@@ -6,6 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from lararium.envelope import Envelope
+from lararium.steward.vision import ImagePart, framing
 
 _SYSTEM_TEMPLATE = """{persona}
 
@@ -210,6 +211,31 @@ def _stamp(ts: datetime, tz: ZoneInfo) -> str:
     return ts.astimezone(tz).isoformat(timespec="seconds")
 
 
+def journalable_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把消息列表收成能进起居注的形状:图片只留**引用 + 哈希 + 大小**,字节丢掉。
+
+    约束 3。不这么做的话一张两兆的图会:在起居注里存第二遍、顺着 SEARCHABLE_KINDS
+    进全文索引、每次 replay 被 json.loads 一遍——而它原本就在 `media/` 下、
+    按哈希不可变。哈希留着,重建就有据可依(A6);字节留着只是重复。
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        images = msg.get("images")
+        if not images:
+            out.append(msg)
+            continue
+        out.append(
+            {
+                **{k: v for k, v in msg.items() if k != "images"},
+                "images": [
+                    {"sha256": i.sha256, "media_type": i.media_type, "size": len(i.data)}
+                    for i in images
+                ],
+            }
+        )
+    return out
+
+
 def _render_envelope(envelope: Envelope, tz: ZoneInfo) -> str:
     # 必须用配置的时区,不能用裸 astimezone()——后者取的是操作系统本地时区。
     # VPS 默认基本都是 UTC,那样信封会显示 UTC 时间而 current_time 工具显示
@@ -247,6 +273,8 @@ def assemble(
     l0: list[Turn],
     envelope: Envelope,
     timezone: str,
+    images: tuple[ImagePart, ...] = (),
+    image_notes: tuple[str, ...] = (),
 ) -> AssembledContext:
     """纯函数。输入全部来自持久层 —— 这是可重放的前提(DESIGN §6.6)。
 
@@ -304,6 +332,18 @@ def assemble(
                     }
                 )
         messages.append({"role": "assistant", "content": turn.assistant})
-    messages.append({"role": "user", "content": _render_envelope(envelope, tz)})
+    # M5-5:图**只挂在到达的这一轮**。上面那个循环渲染历史轮,结构上够不着 images
+    # ——所以"历史轮不带图"不是靠记得,是靠这里只有一个挂载点(报文级测试钉着)。
+    current: dict[str, Any] = {"role": "user", "content": _render_envelope(envelope, tz)}
+    tail = [*image_notes]
+    if images:
+        # 框定语放在**正文和图之间**,和图在同一条 user 消息里:分成两条的话,
+        # 模型完全可能只把后一条当上下文。不可信轮的文本围栏已经在正文里闭合了,
+        # 这一句落在围栏之外——它框的是图,不是被围起来的那段文本。
+        tail.append(framing(len(images)))
+        current["images"] = list(images)
+    if tail:
+        current["content"] = current["content"] + "\n" + "\n".join(tail)
+    messages.append(current)
 
     return AssembledContext(system_prompt=system_prompt, messages=messages)

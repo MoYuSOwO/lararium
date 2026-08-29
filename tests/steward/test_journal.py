@@ -345,3 +345,27 @@ def test_budget_accounts_for_the_tool_exchanges(journal):
     }
 
     assert recent_turns_estimate(with_ex) > recent_turns_estimate(bare)
+
+
+def test_a_non_text_tool_result_is_not_queued_for_replay(journal):
+    """★ 返回值不是纯文本的工具**不进回放队列**(M5-5)。
+
+    `look_at_image` 返回的是图片;`str()` 出来是一行人话。照着它回放,等于在重试那一轮
+    把图**悄悄换成一句话**——而模型不会知道自己少看了一张,它只会照着残缺的东西作答。
+    这类工具是纯读、无副作用,重试时真跑一遍才是对的。
+
+    老记录没有这个字段,默认按可回放算——它们当初本来就都是文本。
+    """
+    journal.append("env-1", "envelope", {"content": "看看那张图"})
+    journal.append("env-1", "tool_executed", {"tool": "search_history", "result": "找到 2 条"})
+    journal.append(
+        "env-1",
+        "tool_executed",
+        {"tool": "look_at_image", "result": "(重新附上 media/ab…)", "replayable": False},
+    )
+    journal.append("env-1", "tool_executed", {"tool": "current_time", "result": "老记录没这个字段"})
+
+    assert journal.last_attempt_tool_results("env-1") == [
+        ("search_history", "找到 2 条"),
+        ("current_time", "老记录没这个字段"),
+    ]

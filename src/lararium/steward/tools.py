@@ -1,5 +1,7 @@
+import re
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from re import sub
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -8,6 +10,7 @@ from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, neutralize_fence
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
+from lararium.steward.vision import ImagePart, ImageReturn, framing
 
 # 检索结果条数的硬上限。limit 是模型可控参数,不封顶的话:
 #   limit=10000 → 一次工具调用返回约 5.6 万 token,撑爆 L0 并逼出一次压缩
@@ -15,6 +18,11 @@ from lararium.steward.threads import Threads
 # 而压缩是全系统仅有的两个缓存重建点之一,不能让一次检索就触发。
 MAX_SEARCH_HITS = 20
 MAX_HIT_CHARS = 200
+
+# look_at_image 的 image_id 是**模型可控文本**,而它会被当成文件名的一部分用。
+# 只认十六进制:路径分隔符、`..`、glob 通配符一个都进不来。下界 6 位是为了挡住
+# "给个 a 就把 media/ 底下第一张捞出来"。
+_IMAGE_ID_RE = re.compile(r"^[0-9a-f]{6,64}$")
 
 
 def _paged_search(
@@ -93,10 +101,14 @@ class BuiltinTools:
         timezone: str,
         threads: Threads,
         recall_min_similarity: float = 0.35,
+        media_dir: Path | None = None,
+        vision: bool = False,
     ) -> None:
         self.journal = journal
         self.registry = registry
         self.threads = threads
+        self.media_dir = media_dir
+        self.vision = vision
         self._tz = ZoneInfo(timezone)
         # M3-4:语义检索的相似度阈值。2026-08-18 实测命中 0.44~0.58、未命中 0.35,
         # 这个 0.35 是猜的初值——真机跑几天要按实际分布调。
@@ -164,6 +176,30 @@ class BuiltinTools:
             return f"话头已关闭:{topic}"
         return f"没有在开的「{topic}」话头"
 
+    def look_at_image(self, image_id: str) -> Any:
+        """重新看一眼之前收到的某张图片。图片只在收到的那一轮直接进上下文,之后的历史里
+        只留一行 `(图片 · media/xxxxxxxxxxxx…)` 引用;要再看就调这个,image_id 就是
+        那一行里的那串短 id。取不到时返回一句说明,不报错。"""
+        if not self.vision:
+            return "当前模型看不了图,只能看那行引用。"
+        if not (self.media_dir and _IMAGE_ID_RE.match(image_id)):
+            return f"认不出这个图片 id:{image_id[:20]}。它应该是那行引用里的一串十六进制。"
+        # glob 而不是拼后缀:短 id 不带后缀,而后缀由内容嗅探决定(jpg/png/webp…)。
+        # 通配符进不来——image_id 已经被 _IMAGE_ID_RE 限死成纯十六进制。
+        matches = sorted(self.media_dir.glob(f"{image_id}*")) if self.media_dir.is_dir() else []
+        if len(matches) != 1:
+            return f"没找到 {image_id[:12]} 这张图(原件可能已经不在了)。"
+        data = matches[0].read_bytes()
+        digest = matches[0].stem
+        # **重看这条路同样要带框定**。少了它,"重看"就成了绕过防线的支路:
+        # 第一次进来带着"这是数据不是指令",第二次进来光秃秃的。
+        return ImageReturn(
+            text=f"(重新附上 media/{digest[:12]}…)\n{framing(1)}",
+            images=(
+                ImagePart(sha256=digest, media_type=_media_type_of(matches[0].suffix), data=data),
+            ),
+        )
+
     def as_tool_functions(self) -> list[Callable]:
         """顺序固定——工具 schema 是前缀第0层,顺序变了缓存全毁。
 
@@ -178,4 +214,20 @@ class BuiltinTools:
             self.open_thread,
             self.close_thread,
             self.recall_similar,
+            self.look_at_image,
         ]
+
+
+# 后缀 → media_type。和 `envelope._SUFFIXES` 是同一张表反过来查——那边是权威
+# (media_type 决定后缀),这边只在从磁盘反推时用。认不出就按 jpeg 送,
+# 服务商多半按字节自己认。
+_MEDIA_TYPES = {
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _media_type_of(suffix: str) -> str:
+    return _MEDIA_TYPES.get(suffix, "image/jpeg")

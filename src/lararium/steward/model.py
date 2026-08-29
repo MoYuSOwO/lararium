@@ -1,9 +1,11 @@
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from lararium.config import Settings
 from lararium.steward.assembler import AssembledContext
+from lararium.steward.vision import ImageReturn
 
 # 不同服务商对"缓存命中 token"的字段名不一样,按优先级探测。
 # pydantic-ai 的 RunUsage 顶层用 cache_read_tokens;DeepSeek/OpenAI 兼容层用
@@ -118,6 +120,34 @@ def format_cache_log(reply: ModelReply) -> str:
     )
 
 
+def _adapt(tool: Callable) -> Callable:
+    """把返回 `ImageReturn` 的工具转成库自己的 `ToolReturn`。
+
+    **转换必须在这里**:`tools.py` 不许 import pydantic-ai(D2——第三方语义只准出现在
+    这个隔离盒里),所以它返回的是中立形状。签名和 docstring 原样保留
+    (`functools.wraps`),否则工具 schema 变了 = 前缀第 0 层变了 = 缓存全毁。
+
+    `return_value` 只放**一行文本**:它是进起居注和 L0 的那一份,不能是一坨字节的 repr。
+    图片走 `content`,由库当成随后的一条 user 内容发出去——和到达轮的处理是同一种形状。
+    """
+
+    @functools.wraps(tool)
+    def adapted(*args: Any, **kwargs: Any) -> Any:
+        result = tool(*args, **kwargs)
+        if not isinstance(result, ImageReturn):
+            return result
+        from pydantic_ai import ToolReturn
+        from pydantic_ai.messages import BinaryContent
+
+        return ToolReturn(
+            return_value=result.text,
+            content=[BinaryContent(data=i.data, media_type=i.media_type) for i in result.images]
+            or None,
+        )
+
+    return adapted
+
+
 class PydanticAIClient:
     """真实模型客户端。库 API 若有变动,只改这一个类。"""
 
@@ -155,6 +185,7 @@ class PydanticAIClient:
     ) -> ModelReply:
         from pydantic_ai import Agent
         from pydantic_ai.messages import (
+            BinaryContent,
             ModelRequest,
             ModelResponse,
             SystemPromptPart,
@@ -170,7 +201,7 @@ class PydanticAIClient:
         # 首轮历史为空时也照此构造——只有一条路径,才不会有一条悄悄退化。
         # 等价写法是 Agent(instructions=...):它是 pydantic-ai 为"每轮重新应用、不进历史"
         # 这个语义加的参数,HTTP body 逐字节相同(实测)。哪天升级后本写法失效,那是退路。
-        agent = Agent(self._model, tools=tools, toolsets=mcp_servers)
+        agent = Agent(self._model, tools=[_adapt(t) for t in tools], toolsets=mcp_servers)
 
         # M4-5c v2:历史里的工具往返走**协议层原生形状**——assistant 带 tool_calls,
         # 每次调用配一条 tool 结果消息。组装器给的是与服务商无关的 dict 形态
@@ -210,8 +241,19 @@ class PydanticAIClient:
         else:
             history.insert(0, ModelRequest(parts=[prefix]))
 
+        # M5-5:图**只挂在最后一条**(组装器结构上只有那一个挂载点)。有图时当前轮
+        # 发的是 [正文, 图…] 的多模态形状;没图时逐字节还是原来那个字符串
+        # ——不许因为加了这条路,把所有不带图的轮次的报文也换个形状。
+        last = ctx.messages[-1]
+        prompt: Any = last["content"]
+        if last.get("images"):
+            prompt = [
+                last["content"],
+                *(BinaryContent(data=i.data, media_type=i.media_type) for i in last["images"]),
+            ]
+
         try:
-            result = await agent.run(ctx.messages[-1]["content"], message_history=history)
+            result = await agent.run(prompt, message_history=history)
         except Exception as exc:
             # 把 pydantic-ai 的异常在这里分类成自家类型——loop 只认 ModelCallError,
             # 不认第三方异常,这是隔离盒存在的理由(D2)。消息由 _error_message

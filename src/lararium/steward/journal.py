@@ -378,6 +378,11 @@ class Journal:
 
         为什么不用 `tool_result`:那是 `model.run` **成功返回之后**才记的,
         而这里要的恰好是"跑失败了、但工具已经执行掉"的那一批。
+
+        M5-5:`replayable=False` 的条目**不进队列**。返回值不是纯文本的工具
+        (`look_at_image` 带着图片字节)照着 `str()` 回放,等于把图悄悄换成一句话,
+        而模型不会知道自己少看了一张。老记录没有这个字段,默认按可回放算
+        ——它们当初本来就都是文本。
         """
         rows = self._conn.execute(
             "SELECT kind, payload FROM journal WHERE envelope_id=? ORDER BY seq", (envelope_id,)
@@ -391,6 +396,8 @@ class Journal:
             if r["kind"] != "tool_executed":
                 continue
             payload = json.loads(r["payload"])
+            if not payload.get("replayable", True):
+                continue
             out.append((str(payload.get("tool")), str(payload.get("result", ""))))
         return out
 

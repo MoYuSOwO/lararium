@@ -14,7 +14,13 @@ _LIVE_ENV = {k: v for k, v in os.environ.items() if k.startswith("LARARIUM_")}
 
 
 @pytest.fixture
-def live_steward(tmp_path, monkeypatch):
+def live_steward(live_steward_factory):
+    """默认配置下的真模型 Steward。要改配置(如 M5-5 的 LARARIUM_VISION)用工厂那个。"""
+    return live_steward_factory()
+
+
+@pytest.fixture
+def live_steward_factory(tmp_path, monkeypatch):
     """真 key、真模型,走**生产的组装根** `build_steward`,只把 data_dir 换到 tmp_path。
 
     没有 API key 就 skip——判定放在 fixture 里而不是模块级 mark,是因为本项目共享测试
@@ -22,22 +28,29 @@ def live_steward(tmp_path, monkeypatch):
     `__init__.py` 才成立,谁加一个就让整个收集失败(补2b Step 4 的教训)。
 
     `steward.ledger` / `steward.gate` 直接挂在实例上,验收账本与门控用它们即可。
+    `make(**overrides)` 里传的环境变量覆盖 .env 里的那份。
     """
-    if not _LIVE_ENV.get("LARARIUM_API_KEY"):
-        pytest.skip("真模型验收:需要 LARARIUM_API_KEY(先 set -a && source .env && set +a)")
 
-    from bundles.memory.server import build_memory_components
+    def make(**overrides: str) -> Any:
+        if not _LIVE_ENV.get("LARARIUM_API_KEY"):
+            pytest.skip("真模型验收:需要 LARARIUM_API_KEY(先 set -a && source .env && set +a)")
 
-    from lararium.config import Settings
-    from lararium.gateway.server import build_steward
+        from bundles.memory.server import build_memory_components
 
-    for key, value in _LIVE_ENV.items():
-        monkeypatch.setenv(key, value)
-    monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
+        from lararium.config import Settings
+        from lararium.gateway.server import build_steward
 
-    settings = Settings.load()
-    ledger, gate = build_memory_components(settings.data_dir)
-    return build_steward(settings, ledger, gate)
+        for key, value in _LIVE_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
+        for key, value in overrides.items():
+            monkeypatch.setenv(key, value)
+
+        settings = Settings.load()
+        ledger, gate = build_memory_components(settings.data_dir)
+        return build_steward(settings, ledger, gate)
+
+    return make
 
 
 @pytest.fixture(autouse=True)

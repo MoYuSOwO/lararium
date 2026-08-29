@@ -47,6 +47,7 @@ class Settings:
     compact_low_water: int
     compact_index_days: int
     push_channel: str
+    vision: bool
     bind_host: str
     bind_port: int
     control_tokens: dict[str, str]
@@ -81,6 +82,11 @@ class Settings:
             # M4-7:主动推送落在哪个渠道。以前写死 "cli",于是 M5 双通道下推送会掉进
             # 没人看的窗口(M3 结转第 2 条)。默认仍是 cli,单渠道部署行为不变。
             push_channel=_valid_channel(os.environ.get("LARARIUM_PUSH_CHANNEL", "cli")),
+            # M5-5 读图。**默认关**,两个理由都成立:一是仓库默认的模型不一定能读图,
+            # 发个多模态报文过去就是白花钱加报错;二是图片是一个**现有防线一条都用不上**
+            # 的注入面(围栏、折行、中和分隔符保护的全是文本),开它应该是一次明确的选择,
+            # 不是装上就有。关着时图照样收、照样存,只是不进模型。
+            vision=os.environ.get("LARARIUM_VISION", "off").strip().lower() == "on",
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
             # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。

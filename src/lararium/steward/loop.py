@@ -7,7 +7,7 @@ from typing import Any, Literal
 from lararium.config import Settings
 from lararium.db import transaction
 from lararium.envelope import Envelope
-from lararium.steward.assembler import Turn, assemble
+from lararium.steward.assembler import Turn, assemble, journalable_messages
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal, estimate_tokens
 from lararium.steward.model import ModelCallError, ModelClient, format_cache_log
@@ -16,6 +16,7 @@ from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
 from lararium.steward.tools import BuiltinTools
+from lararium.steward.vision import load_images
 
 logger = logging.getLogger("lararium")
 
@@ -95,6 +96,8 @@ class Steward:
             settings.timezone,
             threads,
             recall_min_similarity=settings.recall_min_similarity,
+            media_dir=settings.data_dir / "media",
+            vision=settings.vision,
         )
 
     def all_tools(self) -> list[Callable]:
@@ -155,6 +158,11 @@ class Steward:
                         "positional": [str(a) for a in args],
                         "result": str(result),
                         "replayed": replayed is not None,
+                        # M5-5:只有**纯文本结果**能回放。`look_at_image` 返回的
+                        # ImageReturn 带着字节,`str()` 出来是一行人话——照着它回放
+                        # 等于把图悄悄换成一句话,而模型不会知道自己少看了一张。
+                        # 它是纯读、无副作用,重试时真跑一遍才是对的。
+                        "replayable": isinstance(result, str),
                     },
                 )
             return result
@@ -275,6 +283,13 @@ class Steward:
             prefix_text = self.persona + directory + ledger_text
             # M3-6:L1(压缩索引块)供数给 assemble;一轮算一次,预算和渲染共用。
             l1_text = self.journal.l1_block(self.settings.compact_index_days)
+            # M5-5:图只在**到达的这一轮**取字节送进模型;历史轮只留那行文本引用
+            # (约束 1)。取不到 / 视觉关着 / 超张数上限都走人话,不抛异常(不许崩)。
+            images, image_notes = load_images(
+                media_dir=self.settings.data_dir / "media",
+                attachments=env.attachments,
+                enabled=self.settings.vision,
+            )
             ctx = assemble(
                 persona=self.persona,
                 directory=directory,
@@ -283,13 +298,17 @@ class Steward:
                 l0=self._recent_turns(prefix_text, l1_text),
                 envelope=env,
                 timezone=self.settings.timezone,
+                images=images,
+                image_notes=image_notes,
             )
             self.journal.append(
                 env.id,
                 "prompt",
                 {
                     "system_prompt": ctx.system_prompt,
-                    "messages": ctx.messages,
+                    # 约束 3:落引用 + 哈希,**不落字节**。字节在 media/ 下按哈希不可变;
+                    # 塞进来就是存第二遍,还会顺着 SEARCHABLE_KINDS 进全文索引。
+                    "messages": journalable_messages(ctx.messages),
                 },
             )
 

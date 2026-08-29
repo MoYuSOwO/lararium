@@ -1,5 +1,6 @@
 """报文级测试:断言真正发出去的 HTTP body。"""
 
+import base64
 import json
 from typing import Any
 
@@ -7,6 +8,7 @@ import httpx
 import pytest
 
 from lararium.steward.assembler import AssembledContext
+from lararium.steward.vision import ImagePart, ImageReturn
 
 PREFIX = "【前缀】"
 
@@ -146,3 +148,108 @@ async def test_history_tool_exchange_is_sent_as_native_tool_calls(wire):
 
     # 正文通道里不许出现工具痕迹——v1 就是把它写在这儿才被伪造的
     assert all("record_expense" not in (m.get("content") or "") for m in msgs)
+
+
+# ── M5-5 读图 ───────────────────────────────────────────────────────────
+
+
+def ctx_with_image(*, history: tuple[tuple[str, str], ...] = ()) -> AssembledContext:
+    messages: list[dict[str, Any]] = []
+    for user, assistant in history:
+        messages.append({"role": "user", "content": user})
+        messages.append({"role": "assistant", "content": assistant})
+    messages.append(
+        {
+            "role": "user",
+            "content": "这是啥",
+            "images": [ImagePart(sha256="ab" * 32, media_type="image/jpeg", data=b"JPEGBYTES")],
+        }
+    )
+    return AssembledContext(system_prompt=PREFIX, messages=messages)
+
+
+async def test_the_image_actually_goes_out_on_the_wire(wire):
+    """报文级:图真的发出去了,而且和那句正文在**同一条 user 消息**里。
+
+    断言发出去的字节而不是内部状态——"框定语和图在一起"这条,只有在这里才算证到。
+    """
+    client, bodies = wire
+    await client.run(ctx_with_image(), [], [])
+
+    last = bodies[-1]["messages"][-1]
+    assert last["role"] == "user"
+    kinds = [p["type"] for p in last["content"]]
+    assert kinds == ["text", "image_url"], f"报文形状不对:{kinds}"
+    assert last["content"][0]["text"] == "这是啥"
+    assert last["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert base64.b64decode(last["content"][1]["image_url"]["url"].split(",", 1)[1]) == b"JPEGBYTES"
+
+
+async def test_history_turns_carry_no_image_bytes(wire):
+    """★ 约束 1 的报文级证明:历史轮里一个字节的图都不许有。
+
+    只看组装器的结构断言不够——真正要证的是"发出去的那份"里没有。图片留在历史里的话,
+    成本和注入面都会**永久地**乘进后续每一轮。
+    """
+    client, bodies = wire
+    await client.run(
+        ctx_with_image(history=(("昨天那张呢", "(图片 · media/abababababab…)"),)), [], []
+    )
+
+    parts = [
+        p
+        for m in bodies[-1]["messages"]
+        if isinstance(m.get("content"), list)
+        for p in m["content"]
+    ]
+    assert [p["type"] for p in parts] == ["text", "image_url"], "整份报文里图不止一张"
+    earlier = bodies[-1]["messages"][:-1]
+    assert all(isinstance(m.get("content"), str) for m in earlier), f"历史轮不是纯文本:{earlier}"
+
+
+async def test_a_tool_can_hand_an_image_back_without_putting_bytes_in_the_journal(
+    http_spy_factory, reply_factories
+):
+    """★ 「重新看一眼」这条路要同时满足两件事,而它们互相拉扯:
+
+    图必须真的到达模型(否则这个工具是摆设),但**进起居注的那一份不能是字节**
+    ——`tool_result` 会进全文索引、进 L0、被 replay 反复 json.loads。所以工具返回的
+    是中立的 `ImageReturn`,隔离盒把它拆成:一行人话当 return_value(那份进起居注),
+    字节走 content(那份只上报文)。
+
+    这里断言的是**发出去的字节**和**上报的 tool_events**两头,不是内部状态。
+    """
+    text_reply, tool_call_reply = reply_factories
+    bodies: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if not any(m.get("role") == "tool" for m in body["messages"]):
+            reply = tool_call_reply()
+            reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = "look_at_image"
+            return httpx.Response(200, json=reply)
+        return httpx.Response(200, json=text_reply("看到了"))
+
+    def look_at_image() -> Any:
+        """重新看一眼"""
+        return ImageReturn(
+            text="(重新附上 media/abababababab…)",
+            images=(ImagePart(sha256="ab" * 32, media_type="image/png", data=b"PNGBYTES"),),
+        )
+
+    client = http_spy_factory(handler)
+    reply = await client.run(ctx(), [look_at_image], [])
+
+    # ① 图真的发出去了(第二次请求里)
+    parts = [
+        p
+        for m in bodies[-1]["messages"]
+        if isinstance(m.get("content"), list)
+        for p in m["content"]
+    ]
+    assert any(p["type"] == "image_url" for p in parts), f"图没上报文:{bodies[-1]['messages'][-1]}"
+
+    # ② 要落起居注的那一份是一行人话,没有任何字节
+    results = [e for e in reply.tool_events if e["type"] == "tool_result"]
+    assert results and results[0]["content"] == "(重新附上 media/abababababab…)"

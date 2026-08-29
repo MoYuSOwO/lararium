@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -5,7 +6,7 @@ from bundles.memory.server import build_memory_components, memory_tool_functions
 
 from lararium.config import Settings
 from lararium.db import connect
-from lararium.envelope import Envelope
+from lararium.envelope import Attachment, Envelope
 from lararium.steward.assembler import AssembledContext
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
@@ -32,9 +33,10 @@ class FakeModel:
 
 @pytest.fixture
 def steward_factory(tmp_path, monkeypatch):
-    def make(replies=None):
+    def make(replies=None, *, vision=False):
         monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
         monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("LARARIUM_VISION", "on" if vision else "off")
         settings = Settings.load()
         conn = connect(tmp_path / "steward.sqlite")
         ledger, gate = build_memory_components(tmp_path)
@@ -86,6 +88,8 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         "open_thread",
         "close_thread",
         "recall_similar",
+        # M5-5:look_at_image 同样只追加在内置那一段的末尾
+        "look_at_image",
         "propose_fact",
         "list_pending",
     ]
@@ -726,3 +730,103 @@ async def test_wrapping_tools_does_not_change_the_tool_schema(steward_factory, h
     await client.run(ctx, steward.all_tools(), [])
 
     assert bodies[0]["tools"] == bodies[1]["tools"], "包装改了工具 schema —— 前缀第0层被动了"
+
+
+# ── M5-5 读图 ───────────────────────────────────────────────────────────
+
+JPEG = b"\xff\xd8\xff\xe0 a photo"
+
+
+def with_image(tmp_path, *, on_disk=True):
+    """造一条带图信封;on_disk=False 模拟"起居注还在、原件已经没了"。"""
+    a = Attachment(kind="image", sha256=hashlib.sha256(JPEG).hexdigest(), media_type="image/jpeg")
+    if on_disk:
+        (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "media" / f"{a.sha256}.jpg").write_bytes(JPEG)
+    return Envelope.new(
+        source="user",
+        channel="wechat",
+        content=f"这是啥\n{a.as_line()}",
+        attachments=[a],
+    )
+
+
+async def test_the_arriving_turn_carries_the_image_and_the_journal_carries_the_hash(
+    steward_factory, tmp_path
+):
+    """一次跑通三条约束里的两条:图进了模型(到达轮),起居注里只有哈希没有字节。"""
+    steward, model = steward_factory([ModelReply(text="看到了")], vision=True)
+    steward.submit(with_image(tmp_path))
+
+    await steward.process_next()
+
+    sent = model.seen[0].messages[-1]
+    assert sent["images"][0].data == JPEG
+
+    events = steward.journal.replay(steward.journal.recent_turns(1)[0]["envelope_id"])
+    payload = next(e["payload"] for e in events if e["kind"] == "prompt")
+    # 形状写死:只有引用+哈希+大小三项,没有第四项能装得下字节(约束 3)
+    assert payload["messages"][-1]["images"] == [
+        {
+            "sha256": hashlib.sha256(JPEG).hexdigest(),
+            "media_type": "image/jpeg",
+            "size": len(JPEG),
+        }
+    ]
+
+
+async def test_vision_off_never_sends_bytes_and_says_so(steward_factory, tmp_path):
+    """关掉视觉:一个字节都不发出去,而且模型被告知"看不了图"——不许静默当没这张图。
+
+    静默的后果是模型对着一行 `(图片 · media/…)` 编内容,而用户以为它真看了。
+    """
+    steward, model = steward_factory([ModelReply(text="好")], vision=False)
+    steward.submit(with_image(tmp_path))
+
+    await steward.process_next()
+
+    sent = model.seen[0].messages[-1]
+    assert "images" not in sent
+    assert "看不了图" in sent["content"]
+
+
+async def test_a_missing_original_says_the_replay_is_incomplete(steward_factory, tmp_path):
+    """原件不在了要明说,不许静默给一份残缺的——外面得看得出这一轮比当初少了东西。"""
+    steward, model = steward_factory([ModelReply(text="好")], vision=True)
+    steward.submit(with_image(tmp_path, on_disk=False))
+
+    await steward.process_next()
+
+    sent = model.seen[0].messages[-1]
+    assert "images" not in sent
+    assert "重放不完整" in sent["content"]
+
+
+async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, tmp_path):
+    """★ 写入侧:带字节的工具结果落起居注时必须标成**不可回放**。
+
+    只测读取侧(`last_attempt_tool_results` 跳过它)不够——把这里写死成 True,
+    整个机制就是死的,而读取侧那条测试照样绿(变异 K 就是这么活下来的)。
+    重试那一轮会把图**悄悄换成一句话**,模型不会知道自己少看了一张。
+    """
+    steward, _ = steward_factory(vision=True)
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(JPEG).hexdigest()
+    (tmp_path / "media" / f"{digest}.jpg").write_bytes(JPEG)
+    steward._active_envelope_id = "env-x"
+    wrapped = {f.__name__: f for f in steward.all_tools()}
+
+    wrapped["look_at_image"](digest[:12])
+    wrapped["current_time"]()
+
+    executed = [
+        e["payload"] for e in steward.journal.replay("env-x") if e["kind"] == "tool_executed"
+    ]
+    assert [(p["tool"], p["replayable"]) for p in executed] == [
+        ("look_at_image", False),
+        ("current_time", True),
+    ]
+    assert "\\xff" not in str(executed[0]["result"]), "字节顺着 result 溜进起居注了"
+    assert steward.journal.last_attempt_tool_results("env-x") == [
+        ("current_time", executed[1]["result"])
+    ]
