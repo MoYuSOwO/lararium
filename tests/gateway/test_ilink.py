@@ -241,7 +241,9 @@ async def test_login_returns_the_flat_credentials():
     assert (qrcode, image_url) == ("t1", "https://liteapp/q/x")
     assert "bot_type=3" in str(seen[-1].url)
 
-    creds = await client.poll_qrcode_status(qrcode)
+    status = await client.poll_qrcode_status(qrcode)
+    assert status.confirmed and not status.dead
+    creds = status.credentials
     assert creds is not None
     assert (creds.bot_token, creds.bot_id, creds.user_id, creds.base_url) == (
         "tok-new",
@@ -255,4 +257,18 @@ async def test_pending_qrcode_status_is_not_an_error():
     """还没扫的时候长轮询会空返回——那是正常控制流,不是错误。"""
     client, _seen = spy(lambda _r: ok({"ret": 0, "status": "wait"}))
 
-    assert await client.poll_qrcode_status("t1") is None
+    status = await client.poll_qrcode_status("t1")
+    assert not status.confirmed and not status.dead
+
+
+@pytest.mark.parametrize("raw", ["expired", "verify_code_blocked"])
+async def test_a_dead_qrcode_is_distinguishable_from_waiting(raw):
+    """★ "这张码废了" 必须和 "还没扫" **分得开**。
+
+    两者都返回 None 的话,调用方只能一直等——而实测症状是:轮询 31 次,
+    始终只用第 1 个码,对着死码等到天亮。
+    """
+    client, _seen = spy(lambda _r: ok({"ret": 0, "status": raw}))
+
+    status = await client.poll_qrcode_status("t1")
+    assert status.dead and not status.confirmed

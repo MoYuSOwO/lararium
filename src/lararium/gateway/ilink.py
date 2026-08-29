@@ -80,6 +80,34 @@ class Credentials:
     base_url: str
 
 
+# 官方 login-qr.ts 列的全部状态。**这里只需要分三类**:确认了 / 这张码废了 / 还在等。
+# `expired` 是码本身过期;`verify_code_blocked` 是被拦下,同样得换一张新的。
+# 两个 `*_redirect` 要换轮询主机,本步没做——它们落进"还在等",由调用方的**超时下界**
+# 兜住(见 wechat.relogin:一张码等够时限就换新的,不靠把状态枚举全)。
+_DEAD_QR_STATES = frozenset({"expired", "verify_code_blocked"})
+
+
+@dataclass(frozen=True)
+class QrStatus:
+    """一次扫码状态轮询的结果。**三态,不是两态。**
+
+    原来 confirmed 之外一律返回 None,调用方分不出"还没扫"和"这张码已经废了"
+    ——于是过期之后会对着一张死码轮询到天亮。助手静默死掉,只能人工重启进程。
+    """
+
+    raw: str
+    credentials: Credentials | None = None
+
+    @property
+    def confirmed(self) -> bool:
+        return self.credentials is not None
+
+    @property
+    def dead(self) -> bool:
+        """这张码不用再等了,得换一张。"""
+        return self.raw in _DEAD_QR_STATES
+
+
 @dataclass(frozen=True)
 class InboundMessage:
     """一条收到的文本消息。
@@ -196,18 +224,23 @@ class ILinkClient:
         )
         return str(payload.get("qrcode", "")), str(payload.get("qrcode_img_content", ""))
 
-    async def poll_qrcode_status(self, qrcode: str) -> Credentials | None:
-        """长轮询扫码状态。**还没确认时返回 None,那是正常控制流不是错误**。"""
+    async def poll_qrcode_status(self, qrcode: str) -> QrStatus:
+        """长轮询扫码状态。**还没扫**是正常控制流不是错误;**码废了**要能和它分开
+        ——分不开的话调用方只能对着死码一直等(见 QrStatus 的 docstring)。"""
         payload = await self._get(
             f"ilink/bot/get_qrcode_status?qrcode={qrcode}", timeout_s=LONG_POLL_TIMEOUT
         )
-        if payload.get("status") != "confirmed":
-            return None
-        return Credentials(
-            bot_token=str(payload.get("bot_token", "")),
-            bot_id=str(payload.get("ilink_bot_id", "")),
-            user_id=str(payload.get("ilink_user_id", "")),
-            base_url=str(payload.get("baseurl") or self.base_url),
+        raw = str(payload.get("status", ""))
+        if raw != "confirmed":
+            return QrStatus(raw=raw)
+        return QrStatus(
+            raw=raw,
+            credentials=Credentials(
+                bot_token=str(payload.get("bot_token", "")),
+                bot_id=str(payload.get("ilink_bot_id", "")),
+                user_id=str(payload.get("ilink_user_id", "")),
+                base_url=str(payload.get("baseurl") or self.base_url),
+            ),
         )
 
     # ── 收发 ────────────────────────────────────────────────────────────

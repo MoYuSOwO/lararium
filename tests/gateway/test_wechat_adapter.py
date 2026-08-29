@@ -7,12 +7,16 @@
 这一步只做"能收能发"。审批卡是 M5-4。
 """
 
+import asyncio
+import contextlib
 import json
+import os
 
 import httpx
 import pytest
 
-from lararium.gateway.ilink import Credentials, ILinkError, InboundMessage
+from lararium.gateway import wechat
+from lararium.gateway.ilink import Credentials, ILinkError, InboundMessage, QrStatus
 from lararium.gateway.wechat import State, WeChatAdapter
 
 
@@ -40,8 +44,15 @@ class FakeILink:
         return "qr-token", "https://liteapp/q/new"
 
     async def poll_qrcode_status(self, qrcode):
+        # 别立即返回:没有 await 挂起点的循环连 asyncio.wait_for 都打断不了。
+        await asyncio.sleep(0)
         self.logins += 1
-        return Credentials(bot_token="tok-new", bot_id="b", user_id="u", base_url="https://ilink")
+        return QrStatus(
+            raw="confirmed",
+            credentials=Credentials(
+                bot_token="tok-new", bot_id="b", user_id="u", base_url="https://ilink"
+            ),
+        )
 
 
 def lararium(handler):
@@ -296,3 +307,157 @@ async def test_other_ilink_errors_are_not_silently_swallowed(tmp_path):
 
     with pytest.raises(ILinkError, match="boom"):
         await a.pump_inbound_once()
+
+
+# ── 恢复路径:二维码过期 ─────────────────────────────────────────────────
+#
+# 失效剧本:凌晨三点会话到期 → 二维码发到微信 → 你在睡觉 → 几分钟后码过期 →
+# 适配器对着一个死码轮询到天亮 → 你早上回消息毫无反应。助手静默死掉,只能人工重启。
+# 这是**恢复路径**上的第二个洞:第一个(二维码发不出去)已经防住了,这个没有。
+
+
+class ExpiringILink(FakeILink):
+    """第 `expire_after` 次轮询之后,这个码就过期了;新申请的码可以正常确认。"""
+
+    def __init__(self, *, expire_after: int, fail_with=None):
+        super().__init__(fail_with=fail_with)
+        self.expire_after = expire_after
+        self.qr_issued = 0
+        self.polls = 0
+
+    async def request_qrcode(self):
+        self.qr_issued += 1
+        return f"qr-{self.qr_issued}", f"https://liteapp/q/{self.qr_issued}"
+
+    async def poll_qrcode_status(self, qrcode):
+        # **别立即返回**:没有 await 挂起点的 while True 是个热循环,
+        # 连 asyncio.wait_for 都打断不了——那样测试自己会挂死,而那是一次
+        # "场景没发生"的假绿。
+        await asyncio.sleep(0)
+        self.polls += 1
+        if self.qr_issued == 1 and self.polls > self.expire_after:
+            return QrStatus(raw="expired")
+        if self.polls <= self.expire_after:
+            return QrStatus(raw="wait")
+        self.logins += 1
+        return QrStatus(
+            raw="confirmed",
+            credentials=Credentials(
+                bot_token="tok-new", bot_id="b", user_id="u", base_url="https://ilink"
+            ),
+        )
+
+
+async def test_an_expired_qrcode_makes_the_adapter_ask_for_a_new_one(tmp_path):
+    """★ 码过期就**重新申请一个**,不许对着死码轮询到天亮。
+
+    `relogin()` 原来只请求一次二维码,然后 `while True` 死等那一个;而
+    `poll_qrcode_status` 把 expired 和"还没扫"都返回 None,调用方**没法区分**。
+    实测症状:轮询 31 次,始终只用第 1 个码。
+    """
+    ilink = ExpiringILink(expire_after=2)
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(200, json={"items": []}))
+
+    await a.relogin()
+
+    assert ilink.qr_issued > 1, f"始终只用了第 {ilink.qr_issued} 个码——对着死码等到天亮"
+    assert a.ilink_token == "tok-new"
+
+
+async def test_a_new_qrcode_is_announced_again_after_expiry(tmp_path):
+    """重新申请的码也要**再发给用户一次**。只在日志里换一张,用户那边还是那张死码。"""
+    ilink = ExpiringILink(expire_after=1)
+    a = adapter(
+        tmp_path,
+        ilink,
+        lambda _r: httpx.Response(200, json={"items": []}),
+        context_token="ctx-1",
+        peer="u1@im.wechat",
+    )
+
+    await a.relogin()
+
+    announced = [text for _to, text, _ctx in ilink.sent if "liteapp" in text]
+    assert len(announced) >= 2, f"新码没重新发给用户:{announced}"
+    assert "/q/2" in announced[-1], "发出去的还是旧那张码"
+
+
+async def test_polling_does_not_spin_hot(tmp_path):
+    """轮询要有下界。服务端对一个死码多半**立刻返回**,没有下界就是 2 核机器上的
+    一个满转核心——把 Lararium 和同机的别的东西一起拖慢。
+
+    生产里长轮询挂 35 秒所以看不出来;这条就是照着"服务端立刻返回"的情形写的。
+    """
+
+    class NeverConfirms(FakeILink):
+        def __init__(self):
+            super().__init__()
+            self.polls = 0
+
+        async def request_qrcode(self):
+            return "qr", "https://liteapp/q/1"
+
+        async def poll_qrcode_status(self, qrcode):
+            await asyncio.sleep(0)
+            self.polls += 1
+            return QrStatus(raw="wait")
+
+    ilink = NeverConfirms()
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(200, json={"items": []}))
+
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(a.relogin(), timeout=0.3)
+
+    assert ilink.polls < 10, f"0.3 秒里轮询了 {ilink.polls} 次,这是在热转"
+
+
+def test_state_is_flushed_to_disk_before_the_rename(tmp_path, monkeypatch):
+    """原子写要和 `ledger.py` 那份(R3-1)一致:同目录 .tmp → **fsync** → os.replace。
+
+    这里后果轻(最坏重扫一次码),但**同一个仓库里两套原子写标准,以后的人照哪份写?**
+    """
+    fsynced: list[int] = []
+    monkeypatch.setattr(os, "fsync", lambda fd: fsynced.append(fd))
+
+    State(path=tmp_path / "wechat" / "state.json", cursor="c1").save()
+
+    assert fsynced, "没 fsync:rename 是原子的,但内容可能还在页缓存里"
+
+
+async def test_a_qrcode_stuck_in_an_unknown_state_is_eventually_replaced(tmp_path, monkeypatch):
+    """★ **按构造兜底**:状态既不是 confirmed 也不是 dead,等够时限也要换新码。
+
+    官方那串状态里还有要换轮询主机的(`scaned_but_redirect`)、要验证码的
+    (`need_verifycode`)——枚举不全。而"这张码没戏了"的形态**只要有一种没被枚举到**,
+    就又回到了"对着死码等到天亮"。限时换码对所有形态都成立,不用把状态认全。
+
+    这和前缀指纹那次是同一条:**别枚举,按构造**。
+    """
+    monkeypatch.setattr(wechat, "_QR_LIFETIME", 0.05)
+    monkeypatch.setattr(wechat, "_POLL_FLOOR", 0.01)
+
+    class Stuck(FakeILink):
+        def __init__(self):
+            super().__init__()
+            self.qr_issued = 0
+
+        async def request_qrcode(self):
+            self.qr_issued += 1
+            return f"qr-{self.qr_issued}", f"https://liteapp/q/{self.qr_issued}"
+
+        async def poll_qrcode_status(self, qrcode):
+            await asyncio.sleep(0)
+            if self.qr_issued >= 3:
+                return QrStatus(
+                    raw="confirmed",
+                    credentials=Credentials("tok-new", "b", "u", "https://ilink"),
+                )
+            return QrStatus(raw="scaned_but_redirect")  # 我们没处理的状态
+
+    ilink = Stuck()
+    a = adapter(tmp_path, ilink, lambda _r: httpx.Response(200, json={"items": []}))
+
+    await a.relogin()
+
+    assert ilink.qr_issued == 3, "卡在未知状态时没有换码"
+    assert a.ilink_token == "tok-new"

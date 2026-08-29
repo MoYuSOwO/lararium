@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -44,6 +45,12 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:8420"
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
 # 出件箱长轮询的等待秒数。和 cli.py 一个量级:短到掉线能快点发现,长到不至于空转刷屏。
 _OUTBOX_WAIT = 5
+# 一张二维码最多等这么久,到点换新的。比微信那边的码有效期宽松些即可——它的作用是
+# **兜住所有"这张码没戏了"却没被状态字段说明白的情形**,不是精确复刻服务端的过期时间。
+_QR_LIFETIME = 180.0
+# 轮询下界。服务端正常会把请求挂住(长轮询),但异常时会立刻返回——没有这一行,
+# 那就是热循环。
+_POLL_FLOOR = 1.0
 
 
 @dataclass
@@ -89,8 +96,15 @@ class State:
         内容却是残缺的,而下一次启动会拿它当真。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {name: getattr(self, name) for name in self.PERSISTED}
-        temp = self.path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # 同目录 .tmp → fsync → 原子替换。**和 ledger.py 的 R3-1 是同一份标准**:
+        # 少了 fsync,rename 虽是原子的,内容却可能还在页缓存里——掉电后拿到的是
+        # "改名成功但内容是空的"。这里后果轻(最坏重扫一次码),但同一个仓库里
+        # 两套原子写标准,以后的人照哪份写?
+        temp = self.path.with_name(self.path.name + ".tmp")
+        with temp.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
         temp.replace(self.path)
 
 
@@ -179,14 +193,42 @@ class WeChatAdapter:
     # ── 重连 ────────────────────────────────────────────────────────────
 
     async def relogin(self) -> None:
-        """重新扫码。**把新二维码当消息发给用户**,否则每天都得 SSH 上服务器扫一次。"""
-        qrcode, image_url = await self.ilink.request_qrcode()
-        await self._announce_qrcode(image_url)
+        """重新扫码,**直到真的连上**。二维码会过期,所以这是个两层循环:
+        外层不断换新码,内层等这一张。
+
+        原来只请求一次码然后死等那一张。失效剧本:凌晨三点会话到期 → 码发到微信 →
+        你在睡觉 → 几分钟后码过期 → 适配器对着死码轮询到天亮 → 你早上回消息毫无反应。
+        **助手静默死掉,只能人工重启进程**——而这里正是恢复路径。
+
+        换码有两个触发口,一快一慢,缺一不可:
+        - 服务端明说这张废了(`QrStatus.dead`)→ 立刻换;
+        - 等够 `_QR_LIFETIME` 还没结果 → 也换。后者是**按构造**的兜底:
+          官方那串状态里还有要换轮询主机的(`*_redirect`)、要验证码的,枚举不全;
+          限时换码对**所有**"这张码没戏了"的形态都成立,不用把状态认全。
+        """
         while True:
-            credentials = await self.ilink.poll_qrcode_status(qrcode)
-            if credentials is not None:
-                self._adopt(credentials)
+            qrcode, image_url = await self.ilink.request_qrcode()
+            await self._announce_qrcode(image_url)
+            if await self._await_scan(qrcode):
                 return
+
+    async def _await_scan(self, qrcode: str) -> bool:
+        """等这一张码。连上了返回 True;这张没戏了返回 False(让外层换一张)。"""
+        deadline = time.monotonic() + _QR_LIFETIME
+        while time.monotonic() < deadline:
+            status = await self.ilink.poll_qrcode_status(qrcode)
+            if status.confirmed and status.credentials is not None:
+                self._adopt(status.credentials)
+                return True
+            if status.dead:
+                logger.warning("二维码已失效(%s),换一张", status.raw)
+                return False
+            # **下界**:生产里长轮询挂 35 秒所以看不出来,但服务端对一张死码多半立刻
+            # 返回——没有下界这就是 2 核机器上的一个满转核心,把 Lararium 和同机
+            # 别的东西一起拖慢。
+            await asyncio.sleep(_POLL_FLOOR)
+        logger.warning("二维码等了 %.0f 秒没结果,换一张", _QR_LIFETIME)
+        return False
 
     async def _announce_qrcode(self, image_url: str) -> None:
         """尽力而为:旧凭据要是已经彻底失效,这条发不出去——那就只能落日志。
