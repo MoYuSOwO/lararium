@@ -10,7 +10,9 @@ Lararium:跑在用户自己服务器上的个人生活助手,通过一个 IM 对
 学习、待办。架构是**单 agent + plugin bundle**:一个主控(Steward)持有全部智能,
 各生活领域是独立的 MCP bundle,只提供工具和数据,不含 LLM。
 
-**当前状态**:设计与计划已定稿,正在实现 M1(骨架)。进度见 `REVIEW.md` 的任务验收表。
+**当前状态**:M1–M4 已完成(骨架 / 前后端分离 / 记忆中间层 / 第一个领域 bundle),
+M5(上手机)收尾中——微信通道、媒体入站、读图都已交付。进度见 `REVIEW.md` 的验收记录、
+待办见 `PLAN.md` 的 M5 段。
 
 ## 按需读,别全读
 
@@ -130,20 +132,31 @@ uv run python -m lararium.gateway.wechat
 
 ```
 src/lararium/
-  config.py envelope.py db.py        基础设施
+  config.py envelope.py db.py        基础设施(db.py:连接一律从这里建,见下)
+  persona.py                          前缀第 1 层:人设 + 纪律,以及前缀指纹
   steward/                            主控:唯一持有智能的地方
     ports.py                          对 bundle 的抽象(守 import 边界)
-    inbox.py journal.py               收件箱、起居注(Steward 独占存储)
+    inbox.py outbox.py journal.py     收件箱、出件箱、起居注(Steward 独占存储)
     registry.py assembler.py tools.py 注册表、上下文组装、内置工具
+    threads.py compact.py sweep.py    话头、压缩、夜间归拢
+    embeddings.py vision.py           本地 embedding、图片进模型那一层
     model.py                          第三方库隔离盒(类型宽松档)
-    loop.py                           一轮的编排
-  gateway/cli.py                      组装根:唯一能 import bundles 的地方
+    loop.py worker.py                 一轮的编排、常驻 worker
+  gateway/
+    server.py                         **组装根**:唯一能 import bundles 的地方
+    commands.py                       斜杠命令分派(审批权在这里,只此一份)
+    cli.py ilink.py wechat.py         纯 HTTP 客户端,不许 import steward/bundles
 bundles/memory/                       Memory 也是一个 bundle,没有特例
-  ledger.py                           账本 + 快照表(全系统唯一写文件的模块)
+  ledger.py                           账本 + 快照表(唯一写入路径 Gate.settle)
   gate.py                             门控状态机
   server.py                           FastMCP server(类型宽松档)
+bundles/finance/                      第一个生活领域:记账与消费分析
 tests/test_architecture.py            项目不变量门禁
 ```
+
+**数据库连接一律走 `db.connect()` / `db.open_connection()`,不许自己 `sqlite3.connect`。**
+同步工具函数跑在框架给的线程池里,一条 assistant 消息里的多个工具调用是**并发**的;
+裸连接在那种并发下会烂掉游标,症状是三种互不相干、指不到任何地方的异常(M5-8)。
 
 边界由 `.importlinter` 强制:`lararium.steward` 不许依赖 `bundles`,bundle 之间不许互相依赖。
 需要 Memory 的能力就走 `ports.py` 的 Protocol,由 `cli.py` 接线。

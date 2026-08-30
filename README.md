@@ -138,7 +138,8 @@ uv run python -m lararium.gateway.cli
 | ✅ **历史检索** | 词法(FTS5)+ 语义(本地 embedding)双路 |
 | ✅ **上下文压缩** | 聊到超窗自动压缩,两道审批屏障 |
 | ✅ **夜间归拢** | 后台扫历史,补上漏记的事 |
-| 🚧 **上手机** | 目前只有 CLI,IM 适配器在做 |
+| ✅ **上手机** | 微信通道:对话、斜杠命令审批、收图收文件 |
+| ✅ **读图** | 图片进模型,带来源框定(默认关,见 `LARARIUM_VISION`) |
 | 🚧 **账单自动入账** | 短信/支付通知的数据面 |
 | 🚧 **部署** | 容器化与运维 |
 
@@ -153,14 +154,14 @@ src/lararium/
     inbox journal   收件箱、起居注
     assembler       上下文组装(那六层)
     loop            一轮的编排
-  gateway/        HTTP 服务 + CLI 客户端
+  gateway/        HTTP 服务 + 客户端(CLI / 微信)
 bundles/
   memory/         账本 + 门控状态机
   finance/        记账与消费分析
 ```
 
 边界由 [import-linter](.importlinter) 强制,四条契约:主控不许依赖任何模块、
-模块不许反向依赖主控、模块之间互不依赖、CLI 是纯 HTTP 客户端。
+模块不许反向依赖主控、模块之间互不依赖、前端(CLI 与 IM 适配器)一律是纯 HTTP 客户端。
 需要某个模块的能力就走 `ports.py` 的 Protocol,由组装根接线。
 
 **进过模型上下文的一切都落起居注**,而且落的是模型实收的那一份——任意一轮都能逐字重放。
@@ -182,7 +183,7 @@ uv run ruff check src bundles tests && uv run ruff format --check src bundles te
 ```
 
 四关:ruff(lint + 格式)、mypy(分层严格)、import-linter(架构边界)、pytest。
-当前 **367 passed**;标 `-m live` 的是真模型验收,没有 API key 会自动跳过。
+当前 **490 passed**;标 `-m live` 的是真模型验收,没有 API key 会自动跳过。
 
 开发规范见 [CONVENTIONS.md](CONVENTIONS.md)——只收"防真实腐烂、而机器判不了"的那些,
 不重复 linter 已经能管的事。
