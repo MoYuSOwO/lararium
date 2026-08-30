@@ -133,6 +133,22 @@ Pydantic AI 只出现在 `steward/model.py`,FastMCP 只出现在 `bundles/*/serv
 库升级改 API 时,你只需要看一个文件。这条同时也是类型宽松档的边界(见 PLAN.md)——
 适配层脏一点是设计意图,但脏必须被关在盒子里。
 
+**D3. 数据库连接一律从 `db.connect` / `db.open_connection` 拿,禁止自己 `sqlite3.connect`。**
+
+理由不是整洁,是**并发**:同步工具函数跑在**框架给的线程池**里(FastMCP、Pydantic AI
+各自决定怎么调度,那不是我们能选的),于是一条 assistant 消息里的多个工具调用是
+**并发执行**的。`check_same_thread=False` 关掉的只是那个守卫,**不是让连接变线程安全**
+——两个线程交错 execute/fetch,pysqlite 的游标与语句缓存就烂了。
+
+这条规则的实体是 `db.GuardedConnection`(一把可重入锁,粒度是一个事务),而它**只有一份**。
+自己 `sqlite3.connect` 就是绕过它,而且症状不长得像并发问题:M5-8 之前两个 bundle
+各写了一份裸 connect,memory 那条的失败面孔是 `KeyError: 提案不存在`——`propose_fact`
+写进去了、转头读不回来,**账本唯一写入路径上的数据面失败**,真机上表现为"我记下了"
+之后提案凭空消失。三分之一的并发批次会中招,而起居注里查不到任何线索。
+
+写不下来这条,下一个 bundle 会再来一次——M5-8 那两处就不是谁偷懒,是这条当时没写下来。
+`tests/test_architecture.py` 有机械门禁钉着。
+
 ---
 
 ## T · 测试

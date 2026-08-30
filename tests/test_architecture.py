@@ -156,6 +156,44 @@ def test_no_shell_or_dynamic_code_execution() -> None:
     assert offenders == [], f"系统内不得存在 shell 或动态代码执行:{offenders}"
 
 
+def test_only_db_opens_a_sqlite_connection() -> None:
+    """CONVENTIONS D3:连接一律从 `db.connect` / `db.open_connection` 拿。
+
+    理由是**并发**,不是整洁:同步工具函数跑在**框架给的线程池**里(FastMCP、
+    Pydantic AI 各自决定怎么调度,那不是我们能选的),一条 assistant 消息里的多个
+    工具调用因此是并发执行的。`check_same_thread=False` 关掉的只是那个守卫,不是让
+    连接变线程安全——串行化靠 `db.GuardedConnection` 那把锁,而它**只有一份**。
+
+    自己 `sqlite3.connect` 就是绕过它,而症状一点都不像并发问题:M5-8 之前两个 bundle
+    各写了一份裸 connect,memory 那条的面孔是 `KeyError: 提案不存在`——写进去了转头
+    读不回来,**账本唯一写入路径上的数据面失败**。三分之一的并发批次中招,查无线索。
+
+    那两处当时不是谁偷懒,是这条规则还没写下来——所以它现在既在 CONVENTIONS 里,
+    也在这里钉着:下一个 bundle 不用再靠自觉。
+    """
+    allowed = {Path("src/lararium/db.py")}  # 唯一允许建连接的地方,那把锁在它手里
+    offenders: list[str] = []
+
+    for path in _source_files():
+        if path in allowed:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "connect"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "sqlite3"
+            ):
+                offenders.append(f"{path}:{node.lineno} sqlite3.connect()")
+
+    assert offenders == [], (
+        f"这些地方自己建了 sqlite 连接,绕过了 db 里那把串行化的锁:{offenders}。"
+        "走 db.connect(Steward 的库,含建表)或 db.open_connection(自己有库的模块)。"
+    )
+
+
 def test_assembler_never_reads_the_clock() -> None:
     """时间绝不进前缀(DESIGN §4)。
 
