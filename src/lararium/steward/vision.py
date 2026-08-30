@@ -31,14 +31,19 @@ from lararium.envelope import Attachment
 # ——不封顶就是一条消息顶穿整个窗口,症状还是"上下文超长"这种完全指不到图片的报错。
 MAX_IMAGES_PER_TURN = 4
 
-# 愿意送进模型的图片类型。服务商实测只收这几种,报错原文:
-# `invalid image format, only bmp/gif/png/jpeg/webp are supported`。
-# **认得出 ≠ 送得进**:HEIC 是 iPhone 发原图的默认格式,`_sniff` 认得出它,
-# 但送过去就是一个 400、整轮当场死掉。认出来并**说一句**,比认不出来静默丢掉强,
-# 也比送出去挨一个 400 强。哪天换了能读 HEIC 的服务商,改这一行就够。
-SENDABLE_IMAGE_TYPES = frozenset(
-    {"image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp"}
-)
+# 愿意送进模型的图片类型。**这一行是服务商相关的,换模型必须重测**——而 M5-10 换到
+# deepseek-v4-flash-vision-exp 时它真的变了:
+#
+#     旧(mimo 那边):invalid image format, only bmp/gif/png/jpeg/webp are supported
+#     新(实测 400):  formats: webp, png, jpeg, and gif          ← **BMP 没了**
+#
+# 一张 24 位 BMP 过去就是 400,用户收到的是「这条消息处理失败(ModelHTTPError:
+# status_code: 400 …)」——一整句 provider 黑话。清单只会比上一家更窄或更宽,
+# 不会自动跟着走,所以换服务商时拿真图逐格式打一遍,别照抄注释。
+#
+# **认得出 ≠ 送得进**:HEIC 是 iPhone 发原图的默认格式,`_sniff` 认得出它、也照样存盘,
+# 但两家都不收。认出来并**说一句**,比认不出来静默丢掉强,也比送出去挨一个 400 强。
+SENDABLE_IMAGE_TYPES = frozenset({"image/gif", "image/jpeg", "image/png", "image/webp"})
 # 嗅不出魔数时落的那个类型。它的意思是"我不知道这是什么",不是"这是二进制文件"。
 _UNKNOWN_MEDIA_TYPE = "application/octet-stream"
 

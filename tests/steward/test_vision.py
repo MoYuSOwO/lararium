@@ -116,9 +116,12 @@ def test_the_framing_points_at_the_pictures_and_not_at_the_text(count):
     [
         # 微信说这是图片,字节却嗅不出来(伪装的 PDF、没见过的格式)
         ("application/octet-stream", "认不出"),
-        # 认得出、但这个模型收不了。HEIC 是 iPhone 发原图的默认格式,
-        # 而服务商那句报错自己写着 only bmp/gif/png/jpeg/webp。
+        # 认得出、但这个服务商收不了。HEIC 是 iPhone 发原图的默认格式。
         ("image/heic", "读不了"),
+        # M5-10:BMP 也进了这一档——**换服务商时清单真的变窄了**(新的只收
+        # webp/png/jpeg/gif)。实测一张 24 位 BMP 过去就是 400,用户收到一整句
+        # provider 黑话。这条钉着"清单是服务商相关的,不是摆设"。
+        ("image/bmp", "读不了"),
     ],
 )
 def test_an_image_that_cannot_be_sent_leaves_a_note_instead_of_vanishing(
@@ -142,11 +145,17 @@ def test_an_image_that_cannot_be_sent_leaves_a_note_instead_of_vanishing(
     assert a.short in notes[0], "得说清楚是哪一张"
 
 
-def test_a_sendable_image_type_still_goes_through(tmp_path):
-    """反向守卫:别为了挡住 HEIC 把 BMP 也挡了——它在服务商支持的清单里。"""
-    bmp = store(tmp_path, data=b"BM\x36\x00\x0c\x00", media_type="image/bmp")
+@pytest.mark.parametrize("media_type", ["image/gif", "image/jpeg", "image/png", "image/webp"])
+def test_every_sendable_type_still_goes_through(tmp_path, media_type):
+    """反向守卫:别为了挡住 HEIC/BMP 把清单里的也一起挡了。
 
-    parts, notes = load_images(media_dir=tmp_path, attachments=[bmp], enabled=True)
+    逐个走一遍而不是抽一个:清单是**服务商相关**的,收窄它的那次改动最容易顺手多砍一个,
+    而少送一种格式的症状是"这张图它就是不看",没有任何报错。
+    """
+    blob = b"\xff\xd8\xff\xe0 pretend"
+    a = store(tmp_path, data=blob, media_type=media_type)
 
-    assert [p.media_type for p in parts] == ["image/bmp"]
+    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=True)
+
+    assert [p.media_type for p in parts] == [media_type]
     assert notes == ()

@@ -9443,3 +9443,86 @@ docstring 里那句「**守住一扇门的门禁比没有更坏:它让人以为�
 白名单断言的失败信息也补对了:它明说**不该靠改列表转绿**,并且写出了正确的处置
 (字库动过 → 暗号按新字库重选 → 两个模型各跑 3 次)。**一条会红的断言,如果没告诉
 下一个人红了该干嘛,最省事的做法就是把它改绿**——这条现在堵上了。
+
+
+## M5-10:换模型 —— 待验收
+
+`LARARIUM_MODEL` → `deepseek-v4-flash-vision-exp`。零代码那部分对了,但**「换完重测
+SENDABLE」不是走过场——清单真的变了**,而且是变窄。
+
+### 一、`SENDABLE_IMAGE_TYPES` 少了一个:BMP
+
+拿**真图**逐格式打了一遍(不是造的字节:png 由本仓库的点阵渲染器出,jpeg/gif/bmp/heic
+由 `sips` 转,webp 由浏览器 canvas 编码。每张图上写着 `XJKY`——**模型答得出来才算收了**,
+不 400 只说明它没拒绝):
+
+```
+image/png    在清单 ✓   replied   读出暗号 ✓   «**CODE XJKY**»
+image/jpeg   在清单 ✓   replied   读出暗号 ✓   «CODE XJKY»
+image/gif    在清单 ✓   replied   读出暗号 ✓   «CODE XJKY»
+image/webp   在清单 ✓   replied   读出暗号 ✓   «XJKY»
+image/bmp    在清单 ✓   replied   读出暗号 ✗   «»            ← 出问题的那个
+image/heic   在清单 ✗   replied   —            «这张图是 HEIC 格式,我读不了…»
+```
+
+BMP 那条挖下去,是新服务商的 400:
+
+```
+Upstream request failed: [invalid_request_error] .messages[1]:
+You have uploaded an unsupported image. Please make sure your image is valid and
+has one of the following formats: webp, png, jpeg, and gif.
+```
+
+对比旧那家的原话 `only bmp/gif/png/jpeg/webp are supported` —— **BMP 没了**。
+用户实际收到的是出件箱里那条 notice:「这条消息处理失败(ModelHTTPError:
+status_code: 400 …)」,一整句 provider 黑话。24 位和 8 位、308 KB 和 7 KB 都试了,
+不是尺寸问题,就是不收这个格式。
+
+已从清单删掉,注释里把**两家的原话并排写上**,并写明"清单只会比上一家更窄或更宽,
+不会自动跟着走,换服务商时拿真图逐格式打一遍,别照抄注释"。改完复测:BMP 现在走人话
+——「这张图是 BMP 格式,我这边读不了…换成 PNG/JPG 再发一次就行」。
+
+测试跟着改:BMP 进"送不出去"那一档;正向那条从"抽一个 BMP"改成**清单里四种逐个走一遍**
+——收窄清单的那次改动最容易顺手多砍一个,而少送一种格式的症状是"这张图它就是不看",
+没有任何报错。
+
+`envelope.SUFFIXES` 里的 `image/bmp` **留着**:认得出、存得下,只是不送——这正是
+"认得出 ≠ 送得进"那条分工。
+
+### 二、三个 live 文件,以及一处与预计不符
+
+```
+tests/test_live_vision_injection.py   2 passed
+tests/test_live_finance_boundary.py   4 passed  (121s)
+tests/test_live_finance_skill.py      1 passed  ← **预计是红的**
+```
+
+**`test_live_finance_skill` 没有红,但也不是稳定的绿。** 单次绿正是这个项目最忌讳的
+东西,所以跑了 10 次:
+
+```
+8 passed / 2 failed
+绿:[(5, 'read_skill'), (7, 'record_expense')]   ← 先读总览再记账
+红:[(4, 'record_expense')]                      ← 只记账,没读
+```
+
+失效形态和 M4 记的一模一样(只调 `record_expense`),**但比例反了**:M4 那次是 5/15 ≈ 33%
+读到,现在是 8/10 ≈ 80%。所以 M5-11 的前提要改一句:**它不是"两个模型都不读"的硬红,
+是"新模型上从 33% 提到 80% 的概率问题"**——复核方各跑一次都 FAILED,在 20% 的失败率下
+是会发生的。我这一步只做观测,没碰任何东西(M5-11 是独立一步)。
+
+顺带提一句给 M5-11:M4 当初的结论是「靠 prompt 让模型先读总览不是机制,是概率」。
+这一轮的数字支持那句话——换个模型概率就从 33% 变成 80%,而机制不会随模型变。
+
+### 三、`.env.example` 也换了,但 `LARARIUM_VISION` 仍然默认关
+
+模型换成能读图的那个,注释里写了为什么(顺带记下实测:输出 357 vs 242 token/轮、
+缓存 93.4% vs 94.9%,以及它在不可信短信归档那个场景上顶住了)。
+
+**`LARARIUM_VISION` 保持 `off`**,理由写进注释:上面那个默认模型确实能读图,改成 on
+就直接生效——但不想让"复制一份 `.env.example`"这个动作**顺带把一个注入面打开**。
+这是我的判断,不是任务书要求的;你要改成 on 说一声。
+
+服务器上的 `LARARIUM_MODEL` 我没碰(`.env` 不进仓库)。
+
+**门禁**:502 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。
