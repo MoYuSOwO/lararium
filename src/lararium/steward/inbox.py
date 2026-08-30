@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
+from lararium.db import transaction
 from lararium.envelope import Envelope
 
 
@@ -54,29 +55,27 @@ class Inbox:
         return cur.rowcount == 1
 
     def claim_next(self) -> Envelope | None:
-        """严格串行:任一时刻最多一条 processing。"""
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        """严格串行:任一时刻最多一条 processing。
+
+        M5-8:BEGIN/COMMIT/ROLLBACK 不再手写,交给 `transaction(immediate=True)`
+        ——它顺带**整块持锁**,而手写那版只锁得住单条语句,另一个线程能挤进
+        「读了再改」的中间。回滚也不用自己写了。
+        """
+        with transaction(self._conn, immediate=True):
             in_flight = self._conn.execute(
                 "SELECT COUNT(*) FROM inbox WHERE state='processing'"
             ).fetchone()[0]
             if in_flight:
-                self._conn.execute("COMMIT")
                 return None
             row = self._conn.execute(
                 "SELECT * FROM inbox WHERE state='pending' ORDER BY ts, rowid LIMIT 1"
             ).fetchone()
             if row is None:
-                self._conn.execute("COMMIT")
                 return None
             self._conn.execute(
                 "UPDATE inbox SET state='processing', claimed_at=?, attempts=attempts+1 WHERE id=?",
                 (_now(), row["id"]),
             )
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return Envelope(
             id=row["id"],
             source=row["source"],
@@ -123,8 +122,7 @@ class Inbox:
         只应在启动时调用一次。同时跑两个 Steward 会互相抢活——本系统按设计
         只有一个,这也是"严格串行"成立的前提。
         """
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
+        with transaction(self._conn, immediate=True):
             abandoned = self._conn.execute(
                 "UPDATE inbox SET state='failed', error=?, completed_at=? "
                 "WHERE state='processing' AND attempts >= ?",
@@ -133,8 +131,4 @@ class Inbox:
             requeued = self._conn.execute(
                 "UPDATE inbox SET state='pending', claimed_at=NULL WHERE state='processing'"
             ).rowcount
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
         return requeued, abandoned

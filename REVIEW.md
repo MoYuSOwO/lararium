@@ -9061,3 +9061,113 @@ WAV 伪装 → 「系统存下来了但格式识别不出来,看着像是一份�
   "本会话见过的名单",那份名单要从起居注扫。
 - 语音不转码、图片不按分辨率压缩——吃 token 目前只靠张数上限管。
 - `SENDABLE_IMAGE_TYPES` 是按**当前服务商**实测定的。换端点要重测,这一行就是那个开关。
+
+
+## M5-8:一条 sqlite 连接被并发使用 —— 待验收
+
+### 一、Step 1 复现(纪律那一步,跑了三遍)
+
+```
+第 1 遍  并行 2 → 0 失败;并行 3 → 4 失败;并行 4 → 6 失败
+第 2 遍  并行 2 → 0 失败;并行 3 → 5 失败;并行 4 → 7 失败
+第 3 遍  并行 2 → 0 失败;并行 3 → 4 失败;并行 4 → 2 失败
+   TypeError: 'NoneType' object is not subscriptable
+   InterfaceError: bad parameter or other API misuse
+   IndexError: tuple index out of range
+```
+
+三种面孔全出现了,概率性,并行度越高越容易撞上。
+
+### 二、修法:一把可重入锁,粒度是「一个事务」
+
+`GuardedConnection(sqlite3.Connection)`,所有对底层连接的调用都从**唯一的临界区**
+`_guarded()` 过。三条约束逐条对上:
+
+| 约束 | 怎么满足的 |
+|---|---|
+| `inbox.conn is outbox.conn` 不能破 | 不动连接数,只加锁。"每线程一条连接"直接违反它,没走 |
+| 不能和可重入的 `transaction()` 死锁 | `RLock`;`transaction()` **整块持锁**,块内的 execute 是同一线程的重入 |
+| `check_same_thread=False` 要留着 | 留着。工具**在工作线程里跑**没问题,有问题的是**同时**跑——这两件事不是一回事 |
+
+**粒度必须是事务不是语句**:只锁单条的话,另一个线程能挤进 BEGIN 和 COMMIT 之间
+——它的写入掉进别人的事务里,而且它自己那句 `BEGIN` 会报
+`cannot start a transaction within a transaction`。有测试钉着。
+
+**行必须在临界区里取干净**(`_Rows`)。锁在 `execute` 返回时就放了,而 `fetchone()`
+还没跑——交出一个活游标只是把洞挪个位置,两个线程各拿一个游标交错 step 同一条连接,
+`InterfaceError: bad parameter` 正是这么来的。代价说清楚:每条 SELECT 整份进内存。
+本仓库所有查询本来就带 LIMIT 或按信封取,而且几乎全都已经在调 `fetchall()`
+——真正变的只是"什么时候取",不是"取多少"。
+
+顺带把 `inbox` 里手写的 `BEGIN IMMEDIATE / COMMIT / ROLLBACK` 换成
+`transaction(immediate=True)`:手写那版只锁得住单条语句,而它恰恰是"读了再改"。
+
+### 三、**范围比任务书大:bundle 的库是同一个洞**
+
+`bundles/memory/server.py` 和 `bundles/finance/server.py` 各自 `sqlite3.connect(...
+check_same_thread=False)`,一模一样的假设,面对的是**同一个线程池**。
+模型一口气报三笔就是三个并发的 `record_expense`;两条事实就是两个并发的 `propose_fact`。
+两个 bundle 都改走 `db.open_connection`(只 import `lararium.db` 这个基础设施,
+没碰 steward/gateway,契约照旧 4 kept)。
+
+实测对比(每档 20 轮):
+
+```
+                        有锁(现在)      无锁(修之前)
+finance 并发记账 ×4      80 成功 0 失败   80 成功 0 失败
+finance 记账+查询 ×4     80 成功 0 失败   80 成功 0 失败
+memory 并发提案 ×4       80 成功 0 失败   65 成功 15 失败
+```
+
+**memory 那一栏是这次最该看的东西**,它的失败长这样:
+
+```
+KeyError: '提案不存在: f137ec03d1e447a9b510feb141641621'   ← 11 次
+InterfaceError: bad parameter or other API misuse
+TypeError: 'NoneType' object is not subscriptable
+```
+
+`propose_fact` 写进去了,转头读不回来。这不是一条崩溃栈——**它是账本唯一写入路径上的
+数据面失败,而它的面孔是"提案不存在"**。真机上用户看到的会是「我记下了」之后那条提案
+凭空消失,查都没处查。这条任务书没点到,我是照着"同一个假设写在三处"顺出来的。
+
+### 四、测试钉机制,不钉崩溃
+
+复现是概率性的,直接搬进 pytest 就是一条随机红的测试。所以钉的是不变量:
+
+1. `test_no_two_threads_are_ever_inside_the_connection` —— 探针重写 `_guarded`,
+   在**真正的临界区之内**数人头,断言 `max_inside == 1`。
+   探针落在锁里面是有讲究的:落在外面的话,等锁的线程也算"在里面",是假阳性;
+   而探针自己再上一把锁的话,产品里的锁删了它也照样绿,是**自己给自己站岗**。
+   `max_queued >= 2` 是阳性对照——证明真有多个线程在抢,少了它 `max_inside == 1`
+   可能只是因为压根没并发过(T6 第三种)。四个线程用 `Barrier` 卡齐再开工,不靠调度运气。
+2. `test_a_transaction_holds_the_connection_for_the_whole_block` —— 事务块中间
+   另一个线程插不进来,`order == ["inside", "outsider"]`。
+3. `test_execute_hands_back_rows_not_a_live_cursor` —— 不许把活游标交出去。
+4. `test_claiming_takes_the_write_lock_up_front` —— 认领仍是 `BEGIN IMMEDIATE`。
+   这条**没有别的可观测面**(连接内的并发已经被锁挡住,IMMEDIATE 防的是别的进程),
+   所以钉的是发出去的那句 SQL——和"原子写只能钉 fsync+rename"是同一种 T1 例外。
+
+`db.py` 那段错了五个里程碑的注释改掉了,`GuardedConnection` 的 docstring 里把
+"为什么那句话是错的"写清楚了:**「一轮在跑」不等于「一个数据库调用在跑」**。
+
+### 五、变异 6 条,6 条被咬住
+
+临界区不上锁 / 事务不整块持锁 / execute 不走临界区 / 行不在临界区里取干净 /
+认领不再 BEGIN IMMEDIATE / bundle 退回裸连接。
+
+**其中两条第一轮存活,都是我漏了断言,不是变异不成立**:"把真游标交出去"和
+"认领不再 IMMEDIATE"——前者是我自己说 `_Rows` 存在的理由,却没为它写测试;后者
+被我在重构里顺手保住了,但没人钉。补了 3、4 两条之后都咬住了。
+
+### 六、没做的
+
+- **`transaction()` 收到裸 `sqlite3.Connection` 时不上锁**(老测试/外部代码可能这么用),
+  这一支不报错也不假装安全,写在 `_hold` 的 docstring 里。想更硬就得在 `transaction()`
+  里拒绝裸连接,那会牵动一批测试,单独一步更干净。
+- **跨连接的锁顺序没有约束**。今天不会死锁:工具执行与起居注写入是先后不是嵌套,
+  没有任何一处在持 A 连接的锁时去拿 B 连接的锁。哪天有了就要定顺序,登记在此。
+
+**门禁**:490 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。
+CHANGELOG 那行按仓库规矩等验收通过再追(任务书 Step 4 写了 CHANGELOG,但 AGENTS.md
+的规矩是"验收通过后立刻追加",上一轮你也是这么排的)。

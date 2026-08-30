@@ -1,4 +1,3 @@
-import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
@@ -6,15 +5,16 @@ from fastmcp import FastMCP
 
 from bundles.memory.gate import Gate
 from bundles.memory.ledger import Ledger, memory_schema
+from lararium.db import open_connection
 
 
 def build_memory_components(data_dir: Path) -> tuple[Ledger, Gate]:
     root = Path(data_dir) / "memory"
     root.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False 的理由同 lararium.db.connect():工具函数跑在线程池里
-    conn = sqlite3.connect(root / "memory.sqlite", isolation_level=None, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # M2 拆容器后会有多个连接
+    # M5-8:走 `open_connection` 而不是裸 sqlite3——**bundle 的库面对的是同一个线程池、
+    # 同一个洞**。一条 assistant 消息里两个 `propose_fact` 并发跑,这条连接照样会烂。
+    # 只 import `lararium.db`(基础设施),没碰 steward/gateway,契约照旧。
+    conn = open_connection(root / "memory.sqlite")
     conn.executescript(memory_schema())
     ledger = Ledger(root / "ledger.md", conn)
     ledger.ensure_initialized()  # 唯一允许新建账本文件的地方:启动时

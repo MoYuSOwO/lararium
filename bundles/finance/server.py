@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from fastmcp import FastMCP
 
 from bundles.runtime import BundleRuntime
+from lararium.db import open_connection
 
 # 固定类目,不是自由文本:模型每次发明一个新词(「吃饭」「餐饮」「外卖」各记一笔),
 # M4-3 的 GROUP BY 就聚不出东西来。顺序即 E2 提示里列出的顺序,保持稳定。
@@ -136,10 +137,9 @@ CREATE INDEX IF NOT EXISTS idx_expenses_occurred_at ON expenses(occurred_at);
 def _connect(root: Path) -> sqlite3.Connection:
     """finance 独占自己的库(§5 数据产权):只碰 data_dir/finance/finance.sqlite。"""
     root.mkdir(parents=True, exist_ok=True)
-    # check_same_thread=False 的理由同 memory:工具函数跑在框架的线程池里
-    conn = sqlite3.connect(root / "finance.sqlite", isolation_level=None, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # M5-8:走 `open_connection` 而不是裸 sqlite3——**bundle 的库面对的是同一个线程池、
+    # 同一个洞**。模型一口气报三笔,三个 `record_expense` 并发跑,这条连接照样会烂。
+    conn = open_connection(root / "finance.sqlite")
     conn.executescript(_FINANCE_SCHEMA)
     return conn
 

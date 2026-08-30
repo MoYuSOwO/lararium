@@ -1,8 +1,10 @@
 import logging
 import sqlite3
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("lararium")
 
@@ -163,21 +165,128 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
 
 
-def connect(path: Path) -> sqlite3.Connection:
+class _Rows:
+    """`GuardedConnection.execute` 的返回值:**行已经在手里了**。
+
+    为什么不能把真游标交出去:锁一旦在 `execute` 返回时释放,`fetchone()` 还没跑呢
+    ——两个线程各拿一个游标交错地 step 同一条连接,烂的正是这个。所以临界区必须
+    从 execute 一直盖到行取完,而那意味着行要在临界区里取干净。
+
+    代价说清楚:每条 SELECT 都会整份进内存。本仓库所有查询本来就带 LIMIT 或按信封
+    取,而且几乎全都已经在调 `fetchall()`——真正变化的只是"什么时候取",不是"取多少"。
+    """
+
+    __slots__ = ("_rows", "description", "lastrowid", "rowcount")
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self.rowcount = cursor.rowcount
+        self.lastrowid = cursor.lastrowid
+        self.description = cursor.description
+        # DDL/PRAGMA 之类没有结果集,fetchall 在某些语句上会抛——取不到就是没有
+        try:
+            self._rows = cursor.fetchall()
+        except sqlite3.Error:
+            self._rows = []
+
+    def fetchone(self) -> Any:
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self) -> list[Any]:
+        rows, self._rows = self._rows, []
+        return rows
+
+    def fetchmany(self, size: int = 1) -> list[Any]:
+        head, self._rows = self._rows[:size], self._rows[size:]
+        return head
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.fetchall())
+
+
+class GuardedConnection(sqlite3.Connection):
+    """一条**被串行化**的 sqlite 连接。
+
+    ## 为什么需要它(M5-8,线上 bug)
+
+    这里原来写着"安全性由架构保证——收件箱严格串行,任一时刻只有一轮在跑,不存在真正
+    的并发访问"。**那句话是错的**,而且错了五个里程碑没人碰到。
+
+    「一轮在跑」不等于「一个数据库调用在跑」:pydantic-ai 把**同步**工具函数丢进线程池,
+    而一条 assistant 消息里的多个 `tool_call` 是**并发执行**的。`check_same_thread=False`
+    关掉的只是那个守卫,**不是让连接变线程安全**——两个线程交错 execute/fetch,
+    pysqlite 的游标与语句缓存就烂了,表现是三种毫不相干的面孔:
+
+        IndexError: tuple index out of range
+        InterfaceError: bad parameter or other API misuse
+        TypeError: 'NoneType' object is not subscriptable
+
+    真机上是这一轮变 retry_later、重试到上限、用户收到「处理失败,已放弃」,
+    而起居注里只有一行指不到任何地方的 TypeError。mimo 一次只发一个调用所以躺着没事,
+    DeepSeek 会批量发,一试就炸——**这不是某个服务商的问题**,是这条连接的问题。
+
+    ## 为什么是"一把锁",不是"一线程一连接"
+
+    `loop.py` 要求 `inbox.conn is outbox.conn`:回复落出件箱与信封标完成必须在同一个
+    事务里(崩在中间会重复回复)。每线程一条连接就直接把那个不变量拆了。
+    而 `check_same_thread=False` 仍然要留着——工具**在工作线程里跑**没问题,
+    有问题的是**同时**跑;改回 True 会让所有工具调用当场抛。
+
+    ## 粒度是"一个事务",不是"一条语句"
+
+    锁是可重入的(`RLock`),`transaction()` 在整个 with 块期间持有它。只锁单条语句的话,
+    另一个线程能挤进 BEGIN 和 COMMIT 之间——它的写入会掉进别人的事务里,而且它自己的
+    `BEGIN` 会直接报 "cannot start a transaction within a transaction"。
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # 可重入:同一线程里 transaction() 持锁期间照样能 execute。
+        self.lock = threading.RLock()
+
+    def _guarded(self, call: Callable[[], sqlite3.Cursor]) -> _Rows:
+        """**唯一的临界区**,所有对底层连接的调用都从这里过。
+
+        收成一个方法而不是每个 execute 各写一遍 `with`:一是漏一处就等于没有,
+        二是它给出了一个可检查的点——测试重写它,就能断言"任一时刻只有一个线程在里面"。
+        散开写的话,没有任何一个地方能被检查。
+        """
+        with self.lock:
+            return _Rows(call())
+
+    def execute(self, sql: str, parameters: Any = (), /) -> Any:
+        return self._guarded(lambda: super(GuardedConnection, self).execute(sql, parameters))
+
+    def executemany(self, sql: str, parameters: Any, /) -> Any:
+        return self._guarded(lambda: super(GuardedConnection, self).executemany(sql, parameters))
+
+    def executescript(self, sql_script: str, /) -> Any:
+        return self._guarded(lambda: super(GuardedConnection, self).executescript(sql_script))
+
+
+def open_connection(path: Path) -> GuardedConnection:
+    """建一条被串行化的连接(不建表)。**每个拥有自己库的模块都该走这里**——
+    bundle 的库和 Steward 的库面对的是同一个线程池,同一个洞。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        path, isolation_level=None, check_same_thread=False, factory=GuardedConnection
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def connect(path: Path) -> GuardedConnection:
     """isolation_level=None:自己管事务,claim 要用 BEGIN IMMEDIATE。
 
     check_same_thread=False:FastMCP 和 Pydantic AI 都把**同步**工具函数丢进线程池执行,
     而连接是在主线程建的。不关掉这个检查,任何碰数据库的工具调用都会抛
-    ProgrammingError。安全性由架构保证——收件箱严格串行,任一时刻只有一轮在跑,
-    不存在真正的并发访问。
+    ProgrammingError。**线程安全不靠这个开关,靠 `GuardedConnection` 的那把锁**
+    ——见它的 docstring:原来写在这里的"架构保证不存在并发访问"是错的。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = open_connection(path)
     # M3-4:vec0 是 sqlite-vec 的扩展,vec 虚拟表必须扩展就绪才建。扩展加载失败
     # 只影响语义检索,不拦启动——SCHEMA 里不建 vec 表,词法路照常(M3-4 补做)。
     vec_ok = _load_vec_extension(conn)
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA + (_VEC_SCHEMA if vec_ok else ""))
     _add_missing_columns(conn)
@@ -189,13 +298,36 @@ _NESTED_SAVEPOINT = "lararium_nested"
 
 
 @contextmanager
-def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+def transaction(conn: sqlite3.Connection, *, immediate: bool = False) -> Iterator[Any]:
     """显式事务:with 块内**同一连接**的语句原子化,异常自动回滚。
 
     isolation_level=None 下每个 execute 各自自动提交,跨对象的"一起成、一起不成"
     必须显式 BEGIN/COMMIT。调用方别再伸手拿各对象的 _conn 去拼(违反 S3),把
     一个共享连接交给它即可。
+
+    **整块持锁**(M5-8):粒度是"一个事务"不是"一条语句"——只锁单条的话,另一个线程
+    能挤进 BEGIN 和 COMMIT 之间。锁是可重入的,所以块内的 execute 不会自己卡住自己。
+
+    `immediate=True` 用 `BEGIN IMMEDIATE`:一上来就拿写锁,给"读了再改"的临界区用
+    (收件箱认领、启动时回收)。嵌套那一支用 SAVEPOINT,谈不上 immediate,忽略它。
     """
+    with _hold(conn):
+        yield from _transaction(conn, immediate)
+
+
+@contextmanager
+def _hold(conn: sqlite3.Connection) -> Iterator[None]:
+    """整个事务期间持有这条连接的锁。裸 sqlite3.Connection(老测试/外部代码)没有锁,
+    那就什么都不做——**不假装它安全**,只是不在这里报错。"""
+    lock = getattr(conn, "lock", None)
+    if lock is None:
+        yield
+        return
+    with lock:
+        yield
+
+
+def _transaction(conn: sqlite3.Connection, immediate: bool) -> Iterator[Any]:
     if conn.in_transaction:
         # **可重入**:已经在事务里就开一个 SAVEPOINT(SQLite 不许嵌套 BEGIN)。
         #
@@ -217,7 +349,7 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
             conn.execute(f"RELEASE {_NESTED_SAVEPOINT}")
             raise
         return
-    conn.execute("BEGIN")
+    conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield conn
         conn.execute("COMMIT")
