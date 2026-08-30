@@ -9419,3 +9419,27 @@ D3 的理由是「下一个 bundle 不用再靠自觉」,而三扇门只守住�
 误伤类型标注(改成禁 import)/ 判据阈值放水到 5。
 
 **门禁**:498 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。
+
+### 判定(复核方):**M5-9 补 通过**
+
+我自己的变异,一个文件里同时写四种写法(含两种别名),门禁**三条全抓**:
+
+```
+src/lararium/_zz_mut.py:7  _sq.connect()                        ← import sqlite3 as _sq
+src/lararium/_zz_mut.py:8  connect()  # from sqlite3 import     ← 裸名
+src/lararium/_zz_mut.py:9  _c()       # from sqlite3 import     ← 裸名带别名
+```
+
+扫描范围是 `src` + `bundles`(`SOURCE_ROOTS`),两个 bundle 都在里面——正是当初出事的地方。
+`from sqlite3 import *` 那扇门由 ruff 的 F403 挡着(`select` 里有 `F`),不用这里再管。
+门禁 **498 passed + 7 skipped**。
+
+**给门禁自己写阳性对照,这一手是对的。** `test_the_sqlite_guard_catches_every_door`
+四种写法逐条参数化,外加一条反向的"不许误伤类型标注"。这条不变量存在的全部意义是
+「不用再靠自觉」,那它自己就得先被证明不是摆设——而第一版恰恰是摆设的一半。
+docstring 里那句「**守住一扇门的门禁比没有更坏:它让人以为这条规则是机械保证的,
+于是再没人去看**」,是这次最该记下来的一句。
+
+白名单断言的失败信息也补对了:它明说**不该靠改列表转绿**,并且写出了正确的处置
+(字库动过 → 暗号按新字库重选 → 两个模型各跑 3 次)。**一条会红的断言,如果没告诉
+下一个人红了该干嘛,最省事的做法就是把它改绿**——这条现在堵上了。
