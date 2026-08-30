@@ -9379,3 +9379,43 @@ D3 的理由是「下一个 bundle 不用再靠自觉」,而三扇门只守住�
 顺带:`assert sorted(...) == ["4","J","K","X","Y"]` 那条**没有失败信息**。字库以后加一个
 字形它就会红,而下一个人最省事的做法是把列表改成新的、让它变绿——那正好是这条断言要防的。
 加一句话说明它为什么该红(字库变了,暗号的选择必须重做一遍)。
+
+
+## M5-9 补:门禁自己只守住了一扇门 —— 待验收
+
+打回的判定我接,而且这条比它看起来严重:**守住一扇门的门禁比没有更坏**——它让人以为
+这条规则是机械保证的,于是再没人去看。D3 那句"下一个 bundle 不用再靠自觉",在补之前
+是句空话。
+
+我先照复核方的做法把洞复现了(纪律那一步):往 `src/` 放一个同时写
+`import sqlite3 as _sq` 与 `from sqlite3 import connect as _c`、两种都调用的文件,
+`test_only_db_opens_a_sqlite_connection` **一声不响地通过**。
+
+补法照建议:`import sqlite3 as X` 把 X 记下来一起判;`from sqlite3 import connect [as Y]`
+里的名字当裸函数判。**没有**改成"禁止 import sqlite3"——`sqlite3.Connection` /
+`sqlite3.Row` 到处在做类型标注,那样会误伤一大片;认的是**调用**不是 import。
+
+### 给门禁自己配了阳性对照
+
+检测逻辑抽成 `_sqlite_connect_calls(tree)`,然后:
+
+- `test_the_sqlite_guard_catches_every_door` —— 四种写法(裸 / 模块别名 / from-import /
+  from-import 别名)逐个喂进去,**一个都不许漏**;
+- `test_the_sqlite_guard_does_not_fire_on_type_annotations` —— 反向:类型标注不许误伤。
+
+这两条是"别让断言变成空话"用在门禁身上:门禁本身也是代码,它退化了同样没人会发现。
+
+### 判据那条断言补了失败信息
+
+`assert sorted(...) == ["4","J","K","X","Y"]` 现在带一句:
+
+> 白名单变了。**它该红,而且不该靠改这个列表转绿**——字库动过就意味着「哪些字符
+> 认得牢」整个变了:`CANARY` 必须按新字库重选一遍,并且重新拿两个模型各跑 3 次
+> (M5-9 的验收口径)。把列表改成新的让它变绿,正好是这条断言要防的那件事。
+
+### 变异 5 条,5 条被咬住
+
+别名那扇门不认 / from-import 那扇门不认 / from-import 的别名不认 /
+误伤类型标注(改成禁 import)/ 判据阈值放水到 5。
+
+**门禁**:498 passed + 7 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。

@@ -170,6 +170,14 @@ def test_only_db_opens_a_sqlite_connection() -> None:
 
     那两处当时不是谁偷懒,是这条规则还没写下来——所以它现在既在 CONVENTIONS 里,
     也在这里钉着:下一个 bundle 不用再靠自觉。
+
+    **三扇门都要守。** 第一版只认字面的 `sqlite3.connect(...)`,而
+    `import sqlite3 as _sq` 和 `from sqlite3 import connect` 从旁边大摇大摆走过去
+    ——实测两种写法同时出现,测试一声不响地通过。守住一扇门的门禁比没有更坏:
+    它让人以为这条规则是机械保证的。
+
+    **不能改成"禁止 import sqlite3"**:`sqlite3.Connection` / `sqlite3.Row` 到处在做
+    类型标注,那样会误伤一大片。要认的是**调用**,不是 import。
     """
     allowed = {Path("src/lararium/db.py")}  # 唯一允许建连接的地方,那把锁在它手里
     offenders: list[str] = []
@@ -178,20 +186,69 @@ def test_only_db_opens_a_sqlite_connection() -> None:
         if path in allowed:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "connect"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "sqlite3"
-            ):
-                offenders.append(f"{path}:{node.lineno} sqlite3.connect()")
+        offenders.extend(f"{path}:{where}" for where in _sqlite_connect_calls(tree))
 
     assert offenders == [], (
         f"这些地方自己建了 sqlite 连接,绕过了 db 里那把串行化的锁:{offenders}。"
         "走 db.connect(Steward 的库,含建表)或 db.open_connection(自己有库的模块)。"
     )
+
+
+def _sqlite_connect_calls(tree: ast.AST) -> list[str]:
+    """一个文件里所有"自己建 sqlite 连接"的地方。**三扇门一起认。**
+
+    别名要跟着记,否则 `import sqlite3 as _sq` 就是一扇没人看的门。
+    """
+    modules: set[str] = set()
+    bare: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(a.asname or a.name for a in node.names if a.name == "sqlite3")
+        elif isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+            bare.update(a.asname or a.name for a in node.names if a.name == "connect")
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "connect"
+            and isinstance(func.value, ast.Name)
+            and func.value.id in modules
+        ):
+            found.append(f"{node.lineno} {func.value.id}.connect()")
+        elif isinstance(func, ast.Name) and func.id in bare:
+            found.append(f"{node.lineno} {func.id}()  # from sqlite3 import connect")
+    return found
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import sqlite3\nsqlite3.connect('x')",
+        "import sqlite3 as _sq\n_sq.connect('x')",
+        "from sqlite3 import connect\nconnect('x')",
+        "from sqlite3 import connect as _c\n_c('x')",
+    ],
+)
+def test_the_sqlite_guard_catches_every_door(source: str) -> None:
+    """★ 给门禁自己的阳性对照:**四种写法一个都不许漏。**
+
+    第一版只认字面的 `sqlite3.connect(...)`,而别名与 `from ... import` 从旁边走过去
+    ——实测两种同时出现,门禁一声不响地通过。**守住一扇门的门禁比没有更坏**:
+    它让人以为这条规则是机械保证的,于是再没人去看。
+    """
+    assert _sqlite_connect_calls(ast.parse(source)), f"这扇门没守住:{source!r}"
+
+
+def test_the_sqlite_guard_does_not_fire_on_type_annotations() -> None:
+    """反向:不许误伤。`sqlite3.Connection` / `sqlite3.Row` 到处在做类型标注,
+    所以认的是**调用**不是 import——改成"禁止 import sqlite3"会一片红。"""
+    source = "import sqlite3\ndef f(c: sqlite3.Connection) -> sqlite3.Row: ...\nx = sqlite3.Row"
+
+    assert _sqlite_connect_calls(ast.parse(source)) == []
 
 
 def test_assembler_never_reads_the_clock() -> None:
