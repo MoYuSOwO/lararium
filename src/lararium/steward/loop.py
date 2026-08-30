@@ -32,6 +32,11 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+# 领域工具被拦下时回给模型的话。**要能照着做**:说清楚缺什么、怎么补、以及这不是建议。
+# 短是有理由的——它会进 L0(工具结果上限 200 字符),而它只是一次路由提示,不是内容。
+SKILL_GATE_HINT = '还没读 {bundle} 的方法说明。先调 read_skill("{bundle}") 看完总览,再调这个工具。'
+
+
 # L0 预算里给"工具 schema + 输出窗口"的固定留白(token)。工具 schema 实测约
 # 500/请求;输出要占窗口,单用户交互给足 8000。M3-6 的低水位也要继承这个估算口径。
 L0_RESERVE = 8000
@@ -90,6 +95,9 @@ class Steward:
         self._resume_consumed: list[bool] = []
         self._resume_cursor = 0
         self._active_envelope_id = ""
+        # M5-11 技能路由守卫:本轮已读过总览的 bundle,以及已经提醒过一次的 bundle。
+        self._overview_read: set[str] = set()
+        self._skill_nudged: set[str] = set()
         self.tools = BuiltinTools(
             journal,
             registry,
@@ -111,13 +119,75 @@ class Steward:
         - M4-5d:**所有**工具再包一层断点续跑。放最外层是必须的——回放时连内层的
           propose 守卫都不该走到,因为那次调用这一轮压根没发生。
         """
-        tools = list(self.tools.as_tool_functions())
+        owners = self.registry.tool_owners()
+        tools = [
+            self._note_overview_read(t) if getattr(t, "__name__", "") == "read_skill" else t
+            for t in self.tools.as_tool_functions()
+        ]
         for t in self.bundle_tools:
-            if getattr(t, "__name__", "") == "propose_fact":
-                tools.append(self._guard_propose_fact(t))
-            else:
-                tools.append(t)
+            name = getattr(t, "__name__", "")
+            if name == "propose_fact":
+                t = self._guard_propose_fact(t)
+            if name in owners:
+                t = self._require_overview(t, owners[name])
+            tools.append(t)
         return [self._resumable(t) for t in tools]
+
+    def _note_overview_read(self, original: Callable[..., str]) -> Callable[..., str]:
+        """记下"这一轮读过谁的总览"。**只认总览**(不带 skill 名那一次)。
+
+        读了 `monthly-review` 不等于读了总览:总览里装的是路由与边界(哪笔走哪个工具、
+        流水不进账本),具体方法篇里没有。
+        """
+
+        @functools.wraps(original)
+        def noting(bundle: str, skill: str | None = None) -> str:
+            result = original(bundle, skill)
+            if skill is None and not result.startswith("读取失败"):
+                self._overview_read.add(bundle)
+            return result
+
+        return noting
+
+    def _require_overview(self, original: Callable[..., Any], bundle: str) -> Callable[..., Any]:
+        """领域工具第一次被调用前,**该领域的总览必须已经进过本轮上下文**。
+
+        为什么要有这条机制(M5-11 实测):提示词里那条纪律写得已经够硬了
+        ——「动手做某个领域的事之前**包括调它的工具**,先 read_skill 读总览」
+        ——而实测 mimo **0/25**、deepseek **9/25**。**提示不是机制,是概率**,
+        而且概率会随模型、随纪律列表变长而漂。这里把它变成一条真路径。
+
+        **只拦一次,然后放行**(`_skill_nudged`)。拦到底的话,一个不听劝的模型会把
+        "记了账但没读方法"变成"根本没记账"——那是把一个轻的失效换成一个重的:
+        用户说了一笔,账上什么都没有,而他不会再说第二遍。提醒过就放行,并且留痕。
+        """
+
+        @functools.wraps(original)
+        def gated(*args: Any, **kwargs: Any) -> Any:
+            if bundle not in self._overview_read:
+                unread_twice = bundle in self._skill_nudged
+                self._journal_skill_gate(bundle, getattr(original, "__name__", ""), unread_twice)
+                if not unread_twice:
+                    self._skill_nudged.add(bundle)
+                    return SKILL_GATE_HINT.format(bundle=bundle)
+            return original(*args, **kwargs)
+
+        return gated
+
+    def _journal_skill_gate(self, bundle: str, tool: str, passed_unread: bool) -> None:
+        """留痕。**"提醒之后还是没读就放行"这一支必须查得到**——它是这条机制的漏水口,
+        真机上漏了多少只能靠数据说话,不能靠印象。"""
+        if not self._active_envelope_id:
+            return
+        self.journal.append(
+            self._active_envelope_id,
+            "skill_gate",
+            {
+                "bundle": bundle,
+                "tool": tool,
+                "action": "passed_unread" if passed_unread else "nudged",
+            },
+        )
 
     def _resumable(self, original: Callable[..., Any]) -> Callable[..., Any]:
         """重试时按顺序回放上一次已成功的调用,只从断点之后开始真执行(M4-5d)。
@@ -256,6 +326,10 @@ class Steward:
         self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
+        # 路由守卫是**每轮**的:上一轮读过不算数(纪律原话是"没在当前对话里读过正文,
+        # 不许照着干活",而且压缩会把读过的那段冲掉——重读几乎不花钱)。
+        self._overview_read = set()
+        self._skill_nudged = set()
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。

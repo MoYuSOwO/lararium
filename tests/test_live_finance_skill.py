@@ -8,15 +8,20 @@ M2/M3 审计九条里有六条是同一个毛病——防护存在,但没人真�
 证据要取模型**实收的那一份**(不可协商第 3 条),也就是起居注里那条 `tool_result`
 事件的正文——它就是框架回灌进对话历史、模型据以作答的字节。
 
-**这条现在是红的,而且是故意留红的。** 2026-08-21 实测(mimo-v2.5,每档 5 次):
+**它曾经是红的,而且红了一整个里程碑。** 2026-08-21(mimo-v2.5,每档 5 次)合计
+5/15 ≈ 33%;M5-11 重新量准(每个模型 25 次)更难看:**mimo 0/25、deepseek 9/25**。
+也就是说**靠 prompt 让模型先读总览不是机制,是概率**——而且概率会随模型漂,
+还会随纪律列表变长被挤掉。
 
-    M4-1 原版 persona                     1/5 读了总览
-    M4-2 新版 persona(先读总览再动手)   2/5
-    新版 persona + 目录行加"用前先 read_skill"  2/5
+M4 当时就写下了正确的改法:**给一条强制路径,不是放松断言**。M5-11 把它做了
+——`Steward._require_overview`:领域工具第一次被调用前,该领域总览必须已经进过本轮
+上下文,否则第一次调用只拿到一句可照做的提示、**不产生任何副作用**。
 
-三档在 n=5 下无法区分,合计 5/15 ≈ 33%。也就是说**靠 prompt 让模型先读总览不是机制**,
-是概率。它红着,是因为 M4-1 验收登记一的条件("证明那段正文进了模型上下文")确实还没
-兑现——把它改绿的正确方式是给一条强制路径,不是放松断言。详见 REVIEW.md M4-2 登记。
+**判据随之改了一处,理由要说清楚**:原来比的是"读总览"和"第一次调 record_expense"
+的先后。守卫上线后,被拦下的那一次**什么都没记**——拿它当"记账"来比,会把
+「拦下 → 去读 → 再记」这条守卫正常工作的路径判成失败。所以现在比的是**真正生效的
+那一次**(结果不是那句提示的那次)。这不是放松:要证的一直是"正文早于账真的落库",
+被拦下的那次不是落库。
 
 跑法(默认跳过,不进日常门禁):
 
@@ -72,9 +77,20 @@ async def test_model_reads_the_finance_overview_before_it_records(
         f"本轮工具调用:{calls}"
     )
 
-    record_seqs = [seq for seq, tool in calls if tool == "record_expense"]
-    assert record_seqs, f"模型没记账,这一轮没走到要证的那步。工具调用:{calls}"
-    assert hit[0]["seq"] < record_seqs[0], (
+    # **生效的那次**才算记账:被路由守卫拦下的那次结果是一句提示,库里什么都没多。
+    results = {e["payload"].get("tool_call_id"): e for e in events if e["kind"] == "tool_result"}
+    effective = [
+        e["seq"]
+        for e in events
+        if e["kind"] == "tool_call"
+        and e["payload"].get("tool") == "record_expense"
+        and "read_skill("
+        not in str(
+            results.get(e["payload"].get("tool_call_id"), {}).get("payload", {}).get("content", "")
+        )
+    ]
+    assert effective, f"模型没真记上账,这一轮没走到要证的那步。工具调用:{calls}"
+    assert hit[0]["seq"] < effective[0], (
         "SKILL.md 是在记账**之后**才读的——正文进了上下文,但没能影响这次动作。"
     )
 

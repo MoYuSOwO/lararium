@@ -1,5 +1,6 @@
 """M1 验收:对应 DESIGN §12 的四条标准。"""
 
+import re
 from pathlib import Path
 
 import pytest
@@ -59,9 +60,19 @@ def system(tmp_path, monkeypatch):
 
 
 def call_tool(steward, name: str, *args, **kwargs):
-    """按名字调用挂给模型的真实工具函数(ScriptedModel 不会自己执行工具)。"""
+    """按名字调用挂给模型的真实工具函数(ScriptedModel 不会自己执行工具)。
+
+    M5-11:领域工具第一次被调用前要先读该领域总览(`Steward._require_overview`),
+    拦下时返回的是一句提示而不是执行结果。这里**照提示做一遍**再调
+    ——真模型走的就是这条路,而不是给这条测试开后门。
+    """
     fn = next(f for f in steward.all_tools() if f.__name__ == name)
-    return fn(*args, **kwargs)
+    result = fn(*args, **kwargs)
+    nudged = re.search(r'read_skill\("([a-z0-9_-]+)"\)', str(result))
+    if nudged:
+        next(f for f in steward.all_tools() if f.__name__ == "read_skill")(nudged.group(1))
+        result = fn(*args, **kwargs)
+    return result
 
 
 async def test_acceptance_fact_flows_through_gate_and_takes_effect(system):

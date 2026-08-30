@@ -5,6 +5,7 @@
 `system_prompt` 必须逐字节不动;L0 必须是严格追加。
 """
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -39,6 +40,12 @@ class ScriptedToolModel:
         events = []
         for name, kwargs in self._script.pop(0):
             out = by_name[name](**kwargs)
+            # M5-11:领域工具第一次被调用前要先读总览,被守卫拦下就**照提示做**
+            # ——真模型走的就是这条路。剧本不用改:它描述的还是它要测的那五轮。
+            nudged = re.search(r'read_skill\("([a-z0-9_-]+)"\)', str(out))
+            if nudged:
+                by_name["read_skill"](nudged.group(1))
+                out = by_name[name](**kwargs)
             self.results.append(out)
             events.append({"type": "tool_call", "tool": name, "args": kwargs, "tool_call_id": name})
             events.append(

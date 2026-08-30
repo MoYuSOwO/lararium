@@ -629,6 +629,9 @@ async def test_p0_propose_downgraded_when_round_untrusted(steward_factory):
     落 pending 待审,绝不自动放行;可信轮不受影响。"""
     steward, _ = steward_factory([ModelReply(text="好")])
     propose = next(f for f in steward.all_tools() if f.__name__ == "propose_fact")
+    # M5-11:领域工具第一次被调用前要先读该领域总览,否则第一次调用只会拿到一句提示。
+    # 先读一遍再测降档——这条测的是**降档**,不是路由守卫。
+    next(f for f in steward.all_tools() if f.__name__ == "read_skill")("memory")
 
     steward._active_untrusted = True  # ingest 信封认领后(meta.untrusted)
     result = propose(
@@ -830,3 +833,126 @@ async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, 
     assert steward.journal.last_attempt_tool_results("env-x") == [
         ("current_time", executed[1]["result"])
     ]
+
+
+# ── M5-11 技能路由守卫 ──────────────────────────────────────────────────
+#
+# 这里拿 memory 的 propose_fact 当样本,不是图省事:**它就在账本那条路上**,
+# 而账本是每轮全量注入的前缀区。守卫作用在所有 bundle 工具上(按 manifest 的
+# `tools:` 认领),finance 那边由 test_retry_resume / test_acceptance_m4 覆盖。
+
+
+def tool(steward, name):
+    return next(f for f in steward.all_tools() if f.__name__ == name)
+
+
+ALLERGY = {
+    "kind": "add",
+    "content": "对花生过敏",
+    "provenance": "user_stated",
+    "section": "长期偏好",
+}
+
+
+async def test_a_domain_tool_is_held_until_its_overview_has_been_read(steward_factory):
+    """★ 把「先读总览再动手」从提示变成机制。
+
+    提示词里那条纪律已经写得够硬了(「动手做某个领域的事之前**包括调它的工具**,
+    先 read_skill 读总览」),而实测 mimo **0/25**、deepseek **9/25**
+    ——**提示不是机制,是概率**,而且概率随模型、随纪律列表变长而漂。
+
+    断言两件事:拿到的是提示,而且**副作用没发生**。只断言返回值的话,
+    一个"提示照发、活照干"的实现也能过。
+    """
+    steward, _ = steward_factory()
+    steward._active_envelope_id = "env-1"
+
+    out = tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "read_skill" in out and "memory" in out
+    assert steward.gate.pending() == [] and "花生" not in steward.ledger.read()
+
+
+async def test_the_overview_unlocks_the_domain(steward_factory):
+    """读过总览之后照常执行——守卫是一道门,不是一堵墙。"""
+    steward, _ = steward_factory()
+    steward._active_envelope_id = "env-1"
+    tool(steward, "read_skill")("memory")
+
+    out = tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "read_skill" not in out
+    assert steward.settle_if_needed() == 1 and "花生" in steward.ledger.read()
+
+
+async def test_only_the_overview_counts_not_a_specific_skill(steward_factory):
+    """读 `writing-facts` 不等于读了总览。
+
+    总览里装的是**路由与边界**(哪件事走哪个工具、什么归领域模块),具体方法篇里没有
+    ——认它就等于把守卫要守的那段正文放过去了。
+    """
+    steward, _ = steward_factory()
+    steward._active_envelope_id = "env-1"
+    tool(steward, "read_skill")("memory", "writing-facts")
+
+    assert "read_skill" in tool(steward, "propose_fact")(**ALLERGY)
+
+
+async def test_a_second_call_goes_through_and_leaves_a_trace(steward_factory):
+    """★ **只拦一次,然后放行。**
+
+    拦到底的话,一个不听劝的模型会把"记了但没读方法"变成"根本没记"——那是拿一个轻的
+    失效换一个重的:用户说了一件事,系统里什么都没有,而他不会再说第二遍。
+    放行的那次必须留痕(`skill_gate` 的 `passed_unread`):这是这条机制的漏水口,
+    真机上漏了多少只能靠数据说话,不能靠印象。
+    """
+    steward, _ = steward_factory()
+    steward._active_envelope_id = "env-1"
+    propose = tool(steward, "propose_fact")
+
+    propose(**ALLERGY)  # 被拦下
+    out = propose(**ALLERGY)  # 放行
+
+    assert "read_skill" not in out
+    assert steward.settle_if_needed() == 1, "放行那次没真执行,那就是把轻失效换成了重失效"
+    gates = [e["payload"] for e in steward.journal.replay("env-1") if e["kind"] == "skill_gate"]
+    assert [g["action"] for g in gates] == ["nudged", "passed_unread"]
+    assert all(g["bundle"] == "memory" and g["tool"] == "propose_fact" for g in gates)
+
+
+async def test_built_in_tools_are_never_held(steward_factory):
+    """内置工具不属于任何 bundle,不该被这道门拦——拦了就是把 read_skill 自己也锁在门外。"""
+    steward, _ = steward_factory()
+    steward._active_envelope_id = "env-1"
+
+    assert "+08:00" in tool(steward, "current_time")()
+    assert "核心账本" in tool(steward, "read_skill")("memory")
+
+
+async def test_the_hint_says_exactly_what_to_call(steward_factory):
+    """提示必须是**可照做的**:把该调的那一句原样写进去。
+
+    只说"你还没读方法说明"的话,模型得自己猜 bundle 名怎么拼——而它猜错一次就又是一轮。
+    几个假模型现在正是靠正则从这句话里把 bundle 名抠出来照做的(它们模拟的就是真模型)。
+    """
+    steward, _ = steward_factory()
+    steward._active_envelope_id = "env-1"
+
+    assert 'read_skill("memory")' in tool(steward, "propose_fact")(**ALLERGY)
+
+
+async def test_the_gate_resets_every_turn(steward_factory):
+    """守卫是**每轮**的。
+
+    纪律原话是「没在**当前对话里**读过正文,不许照着干活」,而且压缩会把读过的那段冲掉
+    ——重读几乎不花钱,凭印象干活会出错。
+    """
+    steward, _ = steward_factory([ModelReply(text="好"), ModelReply(text="好")])
+    steward.submit(Envelope.new(source="user", channel="cli", content="第一轮"))
+    await steward.process_next()
+    tool(steward, "read_skill")("memory")
+
+    steward.submit(Envelope.new(source="user", channel="cli", content="第二轮"))
+    await steward.process_next()
+
+    assert "read_skill" in tool(steward, "propose_fact")(**ALLERGY)

@@ -62,6 +62,11 @@ class Registry:
             lines.append(f"- {b.name}:{b.description}{suffix}")
         return "\n".join(lines)
 
+    def tool_owners(self) -> dict[str, str]:
+        """工具名 → 它属于哪个 bundle。manifest 的 `tools:` 本来就是这份映射的出处,
+        路由守卫据此知道"调这个工具之前该读谁的总览"。"""
+        return {tool: b.name for b in self.bundles for tool in b.tools}
+
     def get(self, bundle: str) -> BundleInfo:
         if bundle not in self._by_name:
             raise KeyError(f"没有这个 bundle: {bundle};已注册: {sorted(self._by_name)}")

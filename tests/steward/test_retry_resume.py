@@ -13,6 +13,7 @@ propose 一次,账本两行——而账本是前缀区、每轮全量注入,`max
 去重会把第二笔吃掉。按顺序回放 + 断点续跑没有这个假阳性——有一条反向测试钉住。
 """
 
+import re
 import sqlite3
 from pathlib import Path
 
@@ -51,13 +52,26 @@ class ToolCallingModel:
         events = []
         for name, args, kwargs in calls:
             result = by_name[name](*args, **kwargs)
-            events.append({"type": "tool_call", "tool": name, "args": kwargs, "tool_call_id": name})
-            events.append(
-                {"type": "tool_result", "tool": name, "content": result, "tool_call_id": name}
-            )
+            events.extend(self._record(name, kwargs, result))
+            # M5-11:领域工具第一次被调用前要先读该领域总览,被守卫拦下时**照提示做**
+            # ——真模型走的就是这条路,而这也顺带证明了那句提示是可照做的(它把
+            # 该调什么写在了里面)。剧本本身不用改:每条剧本描述的还是它要测的那件事。
+            nudged = re.search(r'read_skill\("([a-z0-9_-]+)"\)', str(result))
+            if nudged:
+                overview = by_name["read_skill"](nudged.group(1))
+                events.extend(self._record("read_skill", {"bundle": nudged.group(1)}, overview))
+                result = by_name[name](*args, **kwargs)
+                events.extend(self._record(name, kwargs, result))
         if self.attempts in self._fail_on:
             raise ModelCallError("503 假装限流", retryable=True)
         return ModelReply(text="记好了。", tool_events=events)
+
+    @staticmethod
+    def _record(name, kwargs, result):
+        return [
+            {"type": "tool_call", "tool": name, "args": kwargs, "tool_call_id": name},
+            {"type": "tool_result", "tool": name, "content": result, "tool_call_id": name},
+        ]
 
 
 @pytest.fixture
@@ -184,8 +198,15 @@ async def test_execution_is_journalled_even_when_the_turn_fails(system, tmp_path
     await steward.process_next()
 
     executed = [e for e in steward.journal.replay(env.id) if e["kind"] == "tool_executed"]
-    assert [e["payload"]["tool"] for e in executed] == ["record_expense"]
-    assert executed[0]["payload"]["replayed"] is False
+    # M5-11 之后这一轮是三步:record_expense 被路由守卫拦下一次(结果是那句提示,
+    # 照样落 tool_executed——**副作用没发生,但"调过"这件事发生了**)、read_skill、
+    # 再调一次 record_expense。三条都要在,少一条就说明失败轮的记录又漏了。
+    assert [e["payload"]["tool"] for e in executed] == [
+        "record_expense",
+        "read_skill",
+        "record_expense",
+    ]
+    assert [e["payload"]["replayed"] for e in executed] == [False, False, False]
 
 
 async def test_replayed_calls_are_marked_in_the_journal(system, tmp_path):
@@ -202,7 +223,8 @@ async def test_replayed_calls_are_marked_in_the_journal(system, tmp_path):
         for e in steward.journal.replay(env.id)
         if e["kind"] == "tool_executed"
     ]
-    assert flags == [False, True]
+    # 第一轮三条(拦下的那次 + read_skill + 真执行),第二轮同样三条、全是回放
+    assert flags == [False, False, False, True, True, True]
 
 
 async def test_replay_follows_the_recorded_sequence_across_different_tools(system, tmp_path):
@@ -225,10 +247,16 @@ async def test_replay_follows_the_recorded_sequence_across_different_tools(syste
         for e in steward.journal.replay(env_id)
         if e["kind"] == "tool_executed"
     ]
+    # 被守卫拦下的那次也在序列里,而且回放时**照样先被"拦下"再照提示走一遍**
+    # ——回放跟的是记录下来的那串顺序,不是理想顺序。库里仍然只有一条。
     assert flags == [
         ("current_time", False),
         ("record_expense", False),
+        ("read_skill", False),
+        ("record_expense", False),
         ("current_time", True),
+        ("record_expense", True),
+        ("read_skill", True),
         ("record_expense", True),
     ]
 
