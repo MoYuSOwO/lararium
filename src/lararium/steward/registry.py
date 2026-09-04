@@ -16,6 +16,10 @@ class BundleInfo:
     description: str
     skills: tuple[SkillInfo, ...]
     tools: tuple[str, ...]
+    # 这些工具会真的改数据。M5-12 的留痕要用:「说了已记、这一轮却没有写工具跑过」。
+    # **必须显式声明**(只读 bundle 写 `writes: []`)——漏写不会报错,只会让仪器
+    # 从此不响,而一个永远不响的仪器比没有更坏。有架构门禁钉着。
+    writes: tuple[str, ...]
     root: Path
 
 
@@ -48,6 +52,7 @@ class Registry:
                 description=data["description"],
                 skills=tuple(SkillInfo(s["name"], s["desc"]) for s in data.get("skills", [])),
                 tools=tuple(data.get("tools", [])),
+                writes=tuple(data["writes"]),
                 root=path.parent,
             )
         except (KeyError, TypeError, yaml.YAMLError) as exc:
@@ -61,6 +66,11 @@ class Registry:
             suffix = f" [skills: {skills}]" if skills else ""
             lines.append(f"- {b.name}:{b.description}{suffix}")
         return "\n".join(lines)
+
+    def write_tools(self) -> set[str]:
+        """所有会改数据的工具名。判据来自各自的 manifest,不在主控里维护一张清单
+        ——那张清单会在下一个 bundle 加工具时悄悄过期,而过期的表现是仪器不响。"""
+        return {tool for b in self.bundles for tool in b.writes}
 
     def tool_owners(self) -> dict[str, str]:
         """工具名 → 它属于哪个 bundle。manifest 的 `tools:` 本来就是这份映射的出处,

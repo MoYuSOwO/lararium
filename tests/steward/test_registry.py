@@ -80,8 +80,8 @@ def test_invalid_yaml_names_the_offending_file(tmp_path):
 
 def test_duplicate_bundle_names_are_rejected(tmp_path):
     """名字是路由依据。重名时目录行会列出两个,但只有一个调得到——必须拒绝。"""
-    _write_bundle(tmp_path, "a", "name: finance\ndescription: 甲\ntools: []\n")
-    _write_bundle(tmp_path, "b", "name: finance\ndescription: 乙\ntools: []\n")
+    _write_bundle(tmp_path, "a", "name: finance\ndescription: 甲\ntools: []\nwrites: []\n")
+    _write_bundle(tmp_path, "b", "name: finance\ndescription: 乙\ntools: []\nwrites: []\n")
 
     with pytest.raises(ValueError, match="重名"):
         Registry.load(tmp_path)
@@ -113,3 +113,25 @@ def test_read_skill_rejects_unknown_skill_name_in_finance(registry):
     """白名单校验对 finance 同样生效:skill 名来自模型输出,不许拿去拼路径。"""
     with pytest.raises(KeyError, match="monthly-review"):
         registry.read_skill("finance", "../../../etc/passwd")
+
+
+def test_a_manifest_without_writes_is_rejected_loudly(tmp_path):
+    """`writes:` 是必填的,哪怕是空的(M5-12)。
+
+    给个默认值看着更friendly,代价是:一个忘了声明的 bundle 会照常装上,而
+    `claimed_without_write` 那条留痕**从此对它永远不响**——没有任何报错,
+    只是仪器悄悄哑了一块。宁可在装载时炸,而且要说清是哪个文件缺哪个字段。
+    只读 bundle 写 `writes: []` 就行,一行的事。
+    """
+    _write_bundle(tmp_path, "x", "name: x\ndescription: 缺了 writes\ntools: [peek]\n")
+
+    with pytest.raises(ValueError, match="writes"):
+        Registry.load(tmp_path)
+
+
+def test_write_tools_come_from_the_manifests(tmp_path):
+    """哪些工具会写,判据在各自的 manifest,不在主控里维护一张清单
+    ——那张清单会在下一个 bundle 加工具时悄悄过期,而过期的表现是仪器不响。"""
+    reg = Registry.load(Path("bundles"))
+
+    assert reg.write_tools() == {"propose_fact", "record_expense"}

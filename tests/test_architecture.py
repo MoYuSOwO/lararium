@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from lararium.steward.registry import Registry
+
 SOURCE_ROOTS = (Path("src"), Path("bundles"))
 
 
@@ -249,6 +251,23 @@ def test_the_sqlite_guard_does_not_fire_on_type_annotations() -> None:
     source = "import sqlite3\ndef f(c: sqlite3.Connection) -> sqlite3.Row: ...\nx = sqlite3.Row"
 
     assert _sqlite_connect_calls(ast.parse(source)) == []
+
+
+def test_every_declared_write_tool_actually_exists() -> None:
+    """`writes:` 里的工具名必须真的在 `tools:` 里(M5-12)。
+
+    打错一个字不会报错——`claimed_without_write` 只是**从此对那个工具永远不响**,
+    而一个永远不响的仪器比没有更坏:它让人以为这件事被盯着。
+    `writes:` 本身是必填的(`Registry._parse_manifest` 会炸),这里补的是"填了但填错"。
+    """
+    registry = Registry.load(Path("bundles"))
+    offenders = [
+        f"{b.name}: writes 里有 {sorted(set(b.writes) - set(b.tools))},但 tools 里没有"
+        for b in registry.bundles
+        if set(b.writes) - set(b.tools)
+    ]
+
+    assert offenders == [], offenders
 
 
 def test_assembler_never_reads_the_clock() -> None:

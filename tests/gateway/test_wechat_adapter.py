@@ -19,7 +19,13 @@ import pytest
 
 from lararium.gateway import wechat
 from lararium.gateway.ilink import Credentials, ILinkError, InboundMessage, MediaRef, QrStatus
-from lararium.gateway.wechat import State, WeChatAdapter
+from lararium.gateway.wechat import (
+    BACKOFF_CEILING,
+    BACKOFF_FLOOR,
+    Backoff,
+    State,
+    WeChatAdapter,
+)
 
 
 class FakeILink:
@@ -204,7 +210,9 @@ async def test_the_outbox_cursor_prevents_resending_after_a_restart(tmp_path):
         asked.append(str(request.url))
         return httpx.Response(200, json={"items": []})
 
-    a = adapter(tmp_path, FakeILink(), handler, outbox_after=9)
+    # peer/context_token 也是落盘持久化的(State.PERSISTED),所以"重启之后"这个场景里
+    # 它们本来就在——M5-12 之后没有它们连出件箱都不会去拉,补上才是这个场景的真样子。
+    a = adapter(tmp_path, FakeILink(), handler, outbox_after=9, peer="u1", context_token="ctx-1")
 
     await a.pump_outbox_once()
 
@@ -236,7 +244,13 @@ async def test_a_push_with_no_known_peer_is_left_in_the_outbox(tmp_path):
     ilink = FakeILink()
     a = adapter(tmp_path, ilink, handler)  # 没有 peer / context_token
 
-    await a.pump_outbox_once()
+    # M5-12:这一支现在是**等**,不是"拉回来再放弃",所以拿 task 跑再取消。
+    # 它守的不变量没变:一条都没发出去、游标一格没动。
+    task = asyncio.create_task(a.pump_outbox_once())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
     assert ilink.sent == []
     assert State.load(a.state.path).outbox_after == 0, "游标不许推过去,不然这条就永远丢了"
@@ -843,3 +857,118 @@ async def test_a_wav_pretending_to_be_an_image_does_not_land_as_webp(tmp_path):
     await a.pump_inbound_once()
 
     assert [p.suffix for p in (tmp_path / "media").iterdir()] == [".bin"]
+
+
+# ── M5-12 Step 1:退避,以及被入站消息叫醒 ──────────────────────────────
+
+
+def test_backoff_grows_and_then_stops_growing():
+    """指数退避 + 封顶。
+
+    封顶是必须的:没有上限的话,连着失败一整夜之后下一次重试要等到第二天;
+    而没有指数的话就是现在这样——`sleep(3)` 无限,一夜约 1.4 万次打在腾讯接口上,
+    真撞限流,而限流很可能回 `-14`,那个码正好被过载(缺 HTTP 头也回 -14),极难查。
+    """
+    b = Backoff()
+
+    seq = [b.next() for _ in range(10)]
+
+    assert seq[0] == BACKOFF_FLOOR
+    assert seq == sorted(seq), f"退避没有单调增长:{seq}"
+    assert seq[-1] == BACKOFF_CEILING and max(seq) == BACKOFF_CEILING
+    b.reset()
+    assert b.next() == BACKOFF_FLOOR, "成功一次之后没归零,下一次小故障要从几分钟起步"
+
+
+async def test_the_outbox_pump_does_not_poll_before_anyone_has_spoken(tmp_path):
+    """★ 还没人跟它说过话:**连出件箱都别去拉**。
+
+    拉回来也发不出去(没有 context_token),而每 5 秒一次长轮询 + 一条 warning,
+    一夜就是上万次白转和几千行日志。窗口重开的信号是**入站消息**,所以这里等的就是它。
+    """
+    asked: list[str] = []
+
+    def handler(request):
+        asked.append(request.url.path)
+        return httpx.Response(200, json={"items": []})
+
+    a = adapter(tmp_path, FakeILink(), handler)
+    task = asyncio.create_task(a.pump_outbox_once())
+    await asyncio.sleep(0.05)
+
+    assert asked == [], "还没人开口就去拉出件箱了"
+    assert not task.done()
+
+    a._remember(InboundMessage(1, "u1@im.wechat", "在吗", "ctx-1"))
+    await asyncio.wait_for(task, 1)
+
+    assert asked == ["/v1/outbox"], "窗口开了却没接着干活"
+
+
+async def test_a_backoff_is_cut_short_by_an_inbound_message(tmp_path):
+    """★ **只退避不叫醒等于把延迟写死。**
+
+    窗口重开的信号就是入站消息(它刷新 `context_token`)。用户开口之后还要再等几分钟
+    才收到攒着的推送,那个体验比刷接口更糟。两个泵是独立 task,所以要有一个共享的信号。
+    """
+    a = adapter(tmp_path, FakeILink(), lambda _r: httpx.Response(200, json={"items": []}))
+    task = asyncio.create_task(a._sleep_or_wake(30))
+    await asyncio.sleep(0.02)
+
+    a._remember(InboundMessage(1, "u1@im.wechat", "在吗", "ctx-1"))
+
+    await asyncio.wait_for(task, 1)  # 没被叫醒的话这里会超时
+
+
+async def test_repeated_failures_back_off_and_one_success_resets(tmp_path, monkeypatch):
+    """失败越多等越久,成功一次就归零。
+
+    钉的是**等了多久**——这条没有别的可观测面(真等几分钟的测试没法跑),
+    所以把 `_sleep_or_wake` 换掉记账。和"原子写只能钉 fsync+rename"是同一种 T1 例外。
+    """
+    slept: list[float] = []
+    a = adapter(tmp_path, FakeILink(), lambda _r: httpx.Response(200, json={"items": []}))
+
+    async def record(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(a, "_sleep_or_wake", record)
+
+    async def boom():
+        raise ILinkError("发不出去", code=500)
+
+    async def fine():
+        return None
+
+    for _ in range(3):
+        await a._pump_step(boom, "发信", a._outbox_backoff)
+    await a._pump_step(fine, "发信", a._outbox_backoff)
+    await a._pump_step(boom, "发信", a._outbox_backoff)
+
+    assert slept == [
+        BACKOFF_FLOOR,
+        BACKOFF_FLOOR * 2,
+        BACKOFF_FLOOR * 4,
+        BACKOFF_FLOOR,
+    ], f"退避节奏不对:{slept}"
+
+
+async def test_the_inbound_pump_backs_off_too(tmp_path, monkeypatch):
+    """收信泵失败同样要退避——**同一条理由**:iLink 连不上时它每 3 秒打一次,
+    一夜近三万次,比出件箱那条还密。任务书只点了出件箱,这一条是照着同一个论证补的。
+    """
+    slept: list[float] = []
+    a = adapter(tmp_path, FakeILink(), lambda _r: httpx.Response(200, json={"items": []}))
+
+    async def record(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(a, "_sleep_or_wake", record)
+
+    async def boom():
+        raise httpx.ConnectError("iLink 连不上")
+
+    await a._pump_step(boom, "收信", a._inbound_backoff)
+    await a._pump_step(boom, "收信", a._inbound_backoff)
+
+    assert slept == [BACKOFF_FLOOR, BACKOFF_FLOOR * 2]

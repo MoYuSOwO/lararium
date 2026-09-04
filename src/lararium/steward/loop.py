@@ -37,6 +37,21 @@ def _jsonable(value: Any) -> Any:
 SKILL_GATE_HINT = '还没读 {bundle} 的方法说明。先调 read_skill("{bundle}") 看完总览,再调这个工具。'
 
 
+# 回复里这些词等于向用户**承诺已经写下了**。M5-12 拿它配合"这一轮有没有写工具跑过"
+# 落一条留痕。措辞取自实测到的那次(mimo:「『房租每月 3800』已经在账本里了」,
+# 而账本是空的)和 discipline 自己的原话(「说"记好了"之前,先真的把工具调了」)。
+CLAIM_MARKERS = (
+    "记下了",
+    "记好了",
+    "记上了",
+    "已记",
+    "已经记",
+    "已入档",
+    "已提交",
+    "已经在账本里",
+)
+
+
 # L0 预算里给"工具 schema + 输出窗口"的固定留白(token)。工具 schema 实测约
 # 500/请求;输出要占窗口,单用户交互给足 8000。M3-6 的低水位也要继承这个估算口径。
 L0_RESERVE = 8000
@@ -98,6 +113,12 @@ class Steward:
         # M5-11 技能路由守卫:本轮已读过总览的 bundle,以及已经提醒过一次的 bundle。
         self._overview_read: set[str] = set()
         self._skill_nudged: set[str] = set()
+        # M5-12 留痕用:本轮真正跑过的领域(bundle 名)与写工具(工具名)。
+        self._domain_used: set[str] = set()
+        self._writes_done: set[str] = set()
+        # 一次读定:manifest 是启动时加载的,这两份映射不会中途变。
+        self._tool_owners = registry.tool_owners()
+        self._write_tools = registry.write_tools()
         self.tools = BuiltinTools(
             journal,
             registry,
@@ -119,7 +140,7 @@ class Steward:
         - M4-5d:**所有**工具再包一层断点续跑。放最外层是必须的——回放时连内层的
           propose 守卫都不该走到,因为那次调用这一轮压根没发生。
         """
-        owners = self.registry.tool_owners()
+        owners = self._tool_owners
         tools = [
             self._note_overview_read(t) if getattr(t, "__name__", "") == "read_skill" else t
             for t in self.tools.as_tool_functions()
@@ -216,6 +237,7 @@ class Steward:
             name = getattr(original, "__name__", "")
             replayed = self._take_resumed_result(name)
             result = original(*args, **kwargs) if replayed is None else replayed
+            self._note_tool_use(name, result)
             if self._active_envelope_id:
                 self.journal.append(
                     self._active_envelope_id,
@@ -238,6 +260,47 @@ class Steward:
             return result
 
         return resumable
+
+    def _note_tool_use(self, name: str, result: Any) -> None:
+        """记下"这一轮真的用过谁"。**挂在最外层(`_resumable`)是有理由的**:
+        重试轮里工具结果是回放的,内层压根不会被调到——挂在内层的话,一次 429 之后
+        整轮的写入都会被算成"没写过",`claimed_without_write` 就开始瞎报。
+
+        唯一要排除的是**被路由守卫拦下的那次**:它返回的是提示,什么都没发生。
+        按返回值逐字比对——那句提示是确定性的,而真工具不会恰好回出同一句话。
+        """
+        bundle = self._tool_owners.get(name)
+        if bundle is None:
+            return  # 内置工具不算"用过某个领域"
+        if isinstance(result, str) and result == SKILL_GATE_HINT.format(bundle=bundle):
+            return
+        self._domain_used.add(bundle)
+        if name in self._write_tools:
+            self._writes_done.add(name)
+
+    def _journal_turn_signals(self, envelope_id: str, reply_text: str) -> None:
+        """两条**只留痕、绝不改行为、绝不报警**的信号(M5-12)。
+
+        - `read_only`:读了某个领域的总览,却一次它的工具都没调——"漏做"那一支。
+          `skill_gate` 的两个 action 都盖不到它(它压根没触发守卫)。
+        - `claimed_without_write`:回复里承诺"已记",而这一轮没有任何写工具跑过。
+
+        **第二条落的是「疑似」不是「判定」**:事实可能上一轮就已经在账本里,那句
+        「已经在账本里了」是对的。所以它只留痕——**别把它升级成拦截或报警**,
+        那需要的是对账,不是留痕。价值全在"事后翻得到"。
+
+        两条都不进 L0、不进检索索引(照 `tool_executed` / `skill_gate` 的先例):
+        进了就是拿模型的上下文预算装我们自己的仪表盘,而且模型会开始对着它解释自己。
+        """
+        for bundle in sorted(self._overview_read - self._domain_used):
+            self.journal.append(envelope_id, "read_only", {"bundle": bundle})
+        matched = [m for m in CLAIM_MARKERS if m in (reply_text or "")]
+        if matched and not self._writes_done:
+            self.journal.append(
+                envelope_id,
+                "claimed_without_write",
+                {"markers": matched, "domains_used": sorted(self._domain_used)},
+            )
 
     def _take_resumed_result(self, name: str) -> str | None:
         """位置优先,配不上就在剩余队列里向后按名字找;都没有就返回 None(真执行)。
@@ -330,6 +393,8 @@ class Steward:
         # 不许照着干活",而且压缩会把读过的那段冲掉——重读几乎不花钱)。
         self._overview_read = set()
         self._skill_nudged = set()
+        self._domain_used = set()
+        self._writes_done = set()
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。
@@ -406,6 +471,8 @@ class Steward:
                     "completion_tokens": reply.completion_tokens,
                 },
             )
+            # M5-12:两条只留痕的信号,放在 reply 之后——它们描述的是"这一轮结束时"。
+            self._journal_turn_signals(env.id, reply.text)
             logger.info(format_cache_log(reply))
             # 崩溃语义:回复先落出件箱,信封才算完成。M3-1 Step0 收掉 M2-6 遗留——
             # 两个语句各自动提交,崩在中间会留下「出件箱有回复、信封未完成」的半态,

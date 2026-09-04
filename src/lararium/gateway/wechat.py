@@ -25,6 +25,24 @@
 
 单用户助手,所以只记**最后一个**说话的人(`peer`)。多用户是另一个设计,不在这里假装支持。
 
+## 重试节奏:退避,而且要能被叫醒(M5-12)
+
+原来是「任何异常 → `sleep(3)` → 重来」,无限。而微信窗口是 24 小时:哪天用户没开口,
+晨报发不出去,适配器就对着腾讯的接口打一整夜——**一夜约 1.4 万次**,真会撞限流,
+而限流很可能回 `-14`,那个码正好被过载(缺 HTTP 头也回 -14),到时候极难查。
+
+两种失效形态,别混:
+
+- **发失败**(`send_text` 抛错)→ 指数退避,封顶几分钟(`Backoff`);
+- **还没人跟它说过话**(`peer`/`context_token` 为空)→ 连出件箱都不去拉:
+  拉回来也发不出去,而每 5 秒一次长轮询 + 一条 warning,一夜是上万次白转和几千行日志。
+
+**窗口重开的信号是入站消息**(它刷新 `context_token`),所以退避和等待都必须能被
+入站泵叫醒(`_inbound_woke`)。**只退避不叫醒等于把延迟写死**:用户开口之后还要再等
+几分钟才收到攒着的推送,那个体验比刷接口更糟。
+
+失败的语义没变:条目留在出件箱、游标不推进(M4-7 定的「消息在等你」)。
+
 ## 一条投递失败不许堵住它后面的所有人(M5-4)
 
 原来一批消息是"逐条投,最后统一推游标"。任何一条投递失败(超 16KB 的长文 → 413、
@@ -37,11 +55,13 @@
 """
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -63,6 +83,10 @@ _QR_LIFETIME = 180.0
 # 轮询下界。服务端正常会把请求挂住(长轮询),但异常时会立刻返回——没有这一行,
 # 那就是热循环。
 _POLL_FLOOR = 1.0
+# 退避的下界与封顶。下界沿用原来那个 3 秒(小抖动不该多等);封顶五分钟——
+# 没有封顶的话,连着失败一整夜之后下一次重试要等到第二天。
+BACKOFF_FLOOR = 3.0
+BACKOFF_CEILING = 300.0
 
 # 落盘时按字节的**魔数**认类型,不信对方给的文件名——文件名是外部输入,而这里的
 # 结果会变成磁盘上的后缀,而后缀会一路决定 `Attachment.is_image`。
@@ -95,6 +119,22 @@ _FALLBACK_MEDIA_TYPES: dict[str, str] = {
     "video": "video/mp4",
 }
 _DEFAULT_MEDIA_TYPE = "application/octet-stream"
+
+
+@dataclass
+class Backoff:
+    """指数退避的计数器。**只算时长,不负责睡**——睡在 `_sleep_or_wake` 里,
+    因为那一步要能被入站消息叫醒,而"等多久"和"怎么等"是两件事。"""
+
+    delay: float = 0.0
+
+    def next(self) -> float:
+        self.delay = BACKOFF_FLOOR if not self.delay else min(self.delay * 2, BACKOFF_CEILING)
+        return self.delay
+
+    def reset(self) -> None:
+        """成功一次就归零——不归零的话,一次长故障之后的第一个小抖动要从几分钟起步。"""
+        self.delay = 0.0
 
 
 @dataclass
@@ -169,6 +209,11 @@ class WeChatAdapter:
         self.token = token
         self.state = state
         self.media_dir = media_dir
+        # 两个泵是独立 task,靠这个 Event 通气:入站消息一到就把等着的发信泵叫醒。
+        # 窗口重开的信号只有它(入站消息会刷新 context_token)。
+        self._inbound_woke = asyncio.Event()
+        self._outbox_backoff = Backoff()
+        self._inbound_backoff = Backoff()
 
     @property
     def ilink_token(self) -> str | None:
@@ -209,10 +254,15 @@ class WeChatAdapter:
             self.state.save()
 
     def _remember(self, message: InboundMessage) -> None:
-        """每收到一条就刷新回信凭据并落盘——它同时是主动推送要用的那一份。"""
+        """每收到一条就刷新回信凭据并落盘——它同时是主动推送要用的那一份。
+
+        **顺带把发信泵叫醒**:24 小时窗口重开的唯一信号就是这条消息,而发信泵可能正
+        退避着、或者正等着"第一个说话的人"。不叫醒的话,攒着的推送要等到退避自己走完。
+        """
         self.state.context_token = message.context_token or self.state.context_token
         self.state.peer = message.from_user_id or self.state.peer
         self.state.save()
+        self._inbound_woke.set()
 
     async def _deliver(self, message: InboundMessage) -> None:
         """把一条微信消息变成一个信封投进去;有附件就先取下来存好。
@@ -351,7 +401,11 @@ class WeChatAdapter:
 
         **发不出去就不推游标**:没有 `peer`/`context_token` 时(还没人跟它说过话),
         条目留在出件箱里等用户开口——M4-7 说过失效形态该是"消息在等你",不是"发不出去就丢"。
+
+        M5-12:那种情况下**连出件箱都不去拉**(`_await_peer` 挂在那儿等入站消息),
+        而不是每 5 秒空转一次长轮询再放弃。
         """
+        await self._await_peer()
         response = await self.lararium.get(
             f"/v1/outbox?after={self.state.outbox_after}&wait={_OUTBOX_WAIT}",
             headers={"Authorization": f"Bearer {self.token}"},
@@ -368,6 +422,29 @@ class WeChatAdapter:
             )
             self.state.outbox_after = int(item.get("seq", self.state.outbox_after))
             self.state.save()
+
+    async def _await_peer(self) -> None:
+        """还没人跟它说过话就挂在这儿等,别去拉出件箱。
+
+        日志只在**真的开始等**的时候打一次:原来那条 warning 是每 5 秒一条,一夜几千行,
+        而它说的是同一件事。
+        """
+        if self.state.peer and self.state.context_token:
+            return
+        logger.info("还没有人跟它说过话,推送先攒着,等第一条入站消息把窗口打开")
+        while not (self.state.peer and self.state.context_token):
+            self._inbound_woke.clear()
+            await self._inbound_woke.wait()
+
+    async def _sleep_or_wake(self, seconds: float) -> None:
+        """等这么久,**但入站消息一到就立刻醒**。
+
+        窗口重开的信号只有入站消息;只退避不叫醒等于把延迟写死,用户开口之后还要
+        再等几分钟才收到攒着的推送。
+        """
+        self._inbound_woke.clear()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._inbound_woke.wait(), timeout=seconds)
 
     # ── 重连 ────────────────────────────────────────────────────────────
 
@@ -436,20 +513,42 @@ class WeChatAdapter:
 
     # ── 编排 ────────────────────────────────────────────────────────────
 
+    async def _pump_step(
+        self, once: Callable[[], Awaitable[None]], label: str, backoff: Backoff
+    ) -> None:
+        """跑一次泵;失败就按退避等,成功就把退避归零。
+
+        提成一个方法是为了能测"等了多久"——`run()` 是无限循环,从外面没法看。
+        """
+        try:
+            await once()
+        except Exception as exc:
+            logger.warning(
+                "%s 出错(%.0f 秒后重试):%s: %s",
+                label,
+                backoff.next(),
+                type(exc).__name__,
+                exc,
+            )
+            await self._sleep_or_wake(backoff.delay)
+        else:
+            backoff.reset()
+
     async def run(self) -> None:
         """两个泵各跑各的。一个挂了不该拖死另一个——收不到消息至少还能把推送发出去,
-        反过来也一样。"""
+        反过来也一样。
 
-        async def pump(once, label: str) -> None:
+        **两个泵各有各的退避计数器**:一边的故障不该让另一边跟着变慢,而它们的失效
+        原因通常也不是同一个。
+        """
+
+        async def pump(once: Callable[[], Awaitable[None]], label: str, backoff: Backoff) -> None:
             while True:
-                try:
-                    await once()
-                except Exception as exc:
-                    logger.warning("%s 出错(继续跑):%s: %s", label, type(exc).__name__, exc)
-                    await asyncio.sleep(3)
+                await self._pump_step(once, label, backoff)
 
         await asyncio.gather(
-            pump(self.pump_inbound_once, "收信"), pump(self.pump_outbox_once, "发信")
+            pump(self.pump_inbound_once, "收信", self._inbound_backoff),
+            pump(self.pump_outbox_once, "发信", self._outbox_backoff),
         )
 
 
