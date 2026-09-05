@@ -104,16 +104,33 @@ class BuiltinTools:
         recall_min_similarity: float = 0.35,
         media_dir: Path | None = None,
         vision: bool = False,
+        on_untrusted: Callable[[], None] | None = None,
     ) -> None:
         self.journal = journal
         self.registry = registry
         self.threads = threads
         self.media_dir = media_dir
         self.vision = vision
+        # M5-18:这一轮往上下文里放过不可信内容时喊一声。**回调而不是返回值**:
+        # 判据要落在结构位上,而主控只关心"有没有",不关心是哪一条。
+        # 缺省是空操作,这样 BuiltinTools 单独用(测试、以后拆容器)不必先接线。
+        self._on_untrusted = on_untrusted or (lambda: None)
         self._tz = ZoneInfo(timezone)
         # M3-4:语义检索的相似度阈值。2026-08-18 实测命中 0.44~0.58、未命中 0.35,
         # 这个 0.35 是猜的初值——真机跑几天要按实际分布调。
         self.recall_min_similarity = recall_min_similarity
+
+    def _note_hits(self, hits: list[Any]) -> None:
+        """命中里只要有一条不可信的,就把这一轮拉成不可信。
+
+        **判据是 `hit.untrusted` 这个结构位,不是渲染出来的措辞。** 去嗅返回文本里的
+        「⚠」或围栏符号是 `CLAIM_MARKERS` 那个病的翻版:换一次渲染就哑,而哑掉是静默的。
+        渲染那一刻本来就知道真假,所以在这里说,不在那边猜。
+
+        只看**这一页**:模型看到的就是这一页,没进上下文的不算(不变式是"进过上下文")。
+        """
+        if any(getattr(h, "untrusted", False) for h in hits):
+            self._on_untrusted()
 
     def current_time(self) -> str:
         """返回当前时间(带时区)。需要精确时刻或做日期推算时调用。"""
@@ -140,6 +157,7 @@ class BuiltinTools:
         # 负数/0/超大 limit 钳到 [1, MAX_SEARCH_HITS];负数在 SQLite 里=不限制,M3-1 教训
         limit = MAX_SEARCH_HITS if limit < 0 else max(1, min(limit, MAX_SEARCH_HITS))
         total, hits, cur_page, total_pages = _paged_search(self.journal.search, query, limit, page)
+        self._note_hits(hits)
         return _format_search_result(query, total, hits, cur_page, total_pages)
 
     def recall_similar(self, query: str, page: int = 1) -> str:
@@ -156,6 +174,7 @@ class BuiltinTools:
         total, hits, cur_page, total_pages = _paged_search(
             self._recall_similar_page, query, MAX_SEARCH_HITS, page
         )
+        self._note_hits(hits)
         return _format_search_result(query, total, hits, cur_page, total_pages)
 
     def _recall_similar_page(self, query: str, limit: int, offset: int) -> tuple[int, list[Any]]:
@@ -203,6 +222,13 @@ class BuiltinTools:
             # 转头让用户重发一次图,而真相是那份东西根本不是图。回绝要说清楚是什么,
             # 别给它一个更顺嘴的错误解释。
             return f"media/{image_id[:12]} {reason},我看不了。"
+        # M5-18:**无条件**把这一轮拉成不可信。选的是严的那一支,理由:
+        # 图片是绕开全部文本防线的注入面(M5-5),而"这张图当初是哪一轮进来的"起居注里
+        # 现在查不到(envelope 事件不记 attachments,只能反扫 prompt 事件推)。
+        # 为"稍微宽松一点"付一次额外扫描不划算,而在注入面上"假设可信"是错的默认。
+        # 代价:重看过图的那一轮,propose 要走一次审批。哪天嫌烦了,升级路径是让
+        # envelope 事件记下 attachments,再按来源轮判。
+        self._on_untrusted()
         data = matches[0].read_bytes()
         digest = matches[0].stem
         # **重看这条路同样要带框定**。少了它,"重看"就成了绕过防线的支路:

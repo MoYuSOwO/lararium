@@ -369,6 +369,15 @@ class Journal:
             }
         return out
 
+    def has_kind(self, envelope_id: str, kind: str) -> bool:
+        """这封信下面有没有过某一类事件。给"跨重试继承"用:重试是同一个信封,
+        上一次尝试里发生过的事,这一次不该当没发生。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM journal WHERE envelope_id = ? AND kind = ? LIMIT 1",
+            (envelope_id, kind),
+        ).fetchone()
+        return row is not None
+
     def last_attempt_tool_results(self, envelope_id: str) -> list[tuple[str, str]]:
         """上一次尝试里**已经确立**的工具结果,按调用顺序(M4-5d)。
 

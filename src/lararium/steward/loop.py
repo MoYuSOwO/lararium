@@ -98,6 +98,7 @@ class Steward:
             recall_min_similarity=settings.recall_min_similarity,
             media_dir=settings.data_dir / "media",
             vision=settings.vision,
+            on_untrusted=self._mark_untrusted,
         )
 
     def all_tools(self) -> list[Callable]:
@@ -218,6 +219,28 @@ class Steward:
             {"unconsumed": left, "total": len(self._resume_queue)},
         )
 
+    def _mark_untrusted(self) -> None:
+        """这一轮往上下文里放过不可信内容——**只能拉高,不能拉低**(M5-18)。
+
+        原来 `_active_untrusted` 只在认领信封时定死一次,于是工具捞回来的不可信内容
+        不会把这一轮拉成不可信:可信轮里一句「搜一下那条通知,是长期安排就归档吧」,
+        短信里的账号就会被 `propose(user_stated)` → 自动放行 → worker 自动结算,
+        **而用户从没见过任何审批提示**。实测 1/1 洗进账本。
+
+        **同时落一条起居注**:重试是同一个信封重跑一遍,而重试时工具结果是**回放**的、
+        内层压根不会被调到——只记在内存里的话,一次 429 之后那条不可信内容照样回到
+        上下文,这一轮却又变回"可信"了。按信封记,重试自然继承(见 `_adopt_untrusted_history`)。
+        """
+        already = self._active_untrusted
+        self._active_untrusted = True
+        if not already and self._active_envelope_id:
+            self.journal.append(self._active_envelope_id, "untrusted_seen", {})
+
+    def _adopt_untrusted_history(self, envelope_id: str) -> None:
+        """上一次尝试里见过不可信内容,这一次照样算——重试是同一轮,不是新的一轮。"""
+        if self.journal.has_kind(envelope_id, "untrusted_seen"):
+            self._active_untrusted = True
+
     def _guard_propose_fact(self, original: Callable[..., str]) -> Callable[..., str]:
         @functools.wraps(original)
         def guarded(
@@ -255,6 +278,8 @@ class Steward:
         self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
+        # 重试是同一个信封:上一次尝试里见过不可信内容,这一次不能当没见过。
+        self._adopt_untrusted_history(env.id)
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。

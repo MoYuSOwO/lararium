@@ -4,12 +4,14 @@ from pathlib import Path
 import pytest
 from bundles.memory.server import build_memory_components, memory_tool_functions
 
+from lararium import db as db_module
 from lararium.config import Settings
 from lararium.db import connect
 from lararium.envelope import Attachment, Envelope
+from lararium.steward import tools as tools_module
 from lararium.steward.assembler import AssembledContext
 from lararium.steward.inbox import Inbox
-from lararium.steward.journal import SEARCHABLE_KINDS, Journal
+from lararium.steward.journal import SEARCHABLE_KINDS, Journal, SearchHit
 from lararium.steward.loop import Steward
 from lararium.steward.model import ModelCallError, ModelReply
 from lararium.steward.outbox import Outbox
@@ -944,3 +946,214 @@ async def test_a_plain_model_failure_leaves_no_retry_event(steward_factory):
     await steward.process_next()
 
     assert signals(steward, env.id, "tool_retry") == []
+
+
+# ── M5-18:不可信是单向的,进来就不出去 ─────────────────────────────────
+#
+# `_active_untrusted` 原来只在**认领信封**时定死一次,于是工具捞回来的不可信内容不会把
+# 这一轮拉成不可信:可信轮里用户说一句「搜一下那条通知,如果是我的长期安排就归档吧」,
+# 模型就会把短信里的账号 propose(user_stated) → 自动放行 → worker 自动结算 → 落进账本,
+# **而用户从没见过任何审批提示**。实测给一句条件式放行则 1/1 洗进账本。
+
+
+def seed_untrusted(steward, text="工商银行:您尾号 6688 的账户"):
+    """往起居注里放一条**不可信**信封,让 search_history 能捞到它。"""
+    steward.journal.append(
+        "env-sms",
+        "envelope",
+        {
+            "content": text,
+            "source": "module_event",
+            "channel": "smsforwarder",
+            "meta": {"untrusted": True},
+            "ts": "2026-09-01T10:00:00+08:00",
+        },
+    )
+
+
+def seed_trusted(steward, text="我下个月要去杭州出差"):
+    steward.journal.append(
+        "env-me",
+        "envelope",
+        {
+            "content": text,
+            "source": "user",
+            "channel": "cli",
+            "meta": {},
+            "ts": "2026-09-01T11:00:00+08:00",
+        },
+    )
+
+
+async def start_turn(steward, content="随便问点什么"):
+    """认领一个**可信**信封,把这一轮开起来(工具要在轮内才有意义)。"""
+    steward.submit(Envelope.new(source="user", channel="cli", content=content))
+    env = steward.inbox.claim_next()
+    steward._active_untrusted = bool(env.meta.get("untrusted", False))
+    steward._active_envelope_id = env.id
+    return env
+
+
+async def test_an_untrusted_hit_pulled_back_by_search_downgrades_the_turn(steward_factory):
+    """★ 洞本身:可信轮里检索捞回一条不可信命中,之后的 propose 必须降档待审。
+
+    判据取**副作用**:提案落在 pending 里、结算不动它——只看返回文本的话,一个"嘴上说
+    待审、照样放行"的实现也能过。
+    """
+    steward, _ = steward_factory()
+    seed_untrusted(steward)
+    await start_turn(steward)
+
+    tool(steward, "search_history")("6688")
+    out = tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "待审" in out and "已记下" not in out, out
+    pending = steward.gate.pending()
+    assert len(pending) == 1 and pending[0].provenance == "untrusted"
+    assert steward.settle_if_needed() == 0, "降档了却还是被自动结算,那等于没降"
+
+
+async def test_a_clean_turn_still_auto_passes(steward_factory):
+    """反向:这一轮没有任何不可信内容 → `user_stated` 照旧自动放行。
+
+    **别把正常路径一起拖下水**——一个"凡是搜过就降档"的实现能过上面那条,过不了这条。
+    """
+    steward, _ = steward_factory()
+    seed_trusted(steward)
+    await start_turn(steward)
+
+    tool(steward, "search_history")("杭州")
+    out = tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "已记下" in out or "待审" not in out, out
+    assert steward.gate.pending() == []
+
+
+async def test_once_raised_it_cannot_be_lowered_again(steward_factory):
+    """★ **只能拉高,不能拉低。** 先脏后干净,这一轮余下全程仍算不可信。
+
+    做成"按最后一次检索的结果覆盖"的话这条立刻红——而那个写法看起来完全合理。
+    """
+    steward, _ = steward_factory()
+    seed_untrusted(steward)
+    seed_trusted(steward)
+    await start_turn(steward)
+
+    tool(steward, "search_history")("6688")
+    tool(steward, "search_history")("杭州")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert len(steward.gate.pending()) == 1
+
+
+async def test_the_criterion_is_structural_not_a_string_match(steward_factory, monkeypatch):
+    """★ 给判据的阳性对照:**把渲染措辞整个换掉,降档仍然要发生。**
+
+    这是 `CLAIM_MARKERS` 那个病的预防针:判据挂在渲染出来的字("⚠"、围栏符号)上,
+    换一次渲染就哑,而哑掉是**静默**的。判据要落在 `hit.untrusted` 这个结构位上
+    ——渲染那一刻本来就知道真假,让它直接说出来。
+    """
+    monkeypatch.setattr(tools_module, "_render_hit", lambda hit: f"[{hit.kind}] {hit.text[:40]}")
+    steward, _ = steward_factory()
+    seed_untrusted(steward)
+    await start_turn(steward)
+
+    listed = tool(steward, "search_history")("6688")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "⚠" not in listed and "<<<" not in listed, "阳性对照没生效,措辞还在"
+    assert len(steward.gate.pending()) == 1, "换掉措辞降档就没了——判据挂在字符串上"
+
+
+async def test_a_retried_turn_keeps_the_untrusted_mark(steward_factory):
+    """★ 重试轮不许把标记丢掉,而且要**走真的重试路径**。
+
+    重试时工具结果是**回放**的,内层压根不会被调到——标记只记在内存里的话,一次 429
+    之后那条不可信内容照样回到上下文,而这一轮又变回"可信"了。`_note_tool_use` 当初就是
+    栽在同一个地方(M5-12),所以这次按信封记进起居注,重试自然继承。
+
+    **这条必须走 `process_next`**:第一版我在测试里手动调了 `_adopt_untrusted_history`,
+    于是"把它从 `process_next` 里删掉"这个变异照样绿——测的是方法,不是接线。
+    """
+
+    class SearchThenFail:
+        def __init__(self):
+            self.attempts = 0
+
+        async def run(self, ctx, tools, mcp_servers):
+            self.attempts += 1
+            by_name = {f.__name__: f for f in tools}
+            if self.attempts == 1:
+                by_name["search_history"]("6688")
+                raise ModelCallError("503 假装限流", retryable=True)
+            by_name["propose_fact"](**ALLERGY)
+            return ModelReply(text="好")
+
+    steward, _ = steward_factory()
+    steward.model = SearchThenFail()
+    seed_untrusted(steward)
+    steward.submit(Envelope.new(source="user", channel="cli", content="搜一下那条通知"))
+
+    first = await steward.process_next()
+    second = await steward.process_next()
+
+    assert (first.kind, second.kind) == ("retry_later", "replied")
+    assert len(steward.gate.pending()) == 1, "重试之后标记丢了,那条提案被自动放行了"
+
+
+async def test_recall_similar_raises_the_mark_too(steward_factory, monkeypatch):
+    """语义检索那条路一样要上报——**两个出口,同一条规则**。
+
+    两条检索各自调 `_note_hits`,少写一处不会有任何报错:那条路上捞回来的不可信内容
+    就静悄悄地不算数了。M5-14 之前 finance 的两条聚合 SQL 正是这么漏的。
+    """
+    from lararium.steward import embeddings as em
+
+    monkeypatch.setattr(em, "embedding_available", lambda: True)
+    monkeypatch.setattr(db_module, "VEC_AVAILABLE", True)
+    steward, _ = steward_factory()
+    hit = SearchHit(
+        "env-sms",
+        "envelope",
+        "工商银行 6688",
+        "2026-09-01T10:00:00+08:00",
+        source="module_event",
+        channel="smsforwarder",
+        untrusted=True,
+    )
+    monkeypatch.setattr(steward.journal, "search_similar", lambda *a, **k: (1, [hit]))
+    await start_turn(steward)
+
+    tool(steward, "recall_similar")("那条通知")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert len(steward.gate.pending()) == 1
+
+
+async def test_the_mark_resets_between_turns(steward_factory):
+    """每轮重置:上一轮脏,不该让这一轮跟着脏。"""
+    steward, _ = steward_factory()
+    seed_untrusted(steward)
+    await start_turn(steward, "第一轮")
+    tool(steward, "search_history")("6688")
+    steward.inbox.complete(steward._active_envelope_id)
+
+    await start_turn(steward, "第二轮")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert steward.gate.pending() == [], "上一轮的脏带到这一轮了"
+
+
+async def test_looking_at_an_image_again_raises_the_mark(steward_factory, tmp_path):
+    """`look_at_image` 无条件拉高——**选的是严的那一支**,理由写在实现的 docstring 里。"""
+    steward, _ = steward_factory(vision=True)
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    blob = b"\xff\xd8\xff\xe0 photo"
+    digest = hashlib.sha256(blob).hexdigest()
+    (tmp_path / "media" / f"{digest}.jpg").write_bytes(blob)
+    await start_turn(steward)
+
+    tool(steward, "look_at_image")(digest[:12])
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert len(steward.gate.pending()) == 1
