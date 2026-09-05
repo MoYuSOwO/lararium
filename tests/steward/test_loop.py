@@ -846,11 +846,11 @@ async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, 
     ]
 
 
-# ── M5-11 技能路由守卫 ──────────────────────────────────────────────────
+# ── 领域工具的共用装置 ──────────────────────────────────────────────────
 #
-# 这里拿 memory 的 propose_fact 当样本,不是图省事:**它就在账本那条路上**,
-# 而账本是每轮全量注入的前缀区。守卫作用在所有 bundle 工具上(按 manifest 的
-# `tools:` 认领),finance 那边由 test_retry_resume / test_acceptance_m4 覆盖。
+# M5-11 那套「领域工具第一次调用前必须读过总览」的守卫已在 M5-14 摘掉:真机实测它就是
+# 丢账的全部原因(同一串 8 笔,守卫开 3/8、关 8/8),而它逼模型去读的那份总览逐条对下来
+# 只剩两句别处没有的话——那两句已经挪进 docstring,总览删了。这里只留下面这两个装置。
 
 
 def tool(steward, name):
@@ -863,110 +863,6 @@ ALLERGY = {
     "provenance": "user_stated",
     "section": "长期偏好",
 }
-
-
-async def test_a_domain_tool_is_held_until_its_overview_has_been_read(steward_factory):
-    """★ 把「先读总览再动手」从提示变成机制。
-
-    提示词里那条纪律已经写得够硬了(「动手做某个领域的事之前**包括调它的工具**,
-    先 read_skill 读总览」),而实测 mimo **0/25**、deepseek **9/25**
-    ——**提示不是机制,是概率**,而且概率随模型、随纪律列表变长而漂。
-
-    断言两件事:拿到的是提示,而且**副作用没发生**。只断言返回值的话,
-    一个"提示照发、活照干"的实现也能过。
-    """
-    steward, _ = steward_factory()
-    steward._active_envelope_id = "env-1"
-
-    out = tool(steward, "propose_fact")(**ALLERGY)
-
-    assert "read_skill" in out and "memory" in out
-    assert steward.gate.pending() == [] and "花生" not in steward.ledger.read()
-
-
-async def test_the_overview_unlocks_the_domain(steward_factory):
-    """读过总览之后照常执行——守卫是一道门,不是一堵墙。"""
-    steward, _ = steward_factory()
-    steward._active_envelope_id = "env-1"
-    tool(steward, "read_skill")("memory")
-
-    out = tool(steward, "propose_fact")(**ALLERGY)
-
-    assert "read_skill" not in out
-    assert steward.settle_if_needed() == 1 and "花生" in steward.ledger.read()
-
-
-async def test_only_the_overview_counts_not_a_specific_skill(steward_factory):
-    """读 `writing-facts` 不等于读了总览。
-
-    总览里装的是**路由与边界**(哪件事走哪个工具、什么归领域模块),具体方法篇里没有
-    ——认它就等于把守卫要守的那段正文放过去了。
-    """
-    steward, _ = steward_factory()
-    steward._active_envelope_id = "env-1"
-    tool(steward, "read_skill")("memory", "writing-facts")
-
-    assert "read_skill" in tool(steward, "propose_fact")(**ALLERGY)
-
-
-async def test_a_second_call_goes_through_and_leaves_a_trace(steward_factory):
-    """★ **只拦一次,然后放行。**
-
-    拦到底的话,一个不听劝的模型会把"记了但没读方法"变成"根本没记"——那是拿一个轻的
-    失效换一个重的:用户说了一件事,系统里什么都没有,而他不会再说第二遍。
-    放行的那次必须留痕(`skill_gate` 的 `passed_unread`):这是这条机制的漏水口,
-    真机上漏了多少只能靠数据说话,不能靠印象。
-    """
-    steward, _ = steward_factory()
-    steward._active_envelope_id = "env-1"
-    propose = tool(steward, "propose_fact")
-
-    propose(**ALLERGY)  # 被拦下
-    out = propose(**ALLERGY)  # 放行
-
-    assert "read_skill" not in out
-    assert steward.settle_if_needed() == 1, "放行那次没真执行,那就是把轻失效换成了重失效"
-    gates = [e["payload"] for e in steward.journal.replay("env-1") if e["kind"] == "skill_gate"]
-    assert [g["action"] for g in gates] == ["nudged", "passed_unread"]
-    assert all(g["bundle"] == "memory" and g["tool"] == "propose_fact" for g in gates)
-
-
-async def test_built_in_tools_are_never_held(steward_factory):
-    """内置工具不属于任何 bundle,不该被这道门拦——拦了就是把 read_skill 自己也锁在门外。"""
-    steward, _ = steward_factory()
-    steward._active_envelope_id = "env-1"
-
-    assert "+08:00" in tool(steward, "current_time")()
-    assert "核心账本" in tool(steward, "read_skill")("memory")
-
-
-async def test_the_hint_says_exactly_what_to_call(steward_factory):
-    """提示必须是**可照做的**:把该调的那一句原样写进去。
-
-    只说"你还没读方法说明"的话,模型得自己猜 bundle 名怎么拼——而它猜错一次就又是一轮。
-    几个假模型现在正是靠正则从这句话里把 bundle 名抠出来照做的(它们模拟的就是真模型)。
-    """
-    steward, _ = steward_factory()
-    steward._active_envelope_id = "env-1"
-
-    assert 'read_skill("memory")' in tool(steward, "propose_fact")(**ALLERGY)
-
-
-async def test_the_gate_resets_every_turn(steward_factory):
-    """守卫是**每轮**的。
-
-    纪律原话是「没在**当前对话里**读过正文,不许照着干活」,而且压缩会把读过的那段冲掉
-    ——重读几乎不花钱,凭印象干活会出错。
-    """
-    steward, _ = steward_factory([ModelReply(text="好"), ModelReply(text="好")])
-    steward.submit(Envelope.new(source="user", channel="cli", content="第一轮"))
-    await steward.process_next()
-    tool(steward, "read_skill")("memory")
-
-    steward.submit(Envelope.new(source="user", channel="cli", content="第二轮"))
-    await steward.process_next()
-
-    assert "read_skill" in tool(steward, "propose_fact")(**ALLERGY)
 
 
 # ── M5-12 Step 2:给三种失效留痕 ────────────────────────────────────────
@@ -1005,40 +901,6 @@ async def turn(steward, model, content="随便说点什么"):
     steward.submit(env)
     outcome = await steward.process_next()
     return env.id, outcome
-
-
-async def test_reading_an_overview_and_then_doing_nothing_leaves_a_trace(steward_factory):
-    """★ 阳性对照一:读完总览却一次领域工具都没调 → 落一条 `read_only`。
-
-    这一支 `skill_gate` 的两个 action 都盖不到(它压根没调工具,守卫没被触发)。
-    在 `tool_call` 里推得出来,但没有专门的信号,真机上要发现只能靠人去翻。
-    """
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(steward, ToolUsingModel([("read_skill", {"bundle": "memory"})]))
-
-    assert [s["bundle"] for s in signals(steward, env_id, "read_only")] == ["memory"]
-
-
-async def test_a_turn_that_actually_uses_the_domain_leaves_no_read_only_trace(steward_factory):
-    """反向:读了又真干了活,不许落。**一个永远在响的仪器和永远不响的一样没用。**"""
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(
-        steward,
-        ToolUsingModel([("read_skill", {"bundle": "memory"}), ("propose_fact", ALLERGY)]),
-    )
-
-    assert signals(steward, env_id, "read_only") == []
-
-
-async def test_a_turn_that_never_opened_a_domain_leaves_no_read_only_trace(steward_factory):
-    """反向:压根没读过总览的轮次不该被算成"读完不干活"。"""
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(steward, ToolUsingModel([("current_time", {})]))
-
-    assert signals(steward, env_id, "read_only") == []
 
 
 async def test_claiming_to_have_recorded_without_writing_leaves_a_trace(steward_factory):
@@ -1116,20 +978,6 @@ async def test_the_new_signals_never_reach_l0_or_the_search_index(steward_factor
         for t in turns
         for e in t.get("exchanges", ())
     )
-
-
-async def test_a_call_the_gate_blocked_does_not_count_as_a_write(steward_factory):
-    """★ 最危险的那种假阴性:路由守卫拦下了写工具、模型没重试,回复却说"记好了"。
-
-    被拦下的那次**什么都没写**(返回的是提示)。把它算成"写过",这条信号就正好在
-    最该响的时候哑掉——而这正是它要抓的形状之一。
-    """
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(steward, ToolUsingModel([("propose_fact", ALLERGY)], text="记好了。"))
-
-    assert steward.gate.pending() == [], "阳性对照:这一轮本来就不该写进去任何东西"
-    assert len(signals(steward, env_id, "claimed_without_write")) == 1
 
 
 async def test_the_signals_are_computed_per_turn(steward_factory):

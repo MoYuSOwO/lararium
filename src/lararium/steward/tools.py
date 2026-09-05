@@ -122,8 +122,9 @@ class BuiltinTools:
         return f"{now.isoformat(timespec='seconds')} 星期{weekday}"
 
     def read_skill(self, bundle: str, skill: str | None = None) -> str:
-        """读取某个领域的方法说明。不带 skill 名时返回该领域总览(有哪些方法);
-        带 skill 名时返回具体方法正文。照着某个方法干活前必须先读它。"""
+        """读取某个领域的方法篇。不带 skill 名时列出这个领域有哪些方法篇;
+        带 skill 名时返回那一篇的正文。**照着某个方法篇干活之前先读它**;
+        工具本身怎么用看工具自己的说明,不用先读这里。"""
         try:
             return self.registry.read_skill(bundle, skill)
         except KeyError as exc:

@@ -1,27 +1,27 @@
-"""M4-2 的硬前置(M4-1 验收登记一):finance 的 SKILL.md 正文**确实进了模型上下文**。
+"""真机:记账走不走得通,以及**该读方法篇的时候读不读**(M5-14 重写)。
 
-为什么必须是真模型:这条要证的不是"代码里有一条路能读到 SKILL.md",而是"模型真的
-走了那条路"。假模型只会按剧本调它被安排调的工具,那证明的是剧本,不是行为。
-M2/M3 审计九条里有六条是同一个毛病——防护存在,但没人真的走到那里。
+## 这个文件为什么被整份改写
 
-为什么查起居注而不看回复文本:回复里出现「不记进账本」可能是模型顺口说的。
-证据要取模型**实收的那一份**(不可协商第 3 条),也就是起居注里那条 `tool_result`
-事件的正文——它就是框架回灌进对话历史、模型据以作答的字节。
+M4-2 起它钉的是「记账前必须先 read_skill(finance) 读总览」。**那条断言本身是错的**,
+而 M5-11 整条链子就是从"它变红了"开始的——没有人先问过这条断言该不该存在。
 
-**它曾经是红的,而且红了一整个里程碑。** 2026-08-21(mimo-v2.5,每档 5 次)合计
-5/15 ≈ 33%;M5-11 重新量准(每个模型 25 次)更难看:**mimo 0/25、deepseek 9/25**。
-也就是说**靠 prompt 让模型先读总览不是机制,是概率**——而且概率会随模型漂,
-还会随纪律列表变长被挤掉。
+后来量出来的是:那道强制读总览的守卫**就是丢账的全部原因**。同一串 8 笔、每条排干队列:
 
-M4 当时就写下了正确的改法:**给一条强制路径,不是放松断言**。M5-11 把它做了
-——`Steward._require_overview`:领域工具第一次被调用前,该领域总览必须已经进过本轮
-上下文,否则第一次调用只拿到一句可照做的提示、**不产生任何副作用**。
+    守卫开着   账上 3/8   丢 5 笔   谎报 4 次   284 秒
+    守卫关掉   账上 8/8   丢 0 笔   谎报 0 次    55 秒
 
-**判据随之改了一处,理由要说清楚**:原来比的是"读总览"和"第一次调 record_expense"
-的先后。守卫上线后,被拦下的那一次**什么都没记**——拿它当"记账"来比,会把
-「拦下 → 去读 → 再记」这条守卫正常工作的路径判成失败。所以现在比的是**真正生效的
-那一次**(结果不是那句提示的那次)。这不是放松:要证的一直是"正文早于账真的落库",
-被拦下的那次不是落库。
+模型第一次就把参数填对了,是我们把它正确的动作打回去;而回话里没说"这笔没记",
+它读完 skill 以为生效了,于是回「记好了」。而它被逼去读的那份总览,逐条对下来只剩两句
+别处没有的话(长区间截断、相对时间要自己换算)——那两句已经挪进 docstring,总览删了。
+
+## 所以现在钉什么
+
+钉**真正该成立的两条**:
+
+1. 连续记账 8 笔,账上就该有 8 笔——这是用户唯一在乎的事;
+2. 复杂任务(系统看一个月的账)仍然会自己去 `read_skill(finance, monthly-review)`。
+   摘掉守卫不能把"该读的时候也不读了"一起带走;它现在靠的是目录行里那句 desc,
+   **而 desc 从此是承重的**。
 
 跑法(默认跳过,不进日常门禁):
 
@@ -29,7 +29,6 @@ M4 当时就写下了正确的改法:**给一条强制路径,不是放松断言*
 """
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -37,65 +36,79 @@ from lararium.envelope import Envelope
 
 pytestmark = pytest.mark.live
 
-SKILL_PATH = Path("bundles/finance/skills/SKILL.md")
+EXPENSES = [
+    ("打车 28", 2800),
+    ("中午吃饭 45", 4500),
+    ("买了杯咖啡 32", 3200),
+    ("地铁 5 块", 500),
+    ("晚饭 68", 6800),
+    ("水果 23", 2300),
+    ("打车 19", 1900),
+    ("奶茶 16", 1600),
+]
 
 
-@pytest.fixture
-def skill_text() -> str:
-    """总览正文。在 fixture 里读:异步测试体里碰 pathlib 会被 ASYNC240 拦下。"""
-    return SKILL_PATH.read_text(encoding="utf-8").strip()
+async def drain(steward, content):
+    """投一条并**把队列排干**——可重试失败会把信封放回 pending,不排干就统计不准。"""
+    steward.submit(Envelope.new(source="user", channel="cli", content=content))
+    outcome = await steward.process_next()
+    while outcome.kind == "retry_later":
+        outcome = await steward.process_next()
+    return outcome
 
 
-async def test_model_reads_the_finance_overview_before_it_records(
-    live_steward, tmp_path, skill_text
-):
-    """一轮"我今天吃饭花了 45":模型必须先读到 finance 总览正文,再动手记账。
+async def test_eight_expenses_land_as_eight_rows(live_steward, tmp_path):
+    """★ 用户唯一在乎的事:说了八笔,账上就该有八笔——**不丢、不重**。
 
-    断言三件事,全部取自起居注:
-    1. `read_skill` 的 tool_result 里**逐字**含 SKILL.md 全文(正文进了上下文);
-    2. 它的 seq 早于 `record_expense` 的 tool_call(是"读了再干",不是"干完补读");
-    3. 账真的记进了 finance 自己的库(这一轮确实干了活,不是只读不做)。
+    这条钉的是**我们的机制**:M5-11 的守卫会把模型填对了的调用打回去,同一串八笔只剩
+    三笔(守卫开 3/8、关 8/8)。条数是确定性的,守卫回来了它立刻红。
+
+    **金额对不对是另一件事,只打印不断言**,理由要说清楚免得被当成放宽:那测的是模型
+    的抄写准确度(实测见过「水果 23」被填成 24),n=1 的真机测试钉不住它,钉了就是一条
+    随机红的测试——比没有更糟。它属于"错记"那一类,单独立项对账,而**这里少一条断言
+    不代表那件事不重要**:所以对不上时照样把两串数字打出来。
     """
-    env = Envelope.new(source="user", channel="cli", content="我今天吃饭花了 45")
+    for content, _cents in EXPENSES:
+        outcome = await drain(live_steward, content)
+        assert outcome.kind == "replied", f"「{content}」这一轮没走到终态:{outcome}"
+
+    conn = sqlite3.connect(tmp_path / "finance" / "finance.sqlite")
+    rows = list(conn.execute("SELECT amount_cents, category, note FROM expenses"))
+    conn.close()
+    got, want = sorted(r[0] for r in rows), sorted(c for _t, c in EXPENSES)
+    print("\n[落库]", rows)
+    if got != want:
+        print(f"[金额对不上] 期望 {want} 实际 {got} —— 模型抄错,不是丢账,见 docstring")
+
+    assert len(rows) == len(EXPENSES), (
+        f"说了 {len(EXPENSES)} 笔,账上 {len(rows)} 条:"
+        f"{'少了(丢账)' if len(rows) < len(EXPENSES) else '多了(重记)'}。{rows}"
+    )
+
+
+async def test_a_systematic_review_still_goes_and_reads_the_method(live_steward):
+    """★ 摘掉守卫不能把"该读的时候也不读了"一起带走。
+
+    总览没了之后,模型决定要不要读 `monthly-review` 手里只有目录行里那句
+    「monthly-review    怎么看一个月的账」。这条钉的就是**那句 desc 还在承重**。
+
+    判据取起居注里的调用,不看回复措辞——它可以说"我看了一下方法"而根本没调。
+    """
+    env = Envelope.new(
+        source="user", channel="cli", content="帮我系统地看一下这个月的账,有什么该注意的"
+    )
     live_steward.submit(env)
     outcome = await live_steward.process_next()
     assert outcome.kind == "replied", f"这一轮没走到终态:{outcome}"
 
-    events = live_steward.journal.replay(env.id)
-    calls = [(e["seq"], e["payload"].get("tool")) for e in events if e["kind"] == "tool_call"]
-    reads = [
-        e for e in events if e["kind"] == "tool_result" and e["payload"].get("tool") == "read_skill"
+    calls = [
+        (e["payload"].get("tool"), e["payload"].get("args"))
+        for e in live_steward.journal.replay(env.id)
+        if e["kind"] == "tool_call"
     ]
-
-    # 把真机行为原样打出来,验收记录直接抄这段(-s 可见)
-    print("\n[工具调用顺序]", calls)
+    print("\n[工具调用]", calls)
     print("[回复]", outcome.text)
 
-    hit = [r for r in reads if skill_text in r["payload"].get("content", "")]
-    assert hit, (
-        "模型没把 finance 总览读进上下文——read_skill 的 tool_result 里没有 SKILL.md 全文。"
-        f"本轮工具调用:{calls}"
+    assert any(tool == "read_skill" and "monthly-review" in str(args) for tool, args in calls), (
+        f"复杂任务没去读方法篇——目录行那句 desc 不再承重了:{calls}"
     )
-
-    # **生效的那次**才算记账:被路由守卫拦下的那次结果是一句提示,库里什么都没多。
-    results = {e["payload"].get("tool_call_id"): e for e in events if e["kind"] == "tool_result"}
-    effective = [
-        e["seq"]
-        for e in events
-        if e["kind"] == "tool_call"
-        and e["payload"].get("tool") == "record_expense"
-        and "read_skill("
-        not in str(
-            results.get(e["payload"].get("tool_call_id"), {}).get("payload", {}).get("content", "")
-        )
-    ]
-    assert effective, f"模型没真记上账,这一轮没走到要证的那步。工具调用:{calls}"
-    assert hit[0]["seq"] < effective[0], (
-        "SKILL.md 是在记账**之后**才读的——正文进了上下文,但没能影响这次动作。"
-    )
-
-    conn = sqlite3.connect(tmp_path / "finance" / "finance.sqlite")
-    rows = list(conn.execute("SELECT amount_cents, category, occurred_at FROM expenses"))
-    conn.close()
-    print("[落库]", rows)
-    assert rows, "record_expense 调过了,但库里没有流水"

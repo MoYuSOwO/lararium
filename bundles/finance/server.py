@@ -226,7 +226,8 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
     ) -> str:
         """记一笔支出。amount 为元(内部转整数分存储,不存浮点);category 必须是固定
         类目之一(餐饮|交通|日用|娱乐|医疗|人情|其他),非法类目返回可读提示并列出合法值;
-        occurred_at 缺省用当前时间,给了就用给的。"""
+        occurred_at 缺省用当前时间,给了就用给的——「昨天」「上周三」这类**相对时间要
+        先调 current_time 拿到今天是几号、自己换算成 YYYY-MM-DD 再传**,这里认不了。"""
         cents = _to_cents(amount)
         if cents is None or cents <= 0 or cents > _MAX_CENTS:
             return f"金额不对({amount}):要一个大于 0 的数字,单位是元(比如 28.5)。这笔没记。"
@@ -278,7 +279,9 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
     ) -> str:
         """按类目/按天聚合一段时间内的支出(since/until 格式 YYYY-MM-DD,两端都含),
         group_by 取 category(按类目,金额从高到低)或 day(按天,时间正序);返回总额 +
-        每组一行结论;聚合在 SQL 里算完再返回,**绝不返回单笔流水**。"""
+        每组一行结论;聚合在 SQL 里算完再返回,**绝不返回单笔流水**。
+        区间太长时按天会砍掉最早那段、合并成一行「更早 N 天合计」放在最前面,
+        而**总额那一行始终是全区间的**。"""
         start, end = _parse_day(since), _parse_day(until)
         if start is None or end is None:
             bad = since if start is None else until

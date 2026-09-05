@@ -34,10 +34,17 @@ def test_directory_lines_are_deterministic(registry):
     assert registry.directory_lines() == other.directory_lines()
 
 
-def test_read_skill_without_name_returns_overview(registry):
+def test_read_skill_without_name_lists_the_skills(registry):
+    """M5-14:不带 skill 名 → **列出这个领域有哪些方法篇,不报错**。
+
+    模型自然会先这么调一次;拿"读取失败"惩罚一个合理动作,它下次就绕着走,
+    而绕法不可控。原来这一支读的是总览,而总览已经删了。
+    """
     text = registry.read_skill("memory", None)
-    assert "# memory" in text
+
     assert "writing-facts" in text
+    assert "什么该入账本" in text
+    assert "失败" not in text
 
 
 def test_read_skill_with_name_returns_body(registry):
@@ -109,8 +116,13 @@ def test_finance_directory_line_lists_monthly_review(registry):
 
     这是本里程碑第二次、也是最后一次目录行变动——D3 认可的重建点。
     """
-    line = next(line for line in registry.directory_lines().splitlines() if "finance" in line)
-    assert "monthly-review" in line
+    lines = registry.directory_lines().splitlines()
+    top = next(i for i, line in enumerate(lines) if line.startswith("- finance"))
+
+    # M5-14:改成嵌套列表,方法篇各占一行。**这一行就是路由的全部出处**——总览没了,
+    # 模型决定要不要读某篇,手里只有这句 desc。
+    assert lines[top + 1].strip().startswith("* monthly-review")
+    assert "怎么看一个月的账" in lines[top + 1]
 
 
 def test_read_skill_rejects_unknown_skill_name_in_finance(registry):

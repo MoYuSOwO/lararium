@@ -32,11 +32,6 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-# 领域工具被拦下时回给模型的话。**要能照着做**:说清楚缺什么、怎么补、以及这不是建议。
-# 短是有理由的——它会进 L0(工具结果上限 200 字符),而它只是一次路由提示,不是内容。
-SKILL_GATE_HINT = '还没读 {bundle} 的方法说明。先调 read_skill("{bundle}") 看完总览,再调这个工具。'
-
-
 # 回复里这些词等于向用户**承诺已经写下了**。M5-12 拿它配合"这一轮有没有写工具跑过"
 # 落一条留痕。措辞取自实测到的那次(mimo:「『房租每月 3800』已经在账本里了」,
 # 而账本是空的)和 discipline 自己的原话(「说"记好了"之前,先真的把工具调了」)。
@@ -110,14 +105,9 @@ class Steward:
         self._resume_consumed: list[bool] = []
         self._resume_cursor = 0
         self._active_envelope_id = ""
-        # M5-11 技能路由守卫:本轮已读过总览的 bundle,以及已经提醒过一次的 bundle。
-        self._overview_read: set[str] = set()
-        self._skill_nudged: set[str] = set()
-        # M5-12 留痕用:本轮真正跑过的领域(bundle 名)与写工具(工具名)。
-        self._domain_used: set[str] = set()
+        # M5-12 留痕用:本轮真正跑过的写工具(工具名)。
         self._writes_done: set[str] = set()
-        # 一次读定:manifest 是启动时加载的,这两份映射不会中途变。
-        self._tool_owners = registry.tool_owners()
+        # 一次读定:manifest 是启动时加载的,这份映射不会中途变。
         self._write_tools = registry.write_tools()
         self.tools = BuiltinTools(
             journal,
@@ -140,75 +130,12 @@ class Steward:
         - M4-5d:**所有**工具再包一层断点续跑。放最外层是必须的——回放时连内层的
           propose 守卫都不该走到,因为那次调用这一轮压根没发生。
         """
-        owners = self._tool_owners
-        tools = [
-            self._note_overview_read(t) if getattr(t, "__name__", "") == "read_skill" else t
-            for t in self.tools.as_tool_functions()
-        ]
+        tools = list(self.tools.as_tool_functions())
         for t in self.bundle_tools:
-            name = getattr(t, "__name__", "")
-            if name == "propose_fact":
+            if getattr(t, "__name__", "") == "propose_fact":
                 t = self._guard_propose_fact(t)
-            if name in owners:
-                t = self._require_overview(t, owners[name])
             tools.append(t)
         return [self._resumable(t) for t in tools]
-
-    def _note_overview_read(self, original: Callable[..., str]) -> Callable[..., str]:
-        """记下"这一轮读过谁的总览"。**只认总览**(不带 skill 名那一次)。
-
-        读了 `monthly-review` 不等于读了总览:总览里装的是路由与边界(哪笔走哪个工具、
-        流水不进账本),具体方法篇里没有。
-        """
-
-        @functools.wraps(original)
-        def noting(bundle: str, skill: str | None = None) -> str:
-            result = original(bundle, skill)
-            if skill is None and not result.startswith("读取失败"):
-                self._overview_read.add(bundle)
-            return result
-
-        return noting
-
-    def _require_overview(self, original: Callable[..., Any], bundle: str) -> Callable[..., Any]:
-        """领域工具第一次被调用前,**该领域的总览必须已经进过本轮上下文**。
-
-        为什么要有这条机制(M5-11 实测):提示词里那条纪律写得已经够硬了
-        ——「动手做某个领域的事之前**包括调它的工具**,先 read_skill 读总览」
-        ——而实测 mimo **0/25**、deepseek **9/25**。**提示不是机制,是概率**,
-        而且概率会随模型、随纪律列表变长而漂。这里把它变成一条真路径。
-
-        **只拦一次,然后放行**(`_skill_nudged`)。拦到底的话,一个不听劝的模型会把
-        "记了账但没读方法"变成"根本没记账"——那是把一个轻的失效换成一个重的:
-        用户说了一笔,账上什么都没有,而他不会再说第二遍。提醒过就放行,并且留痕。
-        """
-
-        @functools.wraps(original)
-        def gated(*args: Any, **kwargs: Any) -> Any:
-            if bundle not in self._overview_read:
-                unread_twice = bundle in self._skill_nudged
-                self._journal_skill_gate(bundle, getattr(original, "__name__", ""), unread_twice)
-                if not unread_twice:
-                    self._skill_nudged.add(bundle)
-                    return SKILL_GATE_HINT.format(bundle=bundle)
-            return original(*args, **kwargs)
-
-        return gated
-
-    def _journal_skill_gate(self, bundle: str, tool: str, passed_unread: bool) -> None:
-        """留痕。**"提醒之后还是没读就放行"这一支必须查得到**——它是这条机制的漏水口,
-        真机上漏了多少只能靠数据说话,不能靠印象。"""
-        if not self._active_envelope_id:
-            return
-        self.journal.append(
-            self._active_envelope_id,
-            "skill_gate",
-            {
-                "bundle": bundle,
-                "tool": tool,
-                "action": "passed_unread" if passed_unread else "nudged",
-            },
-        )
 
     def _resumable(self, original: Callable[..., Any]) -> Callable[..., Any]:
         """重试时按顺序回放上一次已成功的调用,只从断点之后开始真执行(M4-5d)。
@@ -262,45 +189,30 @@ class Steward:
         return resumable
 
     def _note_tool_use(self, name: str, result: Any) -> None:
-        """记下"这一轮真的用过谁"。**挂在最外层(`_resumable`)是有理由的**:
+        """记下"这一轮真的写过什么"。**挂在最外层(`_resumable`)是有理由的**:
         重试轮里工具结果是回放的,内层压根不会被调到——挂在内层的话,一次 429 之后
         整轮的写入都会被算成"没写过",`claimed_without_write` 就开始瞎报。
-
-        唯一要排除的是**被路由守卫拦下的那次**:它返回的是提示,什么都没发生。
-        按返回值逐字比对——那句提示是确定性的,而真工具不会恰好回出同一句话。
         """
-        bundle = self._tool_owners.get(name)
-        if bundle is None:
-            return  # 内置工具不算"用过某个领域"
-        if isinstance(result, str) and result == SKILL_GATE_HINT.format(bundle=bundle):
-            return
-        self._domain_used.add(bundle)
+        del result  # 现在只看调了什么;M5-11 那个要按返回值排除的守卫已经摘了
         if name in self._write_tools:
             self._writes_done.add(name)
 
     def _journal_turn_signals(self, envelope_id: str, reply_text: str) -> None:
-        """两条**只留痕、绝不改行为、绝不报警**的信号(M5-12)。
+        """一条**只留痕、绝不改行为、绝不报警**的信号(M5-12;M5-14 去掉了 read_only)。
 
-        - `read_only`:读了某个领域的总览,却一次它的工具都没调——"漏做"那一支。
-          `skill_gate` 的两个 action 都盖不到它(它压根没触发守卫)。
-        - `claimed_without_write`:回复里承诺"已记",而这一轮没有任何写工具跑过。
+        `claimed_without_write`:回复里承诺"已记",而这一轮没有任何写工具跑过。
+        真机 3/3 真阳性零误报,和 M5-11 那个守卫无关,所以守卫摘掉它照旧留着。
 
-        **第二条落的是「疑似」不是「判定」**:事实可能上一轮就已经在账本里,那句
+        **它落的是「疑似」不是「判定」**:事实可能上一轮就已经在账本里,那句
         「已经在账本里了」是对的。所以它只留痕——**别把它升级成拦截或报警**,
         那需要的是对账,不是留痕。价值全在"事后翻得到"。
 
-        两条都不进 L0、不进检索索引(照 `tool_executed` / `skill_gate` 的先例):
+        它不进 L0、不进检索索引(照 `tool_executed` 的先例):
         进了就是拿模型的上下文预算装我们自己的仪表盘,而且模型会开始对着它解释自己。
         """
-        for bundle in sorted(self._overview_read - self._domain_used):
-            self.journal.append(envelope_id, "read_only", {"bundle": bundle})
         matched = [m for m in CLAIM_MARKERS if m in (reply_text or "")]
         if matched and not self._writes_done:
-            self.journal.append(
-                envelope_id,
-                "claimed_without_write",
-                {"markers": matched, "domains_used": sorted(self._domain_used)},
-            )
+            self.journal.append(envelope_id, "claimed_without_write", {"markers": matched})
 
     def _take_resumed_result(self, name: str) -> str | None:
         """位置优先,配不上就在剩余队列里向后按名字找;都没有就返回 None(真执行)。
@@ -389,11 +301,6 @@ class Steward:
         self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
-        # 路由守卫是**每轮**的:上一轮读过不算数(纪律原话是"没在当前对话里读过正文,
-        # 不许照着干活",而且压缩会把读过的那段冲掉——重读几乎不花钱)。
-        self._overview_read = set()
-        self._skill_nudged = set()
-        self._domain_used = set()
         self._writes_done = set()
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
@@ -496,7 +403,7 @@ class Steward:
             self.journal.append(env.id, "error", {"content": str(exc)})
             # M5-13:工具重试耗尽时,把"模型填了什么 / 服务端反馈了什么"落在 error 旁边。
             # 只有那一行 `exceeded max retries count of 1` 的话,事后什么都查不出来。
-            # 和 skill_gate / read_only 同一类:不进 L0、不进检索索引。
+            # 和 tool_executed 同一类:不进 L0、不进检索索引。
             if exc.details:
                 self.journal.append(env.id, "tool_retry", {"details": list(exc.details)})
             attempts = self.inbox.attempts(env.id)

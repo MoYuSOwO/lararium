@@ -94,10 +94,15 @@ def test_tool_order_is_frozen_and_matches_manifest(runtime):
     assert got == list(manifest["tools"])
 
 
-def test_skill_overview_exists(runtime):
+def test_every_skill_named_in_the_manifest_has_a_file(runtime):
+    """M5-14:总览(SKILL.md)删掉了——2073 字节里别处没有的只剩两句,已经挪进 docstring。
+    钉的改成"manifest 点到的方法篇必须真的在",那才是路由真正依赖的东西。"""
     root = Path("bundles/finance")
-    assert (root / "skills" / "SKILL.md").exists()
-    assert (root / "skills" / "SKILL.md").read_text(encoding="utf-8").lstrip().startswith("#")
+    manifest = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+    assert not (root / "skills" / "SKILL.md").exists(), "总览回来了?它是会悄悄腐烂的那一层"
+    for skill in manifest["skills"]:
+        body = root / "skills" / f"{skill['name']}.md"
+        assert body.exists() and body.read_text(encoding="utf-8").lstrip().startswith("#")
 
 
 def test_manifest_is_parseable_and_names_finance(runtime):

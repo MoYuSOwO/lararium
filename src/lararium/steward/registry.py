@@ -65,12 +65,18 @@ class Registry:
             raise ValueError(f"{path} 不是合法的 bundle manifest:{exc}") from exc
 
     def directory_lines(self) -> str:
-        """前缀第1层的目录部分。排序确定,内容不含时间——字节稳定。"""
+        """前缀第1层的目录部分。排序确定,内容不含时间——字节稳定。
+
+        M5-14 起改成嵌套列表,而且它**就是路由的全部出处**:总览(SKILL.md)删掉了,
+        模型决定"要不要读某份方法篇"手里只有下面那一行 desc。实测这样够用——不带守卫时
+        记账/查账直接调工具、月度复盘主动去读 monthly-review,靠的正是这句 desc。
+
+        **所以 desc 从此是承重的**:写 manifest 的时候要当回事,它不再是一句注解。
+        """
         lines = []
         for b in self.bundles:
-            skills = " / ".join(f"{s.name}({s.desc})" for s in b.skills)
-            suffix = f" [skills: {skills}]" if skills else ""
-            lines.append(f"- {b.name}:{b.description}{suffix}")
+            lines.append(f"- {b.name} —— {b.description}")
+            lines.extend(f"    * {s.name}    {s.desc}" for s in b.skills)
         return "\n".join(lines)
 
     def write_tools(self) -> set[str]:
@@ -78,20 +84,25 @@ class Registry:
         ——那张清单会在下一个 bundle 加工具时悄悄过期,而过期的表现是仪器不响。"""
         return {tool for b in self.bundles for tool in b.writes}
 
-    def tool_owners(self) -> dict[str, str]:
-        """工具名 → 它属于哪个 bundle。manifest 的 `tools:` 本来就是这份映射的出处,
-        路由守卫据此知道"调这个工具之前该读谁的总览"。"""
-        return {tool: b.name for b in self.bundles for tool in b.tools}
-
     def get(self, bundle: str) -> BundleInfo:
         if bundle not in self._by_name:
             raise KeyError(f"没有这个 bundle: {bundle};已注册: {sorted(self._by_name)}")
         return self._by_name[bundle]
 
     def read_skill(self, bundle: str, skill: str | None = None) -> str:
+        """不带 skill 名时列出这个领域有哪些方法篇,**不报错**(M5-14)。
+
+        原来这一支读的是 `SKILL.md` 总览,而那份总览逐条对下来只剩两句别处没有的话,
+        其余全是 docstring 和 discipline 的重复——它是一层会悄悄腐烂的文档,已经删掉。
+        模型自然会先这么调一次;拿"读取失败"惩罚一个合理动作,它下次就绕着走,
+        而绕法不可控。
+        """
         info = self.get(bundle)
         if skill is None:
-            return (info.root / "skills" / "SKILL.md").read_text(encoding="utf-8")
+            if not info.skills:
+                return f"{bundle} 没有额外的方法篇,直接用它的工具就行。"
+            listed = "\n".join(f"- {s.name}:{s.desc}" for s in info.skills)
+            return f'{bundle} 有这些方法篇(要哪篇就 read_skill("{bundle}", "名字")):\n{listed}'
         if skill not in {s.name for s in info.skills}:
             raise KeyError(
                 f"{bundle} 没有这个 skill: {skill};可用: {[s.name for s in info.skills]}"

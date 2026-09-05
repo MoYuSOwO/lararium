@@ -110,6 +110,7 @@ def test_skill_files_referenced_in_manifest_exist():
 
     root = Path("bundles/memory")
     manifest = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
-    assert (root / "skills" / "SKILL.md").exists()
+    # M5-14:总览删掉了(重复的一层文档),路由改由目录行 + manifest 的 desc 承担
+    assert not (root / "skills" / "SKILL.md").exists()
     for skill in manifest["skills"]:
         assert (root / "skills" / f"{skill['name']}.md").exists()
