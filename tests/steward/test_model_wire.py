@@ -478,3 +478,72 @@ def test_unwrap_only_strips_an_exact_envelope(args, schema, expected):
     今天"含有 arguments 就剥",明天就有一次合法调用被拆散。所以正例反例一起钉。
     """
     assert unwrap_tool_args(args, schema) == expected
+
+
+# ── M5-16:多轮历史的报文形状,把人工审计钉成常驻门禁 ────────────────────
+
+
+def audit_history(messages: list[dict[str, Any]]) -> list[str]:
+    """报文里工具往返的四项检查,和 M5-16 手工 dump 时用的是同一套判据。"""
+    problems: list[str] = []
+    calls: dict[str, int] = {}
+    for i, m in enumerate(messages):
+        if m.get("role") == "assistant":
+            for c in m.get("tool_calls") or []:
+                calls[c["id"]] = i
+        elif m.get("role") == "tool":
+            cid = m.get("tool_call_id")
+            if cid not in calls:
+                problems.append(f"#{i} tool 消息 {cid!r} 没有前置的 assistant 调用")
+            elif calls[cid] > i:
+                problems.append(f"#{i} tool 消息排在它的调用之前")
+    answered = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+    problems += [f"调用 {cid} 没有配对结果(孤儿)" for cid in calls if cid not in answered]
+    return problems
+
+
+async def test_the_rebuilt_history_is_well_formed_on_the_wire(wire):
+    """★ M5-16:**我们自己重建的那份多轮历史,发出去必须是合法的。**
+
+    M4-5c v2 起,历史里的工具往返是我们从起居注重建的(assistant 带 tool_calls +
+    配对的 tool 消息)。重建里只要有一处不对——id 配不上、有结果没有调用、顺序错位
+    ——任何模型都会被带歪,而症状是"它记错了账",没有人会往报文上想。
+
+    M5-16 手工 dump 过一次、逐条查干净了;这条把那次审计钉成常驻的,免得下次改
+    assembler 时悄悄破掉,又要重新查一遍才发现。
+    """
+    client, bodies = wire
+    history = (("打车 28", "记好了。"), ("买菜 62", "记好了。"))
+    messages: list[dict[str, Any]] = []
+    for i, (user, assistant) in enumerate(history):
+        messages.append({"role": "user", "content": user})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": f"c{i}", "name": "record_expense", "args": '{"amount": 28}'}],
+            }
+        )
+        messages.append(
+            {"role": "tool", "tool_call_id": f"c{i}", "name": "record_expense", "content": "记好了"}
+        )
+        messages.append({"role": "assistant", "content": assistant})
+    messages.append({"role": "user", "content": "咖啡 22"})
+
+    await client.run(AssembledContext(system_prompt=PREFIX, messages=messages), [], [])
+
+    sent = bodies[-1]["messages"]
+    assert audit_history(sent) == [], f"发出去的历史形状不合法:{audit_history(sent)}"
+    # 阳性对照:这份报文里**确实有**工具往返,不然上面那条是在审计一份空历史
+    assert sum(1 for m in sent if m.get("role") == "tool") == len(history)
+
+
+def test_the_audit_itself_catches_a_broken_history():
+    """给审计自己的阳性对照:它得真能否掉东西,不然它只是一句好听的话。"""
+    orphan_result = [{"role": "tool", "tool_call_id": "x", "content": "结果"}]
+    orphan_call = [
+        {"role": "assistant", "tool_calls": [{"id": "y", "function": {"name": "f"}}]},
+    ]
+
+    assert audit_history(orphan_result), "有结果没有调用,居然没查出来"
+    assert audit_history(orphan_call), "有调用没有结果,居然没查出来"
