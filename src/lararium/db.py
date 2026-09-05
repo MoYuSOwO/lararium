@@ -159,8 +159,10 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    for probe, column, ddl in _ADDED_COLUMNS:
+def add_missing_columns(conn: sqlite3.Connection, specs: tuple[tuple[str, str, str], ...]) -> None:
+    """按 (探测语句, 列名, 补列语句) 逐条补。**公开给 bundle 用**:它们各有各的库,
+    面对的是同一个"新字段只写进 SCHEMA、老库永远看不到"的坑,不该各写一份。"""
+    for probe, column, ddl in specs:
         if column not in {row[1] for row in conn.execute(probe)}:
             conn.execute(ddl)
 
@@ -289,7 +291,7 @@ def connect(path: Path) -> GuardedConnection:
     vec_ok = _load_vec_extension(conn)
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA + (_VEC_SCHEMA if vec_ok else ""))
-    _add_missing_columns(conn)
+    add_missing_columns(conn, _ADDED_COLUMNS)
     return conn
 
 

@@ -90,6 +90,8 @@ def test_tool_order_is_frozen_and_matches_manifest(runtime):
         "record_expense",
         "query_spending",
         "list_recent",
+        # M5-15:amend_expense **追加在末尾**,前三位一个都没动
+        "amend_expense",
     ]
     assert got == list(manifest["tools"])
 

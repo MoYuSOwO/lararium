@@ -152,7 +152,7 @@ def test_write_tools_come_from_the_manifests(tmp_path):
     ——那张清单会在下一个 bundle 加工具时悄悄过期,而过期的表现是仪器不响。"""
     reg = Registry.load(Path("bundles"))
 
-    assert reg.write_tools() == {"propose_fact", "record_expense"}
+    assert reg.write_tools() == {"propose_fact", "record_expense", "amend_expense"}
 
 
 def test_a_manifest_without_reads_is_rejected_loudly(tmp_path):

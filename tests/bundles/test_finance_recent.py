@@ -35,7 +35,9 @@ def test_lists_the_most_recent_first(finance):
     said = recent(3)
 
     body = said.splitlines()[1:]
-    assert [line.split()[1] for line in body] == ["2026-08-05", "2026-08-03", "2026-08-01"]
+    # M5-15 起每行开头多了可指认的 #id(用户说「第三笔记错了」得有东西可指),日期后移一位
+    assert [line.split()[2] for line in body] == ["2026-08-05", "2026-08-03", "2026-08-01"]
+    assert all(line.split()[1].startswith("#") for line in body), said
 
 
 def test_limit_is_clamped_to_the_hard_cap(finance):
