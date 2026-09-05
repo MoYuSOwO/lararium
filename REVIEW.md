@@ -10020,3 +10020,26 @@ read_only               0/8 误报
 **5/5 都不是重复记账**——第一次是被 M5-11 的路由守卫拦下(返回提示、什么都没做),
 第二次才真记。这正好是 M5-12 里「被守卫拦下的那次不算写过」那条判据在真机上的样子。
 (只是 5 次,不构成"不会重复"的保证。)
+
+### 补记:换到 AMD 端点(2026-09-05)
+
+`https://developer.amd.com.cn/radeon/api/v1`,模型 `DeepSeek-V4-Flash-Vision-Exp`。
+**和 lunadeer 完全两回事,三条都干净:**
+
+```
+/models        4 个,DeepSeek-V4-Flash-Vision-Exp 真的在里面
+标签 vs 后端    连发 6 次,6/6 都是 self-dploy/DeepSeek-V4-Flash-Vision-Exp —— 不换池子
+读图           ✅ 读出 CODE: XJKY;usage 里有 image_tokens / cache_write_tokens
+```
+
+**所以注入验收重新跑得起来了**——`LARARIUM_VISION` 已置 `on`,
+`test_live_vision_injection` 两条全过(lunadeer 上是根本跑不了)。
+live 套件 4 passed / 3 failed,过的包含两条注入验收和 finance skill 那条。
+
+**三条失败全是同一个,已立为 M5-13**:`record_expense` 的工具重试耗尽
+(`exceeded max retries count of 1`),连续记账到第 2~6 轮必现。查到"看不见原因"为止:
+pydantic-ai 吞了校验详情,起居注里只有那一行,三种抓报文的办法都没拦到那条 client。
+排除项写进任务书了(单轮参数 0/8 有问题、工具自己不抛、耗时与成功轮同量级)。
+
+**顺带一条真机观测**:raw 探针里见过一次模型**没调工具却回「好的,已经帮你记了一笔
+餐饮支出12元」**——M5-12 装的 `claimed_without_write` 要抓的正是这个形状。
