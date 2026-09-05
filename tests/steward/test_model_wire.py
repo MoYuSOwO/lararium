@@ -391,10 +391,9 @@ async def test_a_doubly_wrapped_arguments_envelope_is_unwrapped(http_spy_factory
             ),
         )
 
-    reply = await http_spy_factory(handler).run(ctx(), [record_expense], [])
+    await http_spy_factory(handler).run(ctx(), [record_expense], [])
 
     assert seen == [(5, "交通")], "多包的那层没剥掉,这一笔又丢了"
-    assert reply.unwrapped_args == 1, "剥了却不计数——那就没人知道服务商还在不在抽"
 
 
 async def test_normal_arguments_are_left_alone(http_spy_factory, reply_factories):
@@ -418,10 +417,9 @@ async def test_normal_arguments_are_left_alone(http_spy_factory, reply_factories
             ),
         )
 
-    reply = await http_spy_factory(handler).run(ctx(), [record_expense], [])
+    await http_spy_factory(handler).run(ctx(), [record_expense], [])
 
     assert seen == [(28, "交通")]
-    assert reply.unwrapped_args == 0
 
 
 async def test_a_tool_that_really_takes_arguments_is_not_unwrapped(
@@ -446,10 +444,9 @@ async def test_a_tool_that_really_takes_arguments_is_not_unwrapped(
             return httpx.Response(200, json=text_reply("好"))
         return httpx.Response(200, json=wrapped_call_reply("relay", '{"arguments": {"a": 1}}'))
 
-    reply = await http_spy_factory(handler).run(ctx(), [relay], [])
+    await http_spy_factory(handler).run(ctx(), [relay], [])
 
     assert seen == [{"a": 1}], "把一次合法调用拆散了"
-    assert reply.unwrapped_args == 0
 
 
 @pytest.mark.parametrize(

@@ -13,8 +13,6 @@ from pathlib import Path
 
 import pytest
 
-from lararium.steward.registry import Registry
-
 SOURCE_ROOTS = (Path("src"), Path("bundles"))
 
 
@@ -251,30 +249,6 @@ def test_the_sqlite_guard_does_not_fire_on_type_annotations() -> None:
     source = "import sqlite3\ndef f(c: sqlite3.Connection) -> sqlite3.Row: ...\nx = sqlite3.Row"
 
     assert _sqlite_connect_calls(ast.parse(source)) == []
-
-
-def test_writes_and_reads_exactly_partition_the_tools() -> None:
-    """`tools:` 必须**恰好**被 `writes:` 与 `reads:` 划分,且两边不相交(M5-12 补)。
-
-    第一版只断言"writes 里的名字在 tools 里"。那挡得住**填错字**,挡不住
-    **加了写工具忘了登记**——拿变异试过,一声不响就过了。而漏登记的表现是
-    `claimed_without_write` 从此对那个工具永远不响:一个永远不响的仪器比没有更坏,
-    它让人以为这件事被盯着。
-
-    要求划分,是为了逼出一个决定:新加的工具到底写不写。两边都不填就装不上
-    (`Registry._parse_manifest` 会炸),填一半就红在这里。
-    """
-    offenders: list[str] = []
-    for b in Registry.load(Path("bundles")).bundles:
-        tools, writes, reads = set(b.tools), set(b.writes), set(b.reads)
-        if writes & reads:
-            offenders.append(f"{b.name}: {sorted(writes & reads)} 同时算写又算读")
-        if missing := tools - writes - reads:
-            offenders.append(f"{b.name}: {sorted(missing)} 没登记是写还是读")
-        if extra := (writes | reads) - tools:
-            offenders.append(f"{b.name}: {sorted(extra)} 登记了但 tools 里没有")
-
-    assert offenders == [], offenders
 
 
 def test_assembler_never_reads_the_clock() -> None:

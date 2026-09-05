@@ -32,21 +32,6 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-# 回复里这些词等于向用户**承诺已经写下了**。M5-12 拿它配合"这一轮有没有写工具跑过"
-# 落一条留痕。措辞取自实测到的那次(mimo:「『房租每月 3800』已经在账本里了」,
-# 而账本是空的)和 discipline 自己的原话(「说"记好了"之前,先真的把工具调了」)。
-CLAIM_MARKERS = (
-    "记下了",
-    "记好了",
-    "记上了",
-    "已记",
-    "已经记",
-    "已入档",
-    "已提交",
-    "已经在账本里",
-)
-
-
 # L0 预算里给"工具 schema + 输出窗口"的固定留白(token)。工具 schema 实测约
 # 500/请求;输出要占窗口,单用户交互给足 8000。M3-6 的低水位也要继承这个估算口径。
 L0_RESERVE = 8000
@@ -105,10 +90,6 @@ class Steward:
         self._resume_consumed: list[bool] = []
         self._resume_cursor = 0
         self._active_envelope_id = ""
-        # M5-12 留痕用:本轮真正跑过的写工具(工具名)。
-        self._writes_done: set[str] = set()
-        # 一次读定:manifest 是启动时加载的,这份映射不会中途变。
-        self._write_tools = registry.write_tools()
         self.tools = BuiltinTools(
             journal,
             registry,
@@ -164,7 +145,6 @@ class Steward:
             name = getattr(original, "__name__", "")
             replayed = self._take_resumed_result(name)
             result = original(*args, **kwargs) if replayed is None else replayed
-            self._note_tool_use(name, result)
             if self._active_envelope_id:
                 self.journal.append(
                     self._active_envelope_id,
@@ -187,32 +167,6 @@ class Steward:
             return result
 
         return resumable
-
-    def _note_tool_use(self, name: str, result: Any) -> None:
-        """记下"这一轮真的写过什么"。**挂在最外层(`_resumable`)是有理由的**:
-        重试轮里工具结果是回放的,内层压根不会被调到——挂在内层的话,一次 429 之后
-        整轮的写入都会被算成"没写过",`claimed_without_write` 就开始瞎报。
-        """
-        del result  # 现在只看调了什么;M5-11 那个要按返回值排除的守卫已经摘了
-        if name in self._write_tools:
-            self._writes_done.add(name)
-
-    def _journal_turn_signals(self, envelope_id: str, reply_text: str) -> None:
-        """一条**只留痕、绝不改行为、绝不报警**的信号(M5-12;M5-14 去掉了 read_only)。
-
-        `claimed_without_write`:回复里承诺"已记",而这一轮没有任何写工具跑过。
-        真机 3/3 真阳性零误报,和 M5-11 那个守卫无关,所以守卫摘掉它照旧留着。
-
-        **它落的是「疑似」不是「判定」**:事实可能上一轮就已经在账本里,那句
-        「已经在账本里了」是对的。所以它只留痕——**别把它升级成拦截或报警**,
-        那需要的是对账,不是留痕。价值全在"事后翻得到"。
-
-        它不进 L0、不进检索索引(照 `tool_executed` 的先例):
-        进了就是拿模型的上下文预算装我们自己的仪表盘,而且模型会开始对着它解释自己。
-        """
-        matched = [m for m in CLAIM_MARKERS if m in (reply_text or "")]
-        if matched and not self._writes_done:
-            self.journal.append(envelope_id, "claimed_without_write", {"markers": matched})
 
     def _take_resumed_result(self, name: str) -> str | None:
         """位置优先,配不上就在剩余队列里向后按名字找;都没有就返回 None(真执行)。
@@ -301,7 +255,6 @@ class Steward:
         self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
-        self._writes_done = set()
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。
@@ -378,12 +331,6 @@ class Steward:
                     "completion_tokens": reply.completion_tokens,
                 },
             )
-            # M5-13:服务商多包 arguments 信封被剥掉的次数。悄悄修好的东西没人会再看,
-            # 而"那家还在不在抽、抽得多不多"是换端点时唯一的依据。0 就不落。
-            if reply.unwrapped_args:
-                self.journal.append(env.id, "args_unwrapped", {"count": reply.unwrapped_args})
-            # M5-12:两条只留痕的信号,放在 reply 之后——它们描述的是"这一轮结束时"。
-            self._journal_turn_signals(env.id, reply.text)
             logger.info(format_cache_log(reply))
             # 崩溃语义:回复先落出件箱,信封才算完成。M3-1 Step0 收掉 M2-6 遗留——
             # 两个语句各自动提交,崩在中间会留下「出件箱有回复、信封未完成」的半态,

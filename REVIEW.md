@@ -10679,3 +10679,64 @@ chat template 拼歪了,模型在自己的上下文里看到一堆畸形示例,�
 **对我们的影响**:换 Qwen 是对的,而且现在知道**为什么**——不是"Qwen 更聪明",
 是那个部署在多轮工具调用上坏了。哪天它修好了,`args_unwrapped` 那个计数器会告诉我们
 (M5-13 留着它正是为了这个)。
+
+## M5-17:删掉两个没人读得到的信号 —— 待验收
+
+净删 **294 行,新增 20 行**(那 20 行是 CONVENTIONS 的 G6)。
+
+### 一、三块都删了
+
+1. `CLAIM_MARKERS`、`_journal_turn_signals`、`_writes_done`、`_note_tool_use`
+   (整个函数都没了——它只为记写工具而存在),以及 `process_next` 里那次每轮重置。
+2. `Registry.write_tools()`、`BundleInfo.writes/reads`、两个 manifest 里的
+   `writes:` / `reads:`,连同架构门禁里 `writes ⊎ reads == tools` 那条。
+3. `ModelReply.unwrapped_args`、`WrapperModel` 上那个计数器、`loop` 里写
+   `args_unwrapped` 的两行。
+
+**留着的**:`unwrap_tool_args`(M5-13 那个剥壳是真修复,和计数无关)、
+`tool_retry` 与 `retry_details`。
+
+顺带删掉的测试:两条信号的 8 条行为测试、`writes/reads` 必填的 2 条、
+`write_tools()` 那条。`test_turn_is_fully_recorded_in_journal` 的 kinds 期望回到五项
+——那条尾巴当初就是 `claimed_without_write` 挂上去的。
+
+### 二、验收三条
+
+```
+① 门禁全绿                                  534 passed + 8 skipped,mypy 35,4 kept 0 broken
+② grep 四个名字在 src/bundles/tests          一处不剩
+③ 构造一次工具重试耗尽,/replay 那封信       ↓
+```
+
+```
+用户看到的那条: 这条消息处理失败(UnexpectedModelBehavior: Tool 'record_expense' exce…
+/replay 90d5879f…:
+  [error]      UnexpectedModelBehavior: Tool 'record_expense' exceeded max retries count of 1.
+  [tool_retry] {'tool': 'record_expense',
+                'args': '{"arguments": {"amount": 22, "category": "餐饮"}}',
+                'feedback': '3 validation errors: missing amount / missing category'}
+```
+
+**这条留着的理由在这份输出里看得很清楚**:用户手上有那句「处理失败,已放弃」,
+拿它去 `/replay` 就能看到模型填了什么、服务端说了什么。被删的那两条没有这个入口
+——它们挂在"你根本不会注意到"的事件上,而起居注没有按 kind 查询,也没有汇总。
+
+### 三、CONVENTIONS 新增 G6
+
+> **拿到一个「坏了」,先问它该不该在,再问怎么修。**
+>
+> 修一个不该存在的东西,代价不是白干,是**把它焊死**:之后每个人都会绕着它走,
+> 而且再没人回头问了。
+>
+> **怎么问**:谁会读到它?什么时候读?读到之后能做什么?三个都答不上来,就删掉,别修。
+
+写进去的时候把 M5 这两次都点了名(M5-11 把一条红测试直接做成机制;M5-17 把哑掉的信号
+一路修判据),因为**规则不带案例就会被读成一句正确的废话**。
+
+### 四、我要说的一句
+
+`claimed_without_write` 的词表是任务书指定的,我照做了——但**照做本身不是免责**。
+M5-12 那一步我为它写了阳性对照、反向对照、变异检查,唯独没问过"谁会读到它"。
+那三样验的都是"它响不响",没有一样验"响了给谁看"。G6 的第一句就是冲这个来的。
+
+**门禁**:534 passed + 8 skipped,mypy 35 files,4 kept 0 broken,ruff/format 全绿。

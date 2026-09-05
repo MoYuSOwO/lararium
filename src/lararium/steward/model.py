@@ -34,9 +34,6 @@ class ModelReply:
     # requests 记录请求次数,看到「2 请求」就知道百分比被工具往返稀释过,
     # 不必怀疑前缀不稳定。
     requests: int | None = None
-    # M5-13:这一轮里剥掉了几层服务商多包的 `arguments` 信封。0 是常态;
-    # 常年不是 0 就说明那家还在抽,而这件事必须查得到——**悄悄修好的东西没人会再看**。
-    unwrapped_args: int = 0
 
 
 class ModelClient(Protocol):
@@ -241,8 +238,6 @@ def _unwrapping_model(wrapped: Any) -> Any:
     from pydantic_ai.models.wrapper import WrapperModel
 
     class Unwrapping(WrapperModel):
-        unwrapped = 0
-
         async def request(self, messages, model_settings, model_request_parameters):
             response = await self.wrapped.request(
                 messages, model_settings, model_request_parameters
@@ -262,7 +257,6 @@ def _unwrapping_model(wrapped: Any) -> Any:
                         part.args,
                     )
                     part.args = fixed
-                    self.unwrapped += 1
             return response
 
     return Unwrapping(wrapped)
@@ -324,8 +318,6 @@ class PydanticAIClient:
         # 等价写法是 Agent(instructions=...):它是 pydantic-ai 为"每轮重新应用、不进历史"
         # 这个语义加的参数,HTTP body 逐字节相同(实测)。哪天升级后本写法失效,那是退路。
         agent = Agent(self._model, tools=[_adapt(t) for t in tools], toolsets=mcp_servers)
-        # 每轮从零数:收件箱严格串行,任一时刻只有一轮在跑(而这个前提由 db 那把锁守着)。
-        self._model.unwrapped = 0
 
         # M4-5c v2:历史里的工具往返走**协议层原生形状**——assistant 带 tool_calls,
         # 每次调用配一条 tool 结果消息。组装器给的是与服务商无关的 dict 形态
@@ -427,5 +419,4 @@ class PydanticAIClient:
             completion_tokens=getattr(usage, "output_tokens", None)
             or getattr(usage, "response_tokens", None),
             requests=getattr(usage, "requests", None),
-            unwrapped_args=self._model.unwrapped,
         )

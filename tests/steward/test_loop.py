@@ -113,18 +113,7 @@ async def test_turn_is_fully_recorded_in_journal(steward_factory):
     await steward.process_next()
 
     kinds = [e["kind"] for e in steward.journal.replay(env.id)]
-    # 末尾那条 M5-12 的信号**不是噪声,是仪器测对了**:这个假模型伪造了 tool_events,
-    # 真的 propose_fact 一次都没跑过,而回复说"记下了"——正是 `claimed_without_write`
-    # 要抓的形状。判据取"写工具真的跑过没有"而不是"tool_events 里有没有",
-    # 差别就在这种地方(被路由守卫拦下的那次也会出现在 tool_events 里,却什么都没写)。
-    assert kinds == [
-        "envelope",
-        "prompt",
-        "tool_call",
-        "tool_result",
-        "reply",
-        "claimed_without_write",
-    ]
+    assert kinds == ["envelope", "prompt", "tool_call", "tool_result", "reply"]
 
 
 async def test_recorded_prompt_matches_what_model_received(steward_factory):
@@ -903,102 +892,6 @@ async def turn(steward, model, content="随便说点什么"):
     return env.id, outcome
 
 
-async def test_claiming_to_have_recorded_without_writing_leaves_a_trace(steward_factory):
-    """★ 阳性对照二:回复里承诺"已记",而这一轮**没有任何写工具**跑过 → 落一条。
-
-    实测抓到过一次(mimo):零工具调用,回复却说「『房租每月 3800』已经在账本里了,
-    不用重复记」——**而账本是空的**。用户不会再说第二遍。
-    """
-    steward, _ = steward_factory()
-
-    env_id, outcome = await turn(
-        steward, ToolUsingModel([], text="「房租每月 3800」已经在账本里了,不用重复记。")
-    )
-
-    assert len(signals(steward, env_id, "claimed_without_write")) == 1
-    # **绝不改行为**:回复原样出去,一个字都没动,也没有拦截
-    assert outcome.text == "「房租每月 3800」已经在账本里了,不用重复记。"
-
-
-async def test_a_real_write_clears_the_claim_signal(steward_factory):
-    """反向:真写了就不该落。判据是"这一轮有没有写工具跑过",不是措辞像不像。"""
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(
-        steward,
-        ToolUsingModel(
-            [("read_skill", {"bundle": "memory"}), ("propose_fact", ALLERGY)], text="记好了。"
-        ),
-    )
-
-    assert signals(steward, env_id, "claimed_without_write") == []
-
-
-async def test_a_reply_that_promises_nothing_leaves_no_claim_trace(steward_factory):
-    """反向:没承诺就不该落——不然每一轮闲聊都会响。"""
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(steward, ToolUsingModel([], text="今天天气不错,出去走走吧。"))
-
-    assert signals(steward, env_id, "claimed_without_write") == []
-
-
-async def test_a_read_only_tool_does_not_count_as_a_write(steward_factory):
-    """★ 查了一下然后说"记好了"**照样要响**。
-
-    把"调过任何领域工具"当成"写过"的话,这一支就漏了——而它恰恰是最像真的那一种:
-    模型查了查、答得头头是道,末尾一句"记好了",账上什么都没有。
-    """
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(
-        steward,
-        ToolUsingModel(
-            [("read_skill", {"bundle": "memory"}), ("list_pending", {})], text="记好了。"
-        ),
-    )
-
-    assert len(signals(steward, env_id, "claimed_without_write")) == 1
-
-
-async def test_the_new_signals_never_reach_l0_or_the_search_index(steward_factory):
-    """两条信号都不进 L0、不进检索索引——照 `tool_executed` / `skill_gate` 的先例。
-
-    进了就是拿模型的上下文预算去装我们自己的仪表盘,而且模型会开始对着它解释自己。
-    """
-    steward, _ = steward_factory()
-
-    env_id, _ = await turn(steward, ToolUsingModel([], text="记好了。"), content="记一下")
-
-    assert signals(steward, env_id, "claimed_without_write"), "阳性对照:这一轮该有信号"
-    assert {"read_only", "claimed_without_write"} & SEARCHABLE_KINDS == set()
-    turns = steward.journal.recent_turns(5)
-    assert all(
-        e.name not in {"read_only", "claimed_without_write"}
-        for t in turns
-        for e in t.get("exchanges", ())
-    )
-
-
-async def test_the_signals_are_computed_per_turn(steward_factory):
-    """两条信号都是**这一轮**的账,上一轮干过什么不算数。
-
-    不重置的话:第一轮真写过,之后每一轮的谎报都会被那一次蒙混过去——而真机上
-    这两件事隔着几小时,没人会把它们联系起来。
-    """
-    steward, _ = steward_factory()
-    await turn(
-        steward,
-        ToolUsingModel(
-            [("read_skill", {"bundle": "memory"}), ("propose_fact", ALLERGY)], text="记好了。"
-        ),
-    )
-
-    env_id, _ = await turn(steward, ToolUsingModel([], text="记好了。"))
-
-    assert len(signals(steward, env_id, "claimed_without_write")) == 1
-
-
 async def test_exhausted_tool_retries_land_in_the_journal(steward_factory):
     """★ M5-13:重试细节必须进起居注,不能只在异常正文里。
 
@@ -1051,36 +944,3 @@ async def test_a_plain_model_failure_leaves_no_retry_event(steward_factory):
     await steward.process_next()
 
     assert signals(steward, env.id, "tool_retry") == []
-
-
-async def test_unwrapped_provider_envelopes_are_counted_in_the_journal(steward_factory):
-    """剥掉的那几层要留痕(M5-13)。
-
-    **悄悄修好的东西没人会再看**——而"那家服务商还在不在抽、抽得多不多",
-    是以后换端点时唯一的依据。0 次的轮次不落,不然每一轮都多一条噪声。
-    """
-
-    class Quirky:
-        async def run(self, ctx, tools, mcp_servers):
-            return ModelReply(text="记好了。", unwrapped_args=2)
-
-    steward, _ = steward_factory()
-    steward.model = Quirky()
-    env = Envelope.new(source="user", channel="cli", content="打车 28")
-    steward.submit(env)
-
-    await steward.process_next()
-
-    assert [s["count"] for s in signals(steward, env.id, "args_unwrapped")] == [2]
-    assert "args_unwrapped" not in SEARCHABLE_KINDS
-
-
-async def test_a_clean_turn_records_no_unwrap_count(steward_factory):
-    """反向:没剥过就不落——每轮一条 count=0 是噪声,不是数据。"""
-    steward, _ = steward_factory([ModelReply(text="好")])
-    env = Envelope.new(source="user", channel="cli", content="你好")
-    steward.submit(env)
-
-    await steward.process_next()
-
-    assert signals(steward, env.id, "args_unwrapped") == []

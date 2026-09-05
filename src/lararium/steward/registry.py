@@ -16,15 +16,6 @@ class BundleInfo:
     description: str
     skills: tuple[SkillInfo, ...]
     tools: tuple[str, ...]
-    # 这些工具会真的改数据。M5-12 的留痕要用:「说了已记、这一轮却没有写工具跑过」。
-    # **必须显式声明**(只读 bundle 写 `writes: []`)——漏写不会报错,只会让仪器
-    # 从此不响,而一个永远不响的仪器比没有更坏。有架构门禁钉着。
-    writes: tuple[str, ...]
-    # 只读的那些。**存在的唯一理由是让 writes 可被机械校验**:只断言"writes 里的名字
-    # 在 tools 里"挡得住填错字,挡不住**加了写工具忘了登记**——那种漏法一声不响,
-    # 而表现是 `claimed_without_write` 从此对它永远不响。要求 writes ⊎ reads == tools
-    # 才逼得出一个决定:新加的工具到底写不写。
-    reads: tuple[str, ...]
     root: Path
 
 
@@ -57,8 +48,6 @@ class Registry:
                 description=data["description"],
                 skills=tuple(SkillInfo(s["name"], s["desc"]) for s in data.get("skills", [])),
                 tools=tuple(data.get("tools", [])),
-                writes=tuple(data["writes"]),
-                reads=tuple(data["reads"]),
                 root=path.parent,
             )
         except (KeyError, TypeError, yaml.YAMLError) as exc:
@@ -78,11 +67,6 @@ class Registry:
             lines.append(f"- {b.name} —— {b.description}")
             lines.extend(f"    * {s.name}    {s.desc}" for s in b.skills)
         return "\n".join(lines)
-
-    def write_tools(self) -> set[str]:
-        """所有会改数据的工具名。判据来自各自的 manifest,不在主控里维护一张清单
-        ——那张清单会在下一个 bundle 加工具时悄悄过期,而过期的表现是仪器不响。"""
-        return {tool for b in self.bundles for tool in b.writes}
 
     def get(self, bundle: str) -> BundleInfo:
         if bundle not in self._by_name:

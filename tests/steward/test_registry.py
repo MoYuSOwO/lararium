@@ -129,39 +129,3 @@ def test_read_skill_rejects_unknown_skill_name_in_finance(registry):
     """白名单校验对 finance 同样生效:skill 名来自模型输出,不许拿去拼路径。"""
     with pytest.raises(KeyError, match="monthly-review"):
         registry.read_skill("finance", "../../../etc/passwd")
-
-
-def test_a_manifest_without_writes_is_rejected_loudly(tmp_path):
-    """`writes:` 是必填的,哪怕是空的(M5-12)。
-
-    给个默认值看着更friendly,代价是:一个忘了声明的 bundle 会照常装上,而
-    `claimed_without_write` 那条留痕**从此对它永远不响**——没有任何报错,
-    只是仪器悄悄哑了一块。宁可在装载时炸,而且要说清是哪个文件缺哪个字段。
-    只读 bundle 写 `writes: []` 就行,一行的事。
-    """
-    _write_bundle(
-        tmp_path, "x", "name: x\ndescription: 缺了 writes\ntools: [peek]\nreads: [peek]\n"
-    )
-
-    with pytest.raises(ValueError, match="writes"):
-        Registry.load(tmp_path)
-
-
-def test_write_tools_come_from_the_manifests(tmp_path):
-    """哪些工具会写,判据在各自的 manifest,不在主控里维护一张清单
-    ——那张清单会在下一个 bundle 加工具时悄悄过期,而过期的表现是仪器不响。"""
-    reg = Registry.load(Path("bundles"))
-
-    assert reg.write_tools() == {"propose_fact", "record_expense", "amend_expense"}
-
-
-def test_a_manifest_without_reads_is_rejected_loudly(tmp_path):
-    """`reads:` 和 `writes:` 一样必填(M5-12 补)。
-
-    给默认值的话,划分那条门禁就自动放行了——`tools - writes - reads` 恒为空,
-    而那正是"加了写工具忘了登记"要被挡住的地方。两边都要求填,才逼得出那个决定。
-    """
-    _write_bundle(tmp_path, "x", "name: x\ndescription: 缺了 reads\ntools: [peek]\nwrites: []\n")
-
-    with pytest.raises(ValueError, match="reads"):
-        Registry.load(tmp_path)
