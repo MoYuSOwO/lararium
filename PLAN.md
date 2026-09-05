@@ -5971,6 +5971,82 @@ POST /ilink/bot/sendmessage
 
   **Step 4** —— 门禁 + 提交 + 登记 + CHANGELOG。
 
+- **M5-14 拆掉 M5-11,并把被它掏空的那一层删掉**(复核方出的错题,连本带利改回来)
+
+  **先说清楚为什么**,否则下一个人会把它当成"又改回去了"。
+
+  M5-11 强制「领域工具第一次调用前必须读过该领域总览」。真机实测(AMD 端点,
+  `DeepSeek-V4-Flash-Vision-Exp`,同一串 8 笔,每条排干队列):
+
+  ```
+  守卫开着    账上 3/8    丢 5 笔    谎报 4 次    一堆往返    284 秒
+  守卫关掉    账上 8/8    丢 0 笔    谎报 0 次    8 次调用    55 秒
+  ```
+
+  **守卫就是那 5 笔的全部原因。** 模型第一次就把参数填对了(`amount/category/note`
+  一个不差),是我们把它正确的动作打回去,而回话里又没说「这笔没记」
+  ——它读完 skill 以为生效了,于是回「记好了」。
+
+  **而它被逼去读的那份总览,已经是空的。** 逐条对过 `finance/SKILL.md`(2073 字节):
+
+  ```
+  「别把流水记进账本」            discipline.md 有(前缀,每轮)        重复
+  「什么时候用哪个工具」           各 docstring + 目录行                 重复
+  「since/until 两端都含」         query_spending docstring             重复
+  「group_by 只认 category/day」   query_spending docstring             重复
+  「不返回单笔流水」               query_spending docstring             重复
+  「order=largest 要配日期范围」   list_recent docstring                重复
+  「记完账不要 propose」           discipline.md 有                     重复
+  ────────────────────────────────────────────────────────────
+  「长区间会截断成『更早 N 天合计』」  没有别处说                        ★ 独有
+  「相对时间先调 current_time 换算」   没有别处说                        ★ 独有
+  ```
+
+  **2073 字节里真正独有的只有两句话。** 而且**路由的出处从来不是 SKILL.md,是 manifest**
+  ——`directory_lines()` 照 `skills: [{name, desc}]` 拼目录行。总览是把 manifest 已经
+  说过的话又写一遍,难怪它会悄悄空掉。
+
+  **不带守卫时模型自己路由得完全正确**(实测):
+
+  ```
+  记账 / 查账 / 问最大一笔   不读 skill,直接调对应工具        ← 对
+  月度复盘 / 看趋势          主动 read_skill(finance, monthly-review)  ← 对
+  ```
+
+  它靠的就是目录行里那句 `monthly-review(怎么看一个月的账)`。**目录在干它该干的活。**
+
+  **要做的六件:**
+
+  1. **总览那两条独有的挪进 docstring**:截断行为 → `query_spending`;
+     相对时间要自己换算 → `record_expense`。docstring 是 schema 层,模型必然看到,
+     不需要任何人提醒它去读。
+  2. **删掉两份 `SKILL.md`**(finance / memory),目录行改成嵌套列表:
+
+     ```
+     - finance —— 记账与消费分析
+         * monthly-review    怎么看一个月的账
+     ```
+
+     省的**不是 token**(总览本来就不在前缀里),是**一层会悄悄腐烂的文档**
+     ——这次栽跟头的根源就是没人回头看它还剩什么。
+  3. **`read_skill(bundle)` 不带 skill 名 → 返回子 skill 清单,不报错。**
+     模型自然会这么调一次;拿错误惩罚一个合理动作,它下次绕着走,而绕法不可控。
+  4. **摘掉 M5-11 的守卫**(`_require_overview` / `_note_overview_read` /
+     `_overview_read` / `_skill_nudged` / `skill_gate` 事件)。
+     `read_only` 那条信号也跟着走——它盖的是"读了总览却没干活",而总览没了。
+     **`claimed_without_write` 留着**:它在真机上 3/3 真阳性零误报,和守卫无关。
+  5. **改掉 M4 那条「记账前必须先读 finance 总览」的断言**
+     (`test_live_finance_skill`)。**那条断言本身是错的**,而 M5-11 整条链子就是从
+     "它变红了"开始的——没有人先问"这条断言该不该存在"。改成什么由你定,
+     但**不许再钉「必须读总览」**;要钉就钉真正该成立的(比如复杂任务会去读方法篇)。
+  6. **留着 M5-13 的剥壳修复**。那是服务商每轮把参数包坏 1~5 次,和本题无关。
+
+  **代价**:第 1、2 条各动一次前缀(工具 schema 是第 0 层、目录是第 1 层),
+  合并成一次重建,`prefix_log` 会记。之后稳定。
+
+  **`desc` 从此是承重的**:总览没了,模型决定"要不要读某份方法篇"手里只有 manifest 里
+  那一句话。实测够用(复杂任务 2/2 都去读了),但以后写 manifest 要当回事。
+
 - **未排期(要在 M6-1 之前修):`_active_untrusted` 是单向的**
 
   它只在**认领信封**时定死(`loop.py:250`),而 `_guard_propose_fact` 只看它。于是工具
