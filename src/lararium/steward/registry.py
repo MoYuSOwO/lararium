@@ -20,6 +20,11 @@ class BundleInfo:
     # **必须显式声明**(只读 bundle 写 `writes: []`)——漏写不会报错,只会让仪器
     # 从此不响,而一个永远不响的仪器比没有更坏。有架构门禁钉着。
     writes: tuple[str, ...]
+    # 只读的那些。**存在的唯一理由是让 writes 可被机械校验**:只断言"writes 里的名字
+    # 在 tools 里"挡得住填错字,挡不住**加了写工具忘了登记**——那种漏法一声不响,
+    # 而表现是 `claimed_without_write` 从此对它永远不响。要求 writes ⊎ reads == tools
+    # 才逼得出一个决定:新加的工具到底写不写。
+    reads: tuple[str, ...]
     root: Path
 
 
@@ -53,6 +58,7 @@ class Registry:
                 skills=tuple(SkillInfo(s["name"], s["desc"]) for s in data.get("skills", [])),
                 tools=tuple(data.get("tools", [])),
                 writes=tuple(data["writes"]),
+                reads=tuple(data["reads"]),
                 root=path.parent,
             )
         except (KeyError, TypeError, yaml.YAMLError) as exc:

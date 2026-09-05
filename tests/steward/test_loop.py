@@ -1149,3 +1149,90 @@ async def test_the_signals_are_computed_per_turn(steward_factory):
     env_id, _ = await turn(steward, ToolUsingModel([], text="记好了。"))
 
     assert len(signals(steward, env_id, "claimed_without_write")) == 1
+
+
+async def test_exhausted_tool_retries_land_in_the_journal(steward_factory):
+    """★ M5-13:重试细节必须进起居注,不能只在异常正文里。
+
+    真机上这一轮变 `retry_later`、重试耗尽后用户收到「处理失败,已放弃」,而**起居注里
+    只有一行 `exceeded max retries count of 1`**——它不告诉你模型填了什么、哪里不合法。
+    信封的 `error` 事件是事后唯一能翻的地方,细节就得落在它旁边。
+
+    和 `skill_gate` / `read_only` 一样:不进 L0、不进检索索引。
+    """
+
+    class Failing:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ModelCallError(
+                "UnexpectedModelBehavior: Tool 'record_expense' exceeded max retries count of 1.",
+                retryable=True,
+                details=(
+                    {
+                        "tool": "record_expense",
+                        "args": '{"amount": "一百块"}',
+                        "feedback": "amount: Input should be a valid number",
+                    },
+                ),
+            )
+
+    steward, _ = steward_factory()
+    steward.model = Failing()
+    env = Envelope.new(source="user", channel="cli", content="打车 28")
+    steward.submit(env)
+
+    await steward.process_next()
+
+    retries = signals(steward, env.id, "tool_retry")
+    assert len(retries) == 1, "重试耗尽了,起居注里却查不到为什么"
+    assert retries[0]["details"][0]["args"] == '{"amount": "一百块"}'
+    assert "tool_retry" not in SEARCHABLE_KINDS
+
+
+async def test_a_plain_model_failure_leaves_no_retry_event(steward_factory):
+    """反向:没有重试细节的普通失败(限流、超时)不许凭空落一条空事件。"""
+
+    class Failing:
+        async def run(self, ctx, tools, mcp_servers):
+            raise ModelCallError("429 限流", retryable=True)
+
+    steward, _ = steward_factory()
+    steward.model = Failing()
+    env = Envelope.new(source="user", channel="cli", content="打车 28")
+    steward.submit(env)
+
+    await steward.process_next()
+
+    assert signals(steward, env.id, "tool_retry") == []
+
+
+async def test_unwrapped_provider_envelopes_are_counted_in_the_journal(steward_factory):
+    """剥掉的那几层要留痕(M5-13)。
+
+    **悄悄修好的东西没人会再看**——而"那家服务商还在不在抽、抽得多不多",
+    是以后换端点时唯一的依据。0 次的轮次不落,不然每一轮都多一条噪声。
+    """
+
+    class Quirky:
+        async def run(self, ctx, tools, mcp_servers):
+            return ModelReply(text="记好了。", unwrapped_args=2)
+
+    steward, _ = steward_factory()
+    steward.model = Quirky()
+    env = Envelope.new(source="user", channel="cli", content="打车 28")
+    steward.submit(env)
+
+    await steward.process_next()
+
+    assert [s["count"] for s in signals(steward, env.id, "args_unwrapped")] == [2]
+    assert "args_unwrapped" not in SEARCHABLE_KINDS
+
+
+async def test_a_clean_turn_records_no_unwrap_count(steward_factory):
+    """反向:没剥过就不落——每轮一条 count=0 是噪声,不是数据。"""
+    steward, _ = steward_factory([ModelReply(text="好")])
+    env = Envelope.new(source="user", channel="cli", content="你好")
+    steward.submit(env)
+
+    await steward.process_next()
+
+    assert signals(steward, env.id, "args_unwrapped") == []

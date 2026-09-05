@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from lararium.steward.assembler import AssembledContext
+from lararium.steward.model import ModelCallError, unwrap_tool_args
 from lararium.steward.vision import ImagePart, ImageReturn
 
 PREFIX = "【前缀】"
@@ -253,3 +254,227 @@ async def test_a_tool_can_hand_an_image_back_without_putting_bytes_in_the_journa
     # ② 要落起居注的那一份是一行人话,没有任何字节
     results = [e for e in reply.tool_events if e["type"] == "tool_result"]
     assert results and results[0]["content"] == "(重新附上 media/abababababab…)"
+
+
+# ── M5-13:工具重试耗尽时,把重试提示原文捞出来 ──────────────────────────
+
+
+async def test_an_exhausted_tool_retry_carries_the_feedback_out(http_spy_factory):
+    """★ `Tool 'x' exceeded max retries count of 1` 这一行本身什么都没说。
+
+    pydantic-ai 把校验详情吞在异常正文之外,起居注里也只剩那一行——真机上这一轮变
+    `retry_later`、重试耗尽后用户收到「处理失败,已放弃」,而**没有任何地方能告诉你
+    模型到底填错了什么**。三种抓报文的办法都没拦到那条 client(它不走那几层)。
+
+    重试提示会作为一条 `tool` 消息回给模型,所以它一定在库自己的消息流里。
+    这条断言的是:它被带出了隔离盒——**模型填的参数**和**服务端给的反馈**都要有,
+    少任何一半都不够定位(只有反馈不知道它填了什么,只有参数不知道哪里不合法)。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reply = tool_call_reply_factory()
+        return httpx.Response(200, json=reply)
+
+    def tool_call_reply_factory() -> dict[str, Any]:
+        return {
+            "id": "1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "tool_calls",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {
+                                    "name": "record_expense",
+                                    # 金额给成一句话:参数校验必然失败
+                                    "arguments": '{"amount": "一百块", "category": "餐饮"}',
+                                },
+                            }
+                        ],
+                    },
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        }
+
+    def record_expense(amount: float, category: str) -> str:
+        """记一笔消费"""
+        return "记好了"
+
+    client = http_spy_factory(handler)
+
+    with pytest.raises(ModelCallError) as caught:
+        await client.run(ctx(), [record_expense], [])
+
+    details = caught.value.details
+    assert details, "重试耗尽了,却什么细节都没带出来——和修之前一样查不动"
+    assert details[0]["tool"] == "record_expense"
+    assert "一百块" in details[0]["args"], f"没带上模型填的参数:{details[0]}"
+    assert "amount" in details[0]["feedback"], f"没带上服务端的反馈:{details[0]}"
+
+
+async def test_a_normal_run_carries_no_retry_details(http_spy_factory, reply_factories):
+    """反向:没出事的时候不许挂着一坨东西——它只在出错那条路上生效。"""
+    text_reply, _ = reply_factories
+    client = http_spy_factory(lambda _r: httpx.Response(200, json=text_reply("好")))
+
+    reply = await client.run(ctx(), [], [])
+
+    assert reply.text == "好"
+
+
+# ── M5-13 Step 2:服务商多包的那层 `arguments` 信封 ──────────────────────
+
+
+def wrapped_call_reply(name: str, inner: str) -> dict[str, Any]:
+    """服务商实测回过的形状:`function.arguments` 里又套了一层 `arguments`。"""
+    return {
+        "id": "1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": name, "arguments": inner},
+                        }
+                    ],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+    }
+
+
+async def test_a_doubly_wrapped_arguments_envelope_is_unwrapped(http_spy_factory, reply_factories):
+    """★ M5-13:AMD 那个自部署端点会**偶发地把参数多包一层**:
+
+        {"arguments": {"amount": 5, "category": "交通", "note": "地铁"}}
+
+    校验于是报 `missing: amount` / `missing: category` / `extra_forbidden: arguments`,
+    一轮里两次都包错就把工具重试耗尽,用户收到「处理失败,已放弃」——**一笔账就没了**。
+    在隔离盒里把这层剥掉,而不是把 retries 调大(调大只是让它多错两次)。
+    """
+    text_reply, _ = reply_factories
+    seen: list[tuple[float, str]] = []
+
+    def record_expense(amount: float, category: str, note: str = "") -> str:
+        """记一笔消费"""
+        seen.append((amount, category))
+        return "记好了"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if any(m.get("role") == "tool" for m in body["messages"]):
+            return httpx.Response(200, json=text_reply("记好了"))
+        return httpx.Response(
+            200,
+            json=wrapped_call_reply(
+                "record_expense",
+                '{"arguments": {"amount": 5, "category": "交通", "note": "地铁"}}',
+            ),
+        )
+
+    reply = await http_spy_factory(handler).run(ctx(), [record_expense], [])
+
+    assert seen == [(5, "交通")], "多包的那层没剥掉,这一笔又丢了"
+    assert reply.unwrapped_args == 1, "剥了却不计数——那就没人知道服务商还在不在抽"
+
+
+async def test_normal_arguments_are_left_alone(http_spy_factory, reply_factories):
+    """反向:形状正常的调用一个字节都不许动。"""
+    text_reply, _ = reply_factories
+    seen: list[tuple[float, str]] = []
+
+    def record_expense(amount: float, category: str, note: str = "") -> str:
+        """记一笔消费"""
+        seen.append((amount, category))
+        return "记好了"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if any(m.get("role") == "tool" for m in body["messages"]):
+            return httpx.Response(200, json=text_reply("记好了"))
+        return httpx.Response(
+            200,
+            json=wrapped_call_reply(
+                "record_expense", '{"amount": 28, "category": "交通", "note": "打车"}'
+            ),
+        )
+
+    reply = await http_spy_factory(handler).run(ctx(), [record_expense], [])
+
+    assert seen == [(28, "交通")]
+    assert reply.unwrapped_args == 0
+
+
+async def test_a_tool_that_really_takes_arguments_is_not_unwrapped(
+    http_spy_factory, reply_factories
+):
+    """★ 反向的要害:**真有一个叫 `arguments` 的参数时不许剥**。
+
+    判据不是"长得像信封",是**那个工具的 schema 里到底有没有这个参数**——
+    照形状猜的话,总有一天会把一次合法调用拆散,而症状是参数凭空少了一半。
+    """
+    text_reply, _ = reply_factories
+    seen: list[dict] = []
+
+    def relay(arguments: dict) -> str:
+        """转发一段参数"""
+        seen.append(arguments)
+        return "转发了"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if any(m.get("role") == "tool" for m in body["messages"]):
+            return httpx.Response(200, json=text_reply("好"))
+        return httpx.Response(200, json=wrapped_call_reply("relay", '{"arguments": {"a": 1}}'))
+
+    reply = await http_spy_factory(handler).run(ctx(), [relay], [])
+
+    assert seen == [{"a": 1}], "把一次合法调用拆散了"
+    assert reply.unwrapped_args == 0
+
+
+@pytest.mark.parametrize(
+    ("args", "schema", "expected"),
+    [
+        # 正例:恰好一个 arguments 信封,而工具本身没有这个参数
+        ('{"arguments": {"amount": 5}}', {"properties": {"amount": {}}}, '{"amount": 5}'),
+        ({"arguments": {"amount": 5}}, {"properties": {"amount": {}}}, {"amount": 5}),
+        # 形状正常:不动
+        ('{"amount": 5}', {"properties": {"amount": {}}}, None),
+        # ★ 带兄弟键:**不许剥**。`note` 是模型真想传的参数,剥了它就凭空消失,
+        # 而症状是"它记的东西少了一块",没有任何报错。宁可走原来的校验失败(至少响)。
+        ('{"arguments": {"amount": 5}, "note": "别丢了我"}', {"properties": {"amount": {}}}, None),
+        # 工具真有 arguments 这个参数:不许剥
+        ('{"arguments": {"a": 1}}', {"properties": {"arguments": {}}}, None),
+        # 里面不是对象:剥了也没用
+        ('{"arguments": "一句话"}', {"properties": {"amount": {}}}, None),
+        # 根本不是 JSON:别猜
+        ("这不是 json", {"properties": {"amount": {}}}, None),
+    ],
+)
+def test_unwrap_only_strips_an_exact_envelope(args, schema, expected):
+    """剥壳的判据逐条钉死。
+
+    它是一条**为某一家服务商的毛病开的口子**,而这种口子最容易越开越大:
+    今天"含有 arguments 就剥",明天就有一次合法调用被拆散。所以正例反例一起钉。
+    """
+    assert unwrap_tool_args(args, schema) == expected

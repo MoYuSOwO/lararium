@@ -80,8 +80,12 @@ def test_invalid_yaml_names_the_offending_file(tmp_path):
 
 def test_duplicate_bundle_names_are_rejected(tmp_path):
     """名字是路由依据。重名时目录行会列出两个,但只有一个调得到——必须拒绝。"""
-    _write_bundle(tmp_path, "a", "name: finance\ndescription: 甲\ntools: []\nwrites: []\n")
-    _write_bundle(tmp_path, "b", "name: finance\ndescription: 乙\ntools: []\nwrites: []\n")
+    _write_bundle(
+        tmp_path, "a", "name: finance\ndescription: 甲\ntools: []\nwrites: []\nreads: []\n"
+    )
+    _write_bundle(
+        tmp_path, "b", "name: finance\ndescription: 乙\ntools: []\nwrites: []\nreads: []\n"
+    )
 
     with pytest.raises(ValueError, match="重名"):
         Registry.load(tmp_path)
@@ -123,7 +127,9 @@ def test_a_manifest_without_writes_is_rejected_loudly(tmp_path):
     只是仪器悄悄哑了一块。宁可在装载时炸,而且要说清是哪个文件缺哪个字段。
     只读 bundle 写 `writes: []` 就行,一行的事。
     """
-    _write_bundle(tmp_path, "x", "name: x\ndescription: 缺了 writes\ntools: [peek]\n")
+    _write_bundle(
+        tmp_path, "x", "name: x\ndescription: 缺了 writes\ntools: [peek]\nreads: [peek]\n"
+    )
 
     with pytest.raises(ValueError, match="writes"):
         Registry.load(tmp_path)
@@ -135,3 +141,15 @@ def test_write_tools_come_from_the_manifests(tmp_path):
     reg = Registry.load(Path("bundles"))
 
     assert reg.write_tools() == {"propose_fact", "record_expense"}
+
+
+def test_a_manifest_without_reads_is_rejected_loudly(tmp_path):
+    """`reads:` 和 `writes:` 一样必填(M5-12 补)。
+
+    给默认值的话,划分那条门禁就自动放行了——`tools - writes - reads` 恒为空,
+    而那正是"加了写工具忘了登记"要被挡住的地方。两边都要求填,才逼得出那个决定。
+    """
+    _write_bundle(tmp_path, "x", "name: x\ndescription: 缺了 reads\ntools: [peek]\nwrites: []\n")
+
+    with pytest.raises(ValueError, match="reads"):
+        Registry.load(tmp_path)

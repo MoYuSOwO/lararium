@@ -471,6 +471,10 @@ class Steward:
                     "completion_tokens": reply.completion_tokens,
                 },
             )
+            # M5-13:服务商多包 arguments 信封被剥掉的次数。悄悄修好的东西没人会再看,
+            # 而"那家还在不在抽、抽得多不多"是换端点时唯一的依据。0 就不落。
+            if reply.unwrapped_args:
+                self.journal.append(env.id, "args_unwrapped", {"count": reply.unwrapped_args})
             # M5-12:两条只留痕的信号,放在 reply 之后——它们描述的是"这一轮结束时"。
             self._journal_turn_signals(env.id, reply.text)
             logger.info(format_cache_log(reply))
@@ -490,6 +494,11 @@ class Steward:
         except ModelCallError as exc:
             # 隔离盒已经把 pydantic-ai 的异常分类成自家类型,这里只认 retryable。
             self.journal.append(env.id, "error", {"content": str(exc)})
+            # M5-13:工具重试耗尽时,把"模型填了什么 / 服务端反馈了什么"落在 error 旁边。
+            # 只有那一行 `exceeded max retries count of 1` 的话,事后什么都查不出来。
+            # 和 skill_gate / read_only 同一类:不进 L0、不进检索索引。
+            if exc.details:
+                self.journal.append(env.id, "tool_retry", {"details": list(exc.details)})
             attempts = self.inbox.attempts(env.id)
             if exc.retryable and attempts < self.settings.max_attempts:
                 self.inbox.release(env.id)  # 回 pending,attempts 已在 claim 时 +1

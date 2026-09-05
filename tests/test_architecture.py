@@ -253,19 +253,26 @@ def test_the_sqlite_guard_does_not_fire_on_type_annotations() -> None:
     assert _sqlite_connect_calls(ast.parse(source)) == []
 
 
-def test_every_declared_write_tool_actually_exists() -> None:
-    """`writes:` 里的工具名必须真的在 `tools:` 里(M5-12)。
+def test_writes_and_reads_exactly_partition_the_tools() -> None:
+    """`tools:` 必须**恰好**被 `writes:` 与 `reads:` 划分,且两边不相交(M5-12 补)。
 
-    打错一个字不会报错——`claimed_without_write` 只是**从此对那个工具永远不响**,
-    而一个永远不响的仪器比没有更坏:它让人以为这件事被盯着。
-    `writes:` 本身是必填的(`Registry._parse_manifest` 会炸),这里补的是"填了但填错"。
+    第一版只断言"writes 里的名字在 tools 里"。那挡得住**填错字**,挡不住
+    **加了写工具忘了登记**——拿变异试过,一声不响就过了。而漏登记的表现是
+    `claimed_without_write` 从此对那个工具永远不响:一个永远不响的仪器比没有更坏,
+    它让人以为这件事被盯着。
+
+    要求划分,是为了逼出一个决定:新加的工具到底写不写。两边都不填就装不上
+    (`Registry._parse_manifest` 会炸),填一半就红在这里。
     """
-    registry = Registry.load(Path("bundles"))
-    offenders = [
-        f"{b.name}: writes 里有 {sorted(set(b.writes) - set(b.tools))},但 tools 里没有"
-        for b in registry.bundles
-        if set(b.writes) - set(b.tools)
-    ]
+    offenders: list[str] = []
+    for b in Registry.load(Path("bundles")).bundles:
+        tools, writes, reads = set(b.tools), set(b.writes), set(b.reads)
+        if writes & reads:
+            offenders.append(f"{b.name}: {sorted(writes & reads)} 同时算写又算读")
+        if missing := tools - writes - reads:
+            offenders.append(f"{b.name}: {sorted(missing)} 没登记是写还是读")
+        if extra := (writes | reads) - tools:
+            offenders.append(f"{b.name}: {sorted(extra)} 登记了但 tools 里没有")
 
     assert offenders == [], offenders
 
