@@ -84,6 +84,7 @@ def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
         "query_spending",  # finance[1]
         "list_recent",  # finance[2]
         "amend_expense",  # finance[3] —— M5-15 追加在末尾,前面一位没动
+        "delete_expense",  # finance[4] —— M5-20 同样只追加在末尾
     ]
 
 

@@ -10960,3 +10960,86 @@ Qwen 从 AMD 端点上消失,换到**官方 DeepSeek**(`api.deepseek.com/v1`)。
 **门禁**:552 passed + 8 skipped(+10 条新的),mypy 35 files,contracts 4 kept / 0 broken。
 
 **要真机验的**:重启服务、发一张图,`data/media/` 里有文件、模型看得见。
+
+---
+
+## M5-20:记错了删不掉 —— 待验收
+
+### 1. `delete_expense(expense_id, reason=None, undo=False)`
+
+打状态位(`deleted_at` / `deleted_reason`),**不插替代行**、一行都不真删。
+`amend_expense` 的 docstring 收紧成"只管改",并点名"要整笔去掉用 `delete_expense`,
+别拿改备注的办法假装删掉"。
+
+**状态位分成两列,没有复用 `voided_by`**:「被 amend 顶掉了」和「压根不该存在」是两件事,
+合成一列之后想撤回就分不出该撤哪个。
+
+### 2. 恢复的路:选了 `undo=True`,没让 `amend` 对已删行放行
+
+**理由是"逐字一致"这条验收口径本身**。`amend` 的做法是**插新行 + 作废旧行**——让它
+"复活"一条删掉的行,回来的是一个**新的 #id**,用户记着的那个号当场作废,而且旧行还得
+再标一次作废。清状态位还回来的就是原来那一行,`id` / `created_at` 一个字节没动。
+
+还有一条:`amend` 一旦对已删行放行,`amend(id, amount=50)` 就会**顺手把一条用户删掉的
+行复活**——一个改金额的动作,副作用是撤销一次删除。那正是 M5-20 这个事故的镜像
+(状态变更藏在一个名字不同的动作底下)。`undo=True` 把意图写在动词上。
+
+### 3. 四条验收口径
+
+| 口径 | 钉在哪 |
+|---|---|
+| 删掉 → 列表看不见、合计不算、`include_voided=True` 还在 | `test_a_deleted_row_leaves_every_view_and_the_total`(**三个视图一起断**) |
+| 撤回后逐字一致 | `test_undo_puts_the_same_row_back_word_for_word`(逐字段比对 + 断行数没长) |
+| 不存在的 id → 人话、不落行 | `test_deleting_something_that_is_not_there_writes_nothing` |
+| 真机 | 见第 5 节 |
+
+第一条**三个视图一起断**是刻意的:真机上炸的正是"其中一个变干净了"——`amend` 让
+`list_recent` 不列旧行,看起来办成了,而新行的 28 块原样计入合计。只断列表的测试会给
+那个实现开绿灯。
+
+另外补了一条给"两个状态位"的机械保证:`test_every_listing_query_filters_both_flags`
+参数化跑遍 `_GROUP_SQL` / `_RECENT_SQL` 每一条。判据本想抽成常量拼进 SQL,但拼接会被
+S608 盯上(而它是对的),所以逐条写死——写死就会漏,漏掉那条的症状恰恰是「删了还在」。
+
+### 4. 变异 11/11 全咬住,但**两条第一版是空的,都是我测试的漏洞**
+
+- **「撤回时把理由留着」存活**:我在测试里删的那笔**没给理由**,`deleted_reason` 本来
+  就是 NULL,这个退化根本不会发生(T6 第一种:变异没造出 bug)。
+- **改写后的 `test_no_tool_ever_removes_a_row_from_the_table` 对「真删行」存活**:
+  它盲扫所有工具、每个都喂一遍 `expense_id`——但 `amend` 排在前面,**先把两行都顶掉了**,
+  轮到 `delete` 时拿到的是已作废行,一句"要删就删 #3"、一个字都没写。
+  **场景根本没发生**(T6 第三种)。补成盲扫之后再拿两条有效行分别喂给会写的那两个。
+
+顺带把 M5-15 那条 `test_finance_still_offers_no_way_to_delete` 改掉了。它断的是
+"没有 delete 这个名字",而**该断的从来是"没有任何一条路让行从表里消失"**——
+一条测试把一个设计错误焊死了整整一个里程碑。G6 的反面教材:它当初该问的是"我在防什么"。
+
+### 5. 真机(本地真模型,和服务器同一份代码)
+
+新加 `test_saying_delete_it_actually_takes_it_off_the_books`,断的是**账**不是工具名
+(只断"调了 delete_expense"的话,一个把 28 记成 0 的实现照样过)。**连跑 5 次全绿。**
+
+探针另外跑了三句话,含真机上惹祸的那句原话:
+
+```
+「刚才那笔 28 的打车删掉,那是我测试时随手记的」
+    工具 [list_recent, delete_expense]    → 行 #1 deleted    ✅
+「那之前的那个作废」                        ← 真机上就是这句话出的事
+    工具 [list_recent]                    → 看了一眼,发现已经删了,如实说
+    回话「已经删掉了,状态就是"已删除",不会再计入合计——这就是你说的作废」
+「算了,刚才删掉的那笔恢复回来」
+    工具 [delete_expense]                 → 行 #1 复原,id 没变    ✅
+```
+
+**撤回这条路模型自己找得到**,不需要提示 `undo` 这个词。
+
+### 6. 前缀重建
+
+新增一个工具 + 改了三处 docstring = **前缀第 0 层变了,缓存全量重建一次**。
+这是必付的,记在这儿是为了下次看曲线时对得上号。`manifest.yaml` 的 `tools:`
+只在末尾追加,前四位一个没动;两处冻结顺序的测试同步。
+
+**门禁**:566 passed + 8 skipped,mypy 35 files,contracts 4 kept / 0 broken。
+**live**:9 passed / 0 failed(整套跑完,含 vision 与 skill)。
+
+**要真机验的**:说一句「刚才那笔删掉」,账上确实没了、说的数和账上的数对得上。

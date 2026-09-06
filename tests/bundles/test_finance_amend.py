@@ -13,6 +13,7 @@ finance 原来只有加,没有改也没有删。真机实测:模型填错金额�
 留痕"是不可协商第 3 条。改完永远还剩一条替代行——**这就是不给 delete 的底气**。
 """
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -161,15 +162,39 @@ def test_list_recent_shows_an_id_you_can_point_at(runtime, tmp_path):
     assert "没有" not in out and "找不到" not in out, f"吐出来的 id 喂不回去:{out}"
 
 
-def test_finance_still_offers_no_way_to_delete(runtime):
-    """**不给 delete。** 删除是唯一会彻底销毁用户可能想要的信息的操作。
+def test_no_tool_ever_removes_a_row_from_the_table(runtime, tmp_path):
+    """这条原来叫 `test_finance_still_offers_no_way_to_delete`,断的是"没有 delete 这个
+    工具",理由写着「删除是唯一会彻底销毁用户可能想要的信息的操作」。**那个理由站不住,
+    这条测试把一个设计错误焊死了整整一个里程碑**(M5-20:真机第一条正经记账就撞上)。
 
-    改完永远还剩一条替代行,所以"改"是安全的;"删"没有这个性质,所以干脆不提供
-    ——安全靠**改不能删 + 全程留痕**,不靠在主控里加守卫拦(M5-11 就是那么丢的 5 笔账)。
+    作废机制本身不销毁任何东西。真正该断的从来不是"没有 delete 这个名字",而是
+    **没有任何一条路会让行从表里消失**——`delete_expense` 打的是状态位,一行不少。
+    工具名该像人话:上一次事故正是因为没有一个看起来像"删"的东西,模型才拿 amend 顶。
+
+    (G6 的反面教材:先问它该不该在。这条测试当初该问的是"我在防什么",
+    而它防的是名字。)
     """
-    names = [f.__name__ for f in runtime.tools]
+    tool(runtime, "record_expense")(amount=49, category="餐饮")
+    tool(runtime, "record_expense")(amount=28, category="交通")
+    seen = {r["id"] for r in all_rows(tmp_path)}
 
-    assert not [n for n in names if "delete" in n or "remove" in n or "drop" in n], names
+    for fn in runtime.tools:
+        for expense_id in sorted(seen):
+            with contextlib.suppress(TypeError):  # 缺必填参数的工具自然拒收
+                fn(expense_id=expense_id)  # type: ignore[call-arg]
+
+    # 上面那一轮盲扫**打不到删除那条路**:amend 先把两行都顶掉了,delete 拿到的是已作废
+    # 的行,于是一句"要删就删 #3"、一个字都没写。只有盲扫的话这条测试是空的
+    # (T6 第三种:场景根本没发生)。所以再拿两条**有效行**分别喂给会写的那两个。
+    seen |= {r["id"] for r in all_rows(tmp_path)}
+    live = [
+        r["id"] for r in all_rows(tmp_path) if r["voided_by"] is None and r["deleted_at"] is None
+    ]
+    assert len(live) == 2, "装置本身坏了:盲扫之后应当还剩两条有效行"
+    tool(runtime, "amend_expense")(expense_id=live[0], amount=1)
+    tool(runtime, "delete_expense")(expense_id=live[1], reason="删掉试试")
+
+    assert seen <= {r["id"] for r in all_rows(tmp_path)}, "有工具让行从表里消失了"
 
 
 def test_totals_by_day_also_skip_voided_rows(runtime, tmp_path):

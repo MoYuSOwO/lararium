@@ -61,10 +61,15 @@ _NOTE_CLOSE = "」"
 # ——白名单今天成立不等于明天有人加个分支时还成立),写死则连"可能"都没有,
 # 顺带还能整条 grep 出来。聚合全在 SQL 里做完:取回来在 Python 里算,就已经把三百条
 # 塞进内存了,离塞进上下文只差一步(A4)。
+# 「这一行还在账上」= `voided_by IS NULL AND deleted_at IS NULL`,聚合与列表的每条
+# 查询都要带上。**抽成常量拼进去会被 S608 盯上,而它是对的**,所以逐条写死,改由
+# `test_every_listing_query_filters_both_flags` 保证一条都不漏:加第三个状态位时
+# 必然有一条忘了改,而症状是「删了还在」,正是 M5-20 要消灭的那个形态。
 _GROUP_SQL = {
     "category": (
         "SELECT category AS grp, SUM(amount_cents) AS cents, COUNT(*) AS n"
-        " FROM expenses WHERE occurred_at >= ? AND occurred_at < ? AND voided_by IS NULL"
+        " FROM expenses WHERE occurred_at >= ? AND occurred_at < ?"
+        " AND voided_by IS NULL AND deleted_at IS NULL"
         " GROUP BY grp ORDER BY cents DESC"
     ),
     "day": (
@@ -72,7 +77,8 @@ _GROUP_SQL = {
         # (日子会跳着来)。且两种排序不对称——「哪几天花得多」从正序里一眼能挑,
         # 「趋势」从金额 top-N 里推不出来。正序严格更强。
         "SELECT substr(occurred_at, 1, 10) AS grp, SUM(amount_cents) AS cents, COUNT(*) AS n"
-        " FROM expenses WHERE occurred_at >= ? AND occurred_at < ? AND voided_by IS NULL"
+        " FROM expenses WHERE occurred_at >= ? AND occurred_at < ?"
+        " AND voided_by IS NULL AND deleted_at IS NULL"
         " GROUP BY grp ORDER BY grp ASC"
     ),
 }
@@ -81,10 +87,16 @@ _GROUP_SQL = {
 # 可比),这样 WHERE 恒定、只有 ORDER BY 两种,不必拼 SQL(同 _GROUP_SQL 的理由)。
 _OPEN_LOWER = "0000-01-01"
 _OPEN_UPPER = "9999-12-31"
-_RECENT_COLUMNS = "SELECT id, occurred_at, category, amount_cents, note, voided_by FROM expenses"
+_RECENT_COLUMNS = (
+    "SELECT id, occurred_at, category, amount_cents, note, voided_by, deleted_at, deleted_reason"
+    " FROM expenses"
+)
 # `? = 1 OR voided_by IS NULL`:用绑定参数开关"要不要看作废行",而不是拼两份 WHERE
 # ——拼出来的 SQL 会被 S608 盯上,而且分支越多越容易有一条忘了加条件。
-_RECENT_WHERE = " WHERE occurred_at >= ? AND occurred_at < ? AND (? = 1 OR voided_by IS NULL)"
+_RECENT_WHERE = (
+    " WHERE occurred_at >= ? AND occurred_at < ?"
+    " AND (? = 1 OR (voided_by IS NULL AND deleted_at IS NULL))"
+)
 _RECENT_SQL = {
     "recent": _RECENT_COLUMNS + _RECENT_WHERE + " ORDER BY occurred_at DESC, id DESC LIMIT ?",
     # 金额并列时用时间倒序兜底,保证同一份数据每次返回同一个顺序(前缀之外也不该抖)
@@ -132,7 +144,12 @@ CREATE TABLE IF NOT EXISTS expenses (
     -- M5-15:被谁替代了。NULL = 这行still有效。**作废而不是就地覆盖**,形状照抄
     -- memory/ledger.py:保留全部历史,让当前视图干净。就地覆盖读起来最干净,
     -- 但它销毁证据,而"进过系统的一切留痕"是不可协商第 3 条。
-    voided_by    INTEGER REFERENCES expenses(id)
+    voided_by    INTEGER REFERENCES expenses(id),
+    -- M5-20:被删掉的时刻(+ 用户说的理由)。**和 voided_by 分成两列,不复用**:
+    -- 「被改掉了」和「压根不该存在」是两件事,合成一列之后想撤回就分不出该撤哪个,
+    -- 而撤回要还回**原来那一行**(逐字一致),不是长出一行新的。
+    deleted_at     TEXT,
+    deleted_reason TEXT
 );
 -- occurred_at 是唯一的检索维度:list_recent 按它倒序取前 N,query_spending 按它做范围
 -- 扫描。没有索引时两者都要全表扫,而这张表只会越长越长(M4-4 补)。
@@ -146,6 +163,16 @@ _ADDED_COLUMNS = (
         "PRAGMA table_info(expenses)",
         "voided_by",
         "ALTER TABLE expenses ADD COLUMN voided_by INTEGER REFERENCES expenses(id)",
+    ),
+    (
+        "PRAGMA table_info(expenses)",
+        "deleted_at",
+        "ALTER TABLE expenses ADD COLUMN deleted_at TEXT",
+    ),
+    (
+        "PRAGMA table_info(expenses)",
+        "deleted_reason",
+        "ALTER TABLE expenses ADD COLUMN deleted_reason TEXT",
     ),
 )
 
@@ -192,8 +219,9 @@ def _parse_day(raw: str) -> date | None:
         return None
 
 
-def _render_note(note: str | None) -> str:
-    """把 note 当**不可信文本**渲染,一条都不例外。
+def _render_note(note: str | None, label: str = "备注") -> str:
+    """把 note 当**不可信文本**渲染,一条都不例外。`label` 只换标签词
+    (删除理由和 note 同源,都是模型写的文本),**刀是同一把**。
 
     note 是模型写的,而模型在不可信轮会把短信正文转述进去(L3:模型输出是不可信输入)。
     bundle 拿不到本轮的信任度,所以不做区分——统一过三刀:
@@ -214,7 +242,11 @@ def _render_note(note: str | None) -> str:
         .replace(_NOTE_OPEN, "﹁")
         .replace(_NOTE_CLOSE, "﹂")
     )
-    return f" · 备注{_NOTE_OPEN}{safe[:MAX_NOTE_CHARS]}{_NOTE_CLOSE}"
+    return f" · {label}{_NOTE_OPEN}{safe[:MAX_NOTE_CHARS]}{_NOTE_CLOSE}"
+
+
+def _render_reason(reason: str | None) -> str:
+    return _render_note(reason, label="原因")
 
 
 def _group_line(row: sqlite3.Row) -> str:
@@ -358,8 +390,9 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         或超大值都钳制到上限。since/until 格式 YYYY-MM-DD、两端都含,缺省为全时段;
         order 取 recent(最近的在前)或 largest(金额从大到小)。回答"某段时间最大的
         一笔"要 order=largest **并且**给上 since/until——只给 order 会答成全时段之最。
-        每行开头的 #id 可以直接喂给 amend_expense;被改过的旧行默认不列,
-        include_voided=True 才带上(标「已作废」)。"""
+        每行开头的 #id 可以直接喂给 amend_expense 或 delete_expense;被改过的旧行和
+        被删掉的行默认都不列,include_voided=True 才带上(标「已作废」「已删除」)
+        ——用户说"删错了恢复一下"时就这么找回那个 #id。"""
         # 负数在 SQLite 的 LIMIT 里是"不限制",不钳制就是全表倒进上下文(M3-1 教训)。
         n = MAX_RECENT_ROWS if limit < 1 else min(limit, MAX_RECENT_ROWS)
         mode = _ORDER_BY.get(order.strip().lower() if isinstance(order, str) else "")
@@ -398,10 +431,17 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         lines = [f"{scope}{word} {len(rows)} 笔:"]
         for r in rows:
             when = r["occurred_at"].replace("T", " ")[:16]
-            voided = f" 已作废(见 #{r['voided_by']})" if r["voided_by"] is not None else ""
+            if r["deleted_at"] is not None:
+                # 删掉的和被改掉的分开说:一句"已作废"会让模型把两者混着回话,
+                # 而用户接下来要问的("那能恢复吗")只有一种答得上来。
+                mark = f" 已删除{_render_reason(r['deleted_reason'])}"
+            elif r["voided_by"] is not None:
+                mark = f" 已作废(见 #{r['voided_by']})"
+            else:
+                mark = ""
             lines.append(
                 f"- #{r['id']} {when} {r['category']} {_yuan(r['amount_cents'])} 元"
-                f"{_render_note(r['note'])}{voided}"
+                f"{_render_note(r['note'])}{mark}"
             )
         return "\n".join(lines)
 
@@ -415,7 +455,8 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         """改一笔已经记错的流水。expense_id 是 list_recent 每行开头那个 #id;
         只传要改的字段,没传的原样保留。**旧行不会被删掉,而是标成作废并指向新行**
         ——所以改错了还能再改,历史查得到(list_recent 带 include_voided=True 能看见)。
-        账上永远只留一条有效记录,不需要、也没有删除这个操作。"""
+        **这个工具只管"改"。要整笔去掉用 delete_expense,别拿改备注的办法假装删掉**
+        ——那样金额还在账上照样计入合计,而用户以为已经没了。"""
         row = conn.execute(
             "SELECT id, amount_cents, category, occurred_at, note, voided_by"
             " FROM expenses WHERE id = ?",
@@ -477,8 +518,66 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
             f"({stamp.replace('T', ' ')[:16]}){_render_note(new_note)}。旧的那条留着,标了作废。"
         )
 
+    def delete_expense(
+        expense_id: int,
+        reason: str | None = None,
+        undo: bool = False,
+    ) -> str:
+        """删掉一笔记错的账——比如这笔根本不该存在、或者是测试时随手记的。
+        expense_id 是 list_recent 每行开头那个 #id。删掉之后正常查询看不见它、
+        合计也不算它。**删错了可以撤回**:同一个 id 再调一次、带 undo=True,
+        原样回到账上(金额、类目、时间一个字都不变)。
+        要改金额或类目用 amend_expense,别先删再重记。"""
+        row = conn.execute(
+            "SELECT id, amount_cents, category, note, voided_by, deleted_at FROM expenses"
+            " WHERE id = ?",
+            (expense_id,),
+        ).fetchone()
+        # **所有判断都在动手之前**:M5-15 栽过的是反过来——先写后校验,失败时账已经变了。
+        if row is None:
+            return (
+                f"没有 #{expense_id} 这笔,什么都没动。"
+                f"先用 list_recent 看一眼有哪些,#id 在每行开头。"
+            )
+        what = f"{row['category']} {_yuan(row['amount_cents'])} 元"
+
+        if undo:
+            if row["deleted_at"] is None:
+                return f"#{expense_id}({what})没被删,现在就在账上,不用恢复。"
+            sql = "UPDATE expenses SET deleted_at = NULL, deleted_reason = NULL WHERE id = ?"
+            args: tuple[object, ...] = (expense_id,)
+            done = f"恢复了 #{expense_id}:{what} 又回到账上了。"
+        else:
+            if row["deleted_at"] is not None:
+                # 再删一次不该覆盖第一次的理由,更不该让模型以为"这次才生效"。
+                return f"#{expense_id}({what})已经删过了,账上没有它。要拿回来就带 undo=True。"
+            if row["voided_by"] is not None:
+                # 这行早被 amend 顶掉了,删它对合计没有任何影响——而模型会回话说"删好了",
+                # 用户就以为那笔钱没了。**说清楚该删哪个**,别让它空转一次。
+                return (
+                    f"#{expense_id} 已经被 #{row['voided_by']} 替代了,它本来就不算在账上。"
+                    f"要去掉这笔的话删 #{row['voided_by']}。"
+                )
+            sql = "UPDATE expenses SET deleted_at = ?, deleted_reason = ? WHERE id = ?"
+            args = (
+                datetime.now(tz).replace(tzinfo=None).isoformat(timespec="seconds"),
+                reason,
+                expense_id,
+            )
+            done = (
+                f"删了 #{expense_id}:{what}{_render_reason(reason)}。"
+                f"合计里不算它了。删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+            )
+
+        try:
+            conn.execute(sql, args)
+        except sqlite3.Error as exc:  # E2:没成也要让模型知道,别回话说办好了
+            verb = "恢复" if undo else "删除"
+            return f"这笔没{verb}成(库写入失败:{exc})。"
+        return done
+
     # 顺序即冻结顺序(前缀第 0 层):**只追加在末尾**,不许插队。
-    return [record_expense, query_spending, list_recent, amend_expense]
+    return [record_expense, query_spending, list_recent, amend_expense, delete_expense]
 
 
 def build(data_dir: Path, *, timezone: str) -> BundleRuntime:

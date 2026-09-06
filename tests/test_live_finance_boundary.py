@@ -155,3 +155,38 @@ async def test_a_reply_that_claims_a_record_is_backed_by_a_real_tool_call(live_s
     for line, reply, tools in unbacked:
         print(f"  [{line}] tools={tools}\n      {reply}")
     assert not unbacked, f"{len(unbacked)} 轮声称记了但没有真实调用:{[u[0] for u in unbacked]}"
+
+
+async def test_saying_delete_it_actually_takes_it_off_the_books(live_steward, tmp_path):
+    """★ M5-20 验收口径四(真机那一条的自动化版):**说一句"删掉",账上就真没了。**
+
+    真机上出的事故:用户说"那之前的那个作废",模型手里只有 `amend`,于是调了
+    `amend_expense(1, note="测试作废:不计入")`——旧行标作废、新行金额原样、仍然有效,
+    然后回话"已经标作废了"。**它说的和账上的对不上,而两边都没有报错。**
+
+    所以这里断的是**账**,不是工具名:模型爱调哪个调哪个,只要 28 块最后不在有效行里。
+    只断"调了 delete_expense"的话,一个把 28 记成 0 的实现照样过。
+    """
+    await _say(live_steward, "打车 28,记一下")
+    await _say(live_steward, "中午吃饭 45.5")
+
+    reply, _ = await _say(live_steward, "刚才那笔 28 的打车删掉,那是我测试时随手记的")
+
+    live = [(cents, category) for cents, category in _live_rows(tmp_path)]
+    assert (2800, "交通") not in live, f"说了删,28 块还在账上——真机上栽的就是这一下:{live}"
+    assert (4550, "餐饮") in live, f"把不该删的那笔一起带走了:{live}"
+    assert "28" not in reply or "删" in reply, f"回话得对得上账:{reply}"
+
+
+def _live_rows(data_dir) -> list[tuple[int, str]]:
+    """**只看有效行**——`_recorded` 查的是全表,而这一条关心的正是"删掉之后还算不算"。"""
+    conn = sqlite3.connect(data_dir / "finance" / "finance.sqlite")
+    try:
+        return list(
+            conn.execute(
+                "SELECT amount_cents, category FROM expenses"
+                " WHERE voided_by IS NULL AND deleted_at IS NULL"
+            )
+        )
+    finally:
+        conn.close()
