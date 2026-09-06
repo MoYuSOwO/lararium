@@ -121,6 +121,14 @@ _FALLBACK_MEDIA_TYPES: dict[str, str] = {
 _DEFAULT_MEDIA_TYPE = "application/octet-stream"
 
 
+def _sniff(data: bytes, kind: str) -> str:
+    """按魔数认类型。**不信对方给的文件名**——它是外部输入,而结果会变成磁盘上的后缀。"""
+    for signature, media_type in _MAGIC:
+        if all(data[at : at + len(magic)] == magic for at, magic in signature):
+            return media_type
+    return _FALLBACK_MEDIA_TYPES.get(kind, _DEFAULT_MEDIA_TYPE)
+
+
 @dataclass
 class Backoff:
     """指数退避的计数器。**只算时长,不负责睡**——睡在 `_sleep_or_wake` 里,
@@ -578,11 +586,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-def _sniff(data: bytes, kind: str) -> str:
-    """按魔数认类型。**不信对方给的文件名**——它是外部输入,而结果会变成磁盘上的后缀。"""
-    for signature, media_type in _MAGIC:
-        if all(data[at : at + len(magic)] == magic for at, magic in signature):
-            return media_type
-    return _FALLBACK_MEDIA_TYPES.get(kind, _DEFAULT_MEDIA_TYPE)

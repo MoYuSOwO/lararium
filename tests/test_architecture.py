@@ -285,3 +285,87 @@ def test_gitignore_protects_personal_data() -> None:
     patterns = Path(".gitignore").read_text(encoding="utf-8").split()
     for required in ("data/", ".env", "*.sqlite"):
         assert required in patterns, f".gitignore 缺少 {required},个人数据可能被提交"
+
+
+def _definitions_after_main(tree: ast.Module) -> list[str]:
+    """一个模块里 `if __name__ == "__main__":` **之后**的所有顶层语句。
+
+    判据不是"哪几种语句不许放",是**那一块之后什么都不许放**。理由见调用处:
+    生产走到那一块就进了主循环,后面的字节永远不执行。枚举 def/class/赋值会漏掉
+    import 和裸调用,而它们烂的方式一模一样——所以这里认"位置",不认"种类"。
+    """
+    guard = None
+    for index, node in enumerate(tree.body):
+        if isinstance(node, ast.If) and any(
+            isinstance(sub, ast.Name) and sub.id == "__name__" for sub in ast.walk(node.test)
+        ):
+            guard = index
+    if guard is None:
+        return []
+    return [f"{node.lineno} {type(node).__name__}" for node in tree.body[guard + 1 :]]
+
+
+def test_nothing_is_defined_after_the_main_guard() -> None:
+    """★ `if __name__ == "__main__":` 必须是模块最后一个顶层语句。
+
+    **这条是真机第一天挖出来的,而 542 个测试全绿。** wechat.py 里 `_sniff` 定义在
+    `asyncio.run(main())` 之后:生产是 `python -m lararium.gateway.wechat`,模块从上往下
+    执行,走到那一行就进了事件循环,**后面的 def 永远不会被定义**。日志上的面孔是
+    `NameError: name '_sniff' is not defined`,而它发生在图片落盘那一步——CDN 200 OK,
+    然后消息被跳过,`data/media/` 一直是空的。
+
+    **测试查不出来,因为测试是 `import` 这个模块**:不走 `__main__` 分支,整个文件
+    从头跑到尾,`_sniff` 就有了。测试看到的模块和生产跑的模块,名字空间不一样。
+    这是"测试通过、生产必炸"的教科书形状,单个功能测试**永远**抓不到——所以它需要
+    自己的守卫,和这个文件里其它几条一个理由。
+
+    这不是风格洁癖:`__main__` 块之后的每一个字节,在生产里都是死的。
+    """
+    offenders = [
+        f"{path}:{where}"
+        for path in _source_files()
+        for where in _definitions_after_main(
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        )
+    ]
+
+    assert offenders == [], (
+        f'这些顶层语句写在 `if __name__ == "__main__":` 之后:{offenders}。'
+        "生产里 `python -m` 执行到那一块就进主循环了,后面的定义**永远不会发生**,"
+        "用到它的地方会在真机上抛 NameError。测试 import 模块时反而是好的,所以只有"
+        "真机能发现。把它们挪到 `__main__` 块之前。"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "def f(): ...",
+        "async def f(): ...",
+        "class C: ...",
+        "X = 1",
+        "X: int = 1",
+        "import os",
+        "from os import path",
+        "print('hi')",
+    ],
+)
+def test_the_main_guard_rule_catches_every_shape(tail: str) -> None:
+    """给门禁自己的阳性对照:**八种写法一个都不许漏。**
+
+    枚举种类的门禁必然漏(sqlite 那条第一版就漏了三扇门中的两扇),所以这条认位置。
+    这几个用例钉的正是"认位置"这个机制:任何一种都必须被抓到。
+    """
+    source = f"def used(): ...\nif __name__ == '__main__':\n    used()\n{tail}"
+
+    assert _definitions_after_main(ast.parse(source)), f"这一种没抓到:{tail!r}"
+
+
+def test_the_main_guard_rule_does_not_fire_on_correct_modules() -> None:
+    """反向:不许误伤。定义在前、`__main__` 收尾是正确写法;没有 `__main__` 的模块
+    (库模块,仓库里绝大多数)整份都不受这条约束。"""
+    correct = "def f(): ...\nX = 1\nif __name__ == '__main__':\n    f()"
+    library = "def f(): ...\nX = 1\nclass C: ...\n"
+
+    assert _definitions_after_main(ast.parse(correct)) == []
+    assert _definitions_after_main(ast.parse(library)) == []

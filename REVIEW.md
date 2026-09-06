@@ -10905,3 +10905,58 @@ Qwen 从 AMD 端点上消失,换到**官方 DeepSeek**(`api.deepseek.com/v1`)。
 不再写具体型号——上一版写了 `Qwen3.8-Flash-Next`,一天之后它就下架了。
 
 **门禁**:542 passed + 8 skipped,我自己跑过。
+
+---
+
+## M5-19:`_sniff` 定义在 `if __name__` 之后 —— 待验收
+
+真机第一天挖出来的,而当时 542 个测试全绿。
+
+### 1. 那一处
+
+`_sniff` 挪到 `_DEFAULT_MEDIA_TYPE` 之后、`Backoff` 之前——它属于魔数表那一段,
+和 `_MAGIC` / `_FALLBACK_MEDIA_TYPES` 挨着,那才是它本来该在的地方。
+`if __name__ == "__main__":` 现在是模块最后一个顶层语句。
+
+**两个方向都实跑核对过**(一次性脚本,不入库):把模块源码按 `__name__ == "__main__"`
+执行、`asyncio.run` 换成假的,看进主循环那一刻名字空间里有没有 `_sniff`——
+
+```
+修后:      进主循环时 _sniff 存在 = True
+修前(复现):进主循环时 _sniff 存在 = False
+```
+
+第二行就是真机那条 `NameError` 的机制,在本地复现了一次。
+
+### 2. 门禁认的是「位置」,不是「种类」
+
+`test_nothing_is_defined_after_the_main_guard`:**`if __name__ == "__main__":`
+必须是模块最后一个顶层语句。**
+
+任务书列的是 `def` / `async def` / `class` / 常量赋值四种。我把判据收得更粗:
+**那一块之后什么都不许有。** 理由是 sqlite 那条门禁的教训——第一版枚举写法,
+漏了三扇门里的两扇,而且**一声不响地通过**。枚举四种同样会漏 `import`(库模块 import
+在最后一行,生产里那个名字不存在,烂法一模一样)和裸调用。认位置没有这个洞,
+而且更好解释:**`__main__` 块之后的每一个字节,在生产里都是死的。**
+
+失败信息说的是机制,不是规矩:执行到那一块就进主循环了 → 后面的定义永远不会发生 →
+真机抛 NameError → 而测试是 `import`,反而是好的,所以只有真机能发现。
+
+### 3. 变异
+
+- **阳性对照(helper)**:`def` / `async def` / `class` / `X = 1` / `X: int = 1` /
+  `import os` / `from os import path` / `print(...)` 八种,全部咬住。
+- **阳性对照(扫描那一半)**:往 5 个真有 `__main__` 的文件(`cli.py`、`server.py`、
+  `wechat.py`、`bundles/memory/server.py`、`bundles/finance/server.py`)各塞一个顶层
+  `def`,**5/5 全红**。单测 helper 不够——M5-18 栽过一次:测了方法,没测接线。
+- **反向**:`__main__` 收尾的正确模块、以及压根没有 `__main__` 的库模块(仓库里绝大
+  多数),都不许误伤。
+
+### 4. 没做的
+
+没加启动自检、没加任何运行期检查。这条门禁挡住的是**这一类**;还有没有别的,
+真机会说(G6:先问它该不该在)。
+
+**门禁**:552 passed + 8 skipped(+10 条新的),mypy 35 files,contracts 4 kept / 0 broken。
+
+**要真机验的**:重启服务、发一张图,`data/media/` 里有文件、模型看得见。
