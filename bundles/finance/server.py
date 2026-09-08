@@ -472,60 +472,77 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         用户记着的那个号接着能用;已经删掉的行改不了(要记就直接记一笔新的)。
         **这个工具只管"改"。要整笔去掉用 delete_expense,别拿改备注的办法假装删掉**
         ——那样金额还在账上照样计入合计,而用户以为已经没了。"""
-        row = conn.execute(
-            "SELECT id, amount_cents, category, occurred_at, note, deleted_at"
-            " FROM expenses WHERE id = ?",
-            (expense_id,),
-        ).fetchone()
-        if row is None:
-            return f"没有 #{expense_id} 这笔。先用 list_recent 看一眼有哪些,#id 在每行开头。"
-        if row["deleted_at"] is not None:
-            # 不指恢复那条路(M5-26):「删了的账要改成别的数」不是撤销,是记一笔新的。
-            # 绕去恢复只会在账本上多两条没意义的痕迹——删了又活、活了又是另一个数。
-            return (
-                f"#{expense_id} 已经删了,改不了——它不在账上,改了你也看不见。"
-                f"要记就直接记一笔新的(record_expense)。"
-            )
-
-        cents = row["amount_cents"] if amount is None else _to_cents(amount)
-        if cents is None or cents <= 0 or cents > _MAX_CENTS:
-            # **先校验再动手**:校验没过却已经写了一半,会把一笔好记录改坏。
-            return f"金额不对({amount}):要一个大于 0 的数字,单位是元。这笔没改。"
-        new_category = row["category"] if category is None else category
-        if new_category not in CATEGORIES:
-            legal = "|".join(CATEGORIES)
-            return f"没有「{new_category}」这个类目。合法类目:{legal}。这笔没改。"
-        stamp = row["occurred_at"]
-        if occurred_at is not None:
-            parsed = _parse_when(occurred_at, tz)
-            if parsed is None:
-                return (
-                    f"看不懂时间「{occurred_at}」:要 YYYY-MM-DD 或 YYYY-MM-DD HH:MM。"
-                    f"相对时间先调 current_time 换算成日期再传。这笔没改。"
-                )
-            stamp = parsed.isoformat(timespec="seconds")
-        new_note = row["note"] if note is None else note
-
         try:
-            # 一条 UPDATE 就完了(M5-26):没有"插新行 + 作废旧行"那对必须同生共死的
-            # 语句,自然也没有崩在中间的形态可言,连事务都不需要。
-            # `id` / `created_at` 不在 SET 里——它们一个字节都不许动。
-            conn.execute(
-                "UPDATE expenses SET amount_cents = ?, category = ?, occurred_at = ?, note = ?"
-                " WHERE id = ?",
-                (cents, new_category, stamp, new_note, expense_id),
-            )
-        except sqlite3.Error as exc:  # E2:改不动也要让模型知道这步没成
-            return f"这笔没改成(库写入失败:{exc})。"
+            # M5-31:**整个读-改-写在一个事务里**。四个字段的新值全部来自那次 SELECT,
+            # 而读和写之间原来是敞开的——两个 amend 打同一行(一条 assistant 消息里的
+            # 多个工具调用是**并发**的,M5-8),都读到旧值,后写的把先写的按旧值盖回去,
+            # 两边还都报成功。`GuardedConnection` 那把锁挡不住:它保的是「一条语句/一个
+            # 事务内部不被打断」,而这个洞在两条独立语句**之间**。锁的粒度就是一个事务,
+            # 包进去窗口就没了。
+            #
+            # **校验也必须在里面**:「判的时候没删、写的时候已删」和「判的时候是 49、
+            # 写完是别人的 22」是同一个洞的两张脸,把 SELECT 单独包住不解决任何问题。
+            #
+            # `immediate=True`:这正是 `transaction()` docstring 说的「读了再改」的临界区
+            # ——一上来就拿写锁。同进程里那把可重入锁已经串好了,这一笔是给独立容器形态
+            # (`create_server`,连接不止一条)留的:否则读快照之后再写会撞 BUSY_SNAPSHOT。
+            with transaction(conn, immediate=True):
+                row = conn.execute(
+                    "SELECT id, amount_cents, category, occurred_at, note, deleted_at"
+                    " FROM expenses WHERE id = ?",
+                    (expense_id,),
+                ).fetchone()
+                if row is None:
+                    return (
+                        f"没有 #{expense_id} 这笔。先用 list_recent 看一眼有哪些,#id 在每行开头。"
+                    )
+                if row["deleted_at"] is not None:
+                    # 不指恢复那条路(M5-26):「删了的账要改成别的数」不是撤销,是记一笔新的。
+                    # 绕去恢复只会在账本上多两条没意义的痕迹——删了又活、活了又是另一个数。
+                    return (
+                        f"#{expense_id} 已经删了,改不了——它不在账上,改了你也看不见。"
+                        f"要记就直接记一笔新的(record_expense)。"
+                    )
 
-        before = f"{row['category']} {_yuan(row['amount_cents'])} 元"
-        after = f"{new_category} {_yuan(cents)} 元"
-        # **说清楚号没变**:用户接下来可能还要拿这个 #id 做别的事(再改一次、或者删掉),
-        # 而上一版回的是「改了 #1 → #2」,那个箭头教会模型去记新号。
-        return (
-            f"改了 #{expense_id}:{before} → {after}"
-            f"({stamp.replace('T', ' ')[:16]}){_render_note(new_note)}。还是 #{expense_id},号没变。"
-        )
+                cents = row["amount_cents"] if amount is None else _to_cents(amount)
+                if cents is None or cents <= 0 or cents > _MAX_CENTS:
+                    # **先校验再动手**:校验没过却已经写了一半,会把一笔好记录改坏。
+                    return f"金额不对({amount}):要一个大于 0 的数字,单位是元。这笔没改。"
+                new_category = row["category"] if category is None else category
+                if new_category not in CATEGORIES:
+                    legal = "|".join(CATEGORIES)
+                    return f"没有「{new_category}」这个类目。合法类目:{legal}。这笔没改。"
+                stamp = row["occurred_at"]
+                if occurred_at is not None:
+                    parsed = _parse_when(occurred_at, tz)
+                    if parsed is None:
+                        return (
+                            f"看不懂时间「{occurred_at}」:要 YYYY-MM-DD 或 YYYY-MM-DD HH:MM。"
+                            f"相对时间先调 current_time 换算成日期再传。这笔没改。"
+                        )
+                    stamp = parsed.isoformat(timespec="seconds")
+                new_note = row["note"] if note is None else note
+
+                # 一条 UPDATE 就完了(M5-26):没有"插新行 + 作废旧行"那对必须同生共死的
+                # 语句。`id` / `created_at` 不在 SET 里——它们一个字节都不许动。
+                conn.execute(
+                    "UPDATE expenses SET amount_cents = ?, category = ?, occurred_at = ?,"
+                    " note = ? WHERE id = ?",
+                    (cents, new_category, stamp, new_note, expense_id),
+                )
+
+                before = f"{row['category']} {_yuan(row['amount_cents'])} 元"
+                after = f"{new_category} {_yuan(cents)} 元"
+                # **说清楚号没变**:用户接下来可能还要拿这个 #id 做别的事(再改一次、
+                # 或者删掉),而上一版回的是「改了 #1 → #2」,那个箭头教会模型去记新号。
+                return (
+                    f"改了 #{expense_id}:{before} → {after}({stamp.replace('T', ' ')[:16]})"
+                    f"{_render_note(new_note)}。还是 #{expense_id},号没变。"
+                )
+        except sqlite3.Error as exc:  # E2:改不动也要让模型知道这步没成
+            # 事务整块包进 try:BEGIN 拿不到写锁、COMMIT 失败,都是"这笔没改成",
+            # 一样不许抛给模型(抛出去整轮就炸了,用户看到的是助手死掉)。
+            return f"这笔没改成(库写入失败:{exc})。"
 
     def delete_expense(
         expense_id: int,
@@ -537,45 +554,56 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         合计也不算它。**删错了可以撤回**:同一个 id 再调一次、带 undo=True,
         原样回到账上(金额、类目、时间一个字都不变)。
         要改金额或类目用 amend_expense,别先删再重记。"""
-        row = conn.execute(
-            "SELECT id, amount_cents, category, note, deleted_at FROM expenses WHERE id = ?",
-            (expense_id,),
-        ).fetchone()
-        # **所有判断都在动手之前**:M5-15 栽过的是反过来——先写后校验,失败时账已经变了。
-        if row is None:
-            return (
-                f"没有 #{expense_id} 这笔,什么都没动。"
-                f"先用 list_recent 看一眼有哪些,#id 在每行开头。"
-            )
-        what = f"{row['category']} {_yuan(row['amount_cents'])} 元"
-
-        if undo:
-            if row["deleted_at"] is None:
-                return f"#{expense_id}({what})没被删,现在就在账上,不用恢复。"
-            sql = "UPDATE expenses SET deleted_at = NULL, deleted_reason = NULL WHERE id = ?"
-            args: tuple[object, ...] = (expense_id,)
-            done = f"恢复了 #{expense_id}:{what} 又回到账上了。"
-        else:
-            if row["deleted_at"] is not None:
-                # 再删一次不该覆盖第一次的理由,更不该让模型以为"这次才生效"。
-                return f"#{expense_id}({what})已经删过了,账上没有它。要拿回来就带 undo=True。"
-            sql = "UPDATE expenses SET deleted_at = ?, deleted_reason = ? WHERE id = ?"
-            args = (
-                datetime.now(tz).replace(tzinfo=None).isoformat(timespec="seconds"),
-                reason,
-                expense_id,
-            )
-            done = (
-                f"删了 #{expense_id}:{what}{_render_reason(reason)}。"
-                f"合计里不算它了。删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
-            )
-
         try:
-            conn.execute(sql, args)
+            # M5-31:这里也是「读了再改」,和 amend 同一个洞。判过 `deleted_at` 才动手,
+            # 而判和动手之间原来敞着:两个并发的删除都读到"还在账上",都写一遍
+            # deleted_at,于是**两边都跟用户说「删了」**、第二次的理由把第一次的盖掉
+            # ——上面那句"再删一次不该覆盖第一次的理由"在并发下是空的。和 amend 撞车时
+            # 更难看:它报给用户的金额是 amend 改之前那一份,账上却是改之后的。
+            with transaction(conn, immediate=True):
+                row = conn.execute(
+                    "SELECT id, amount_cents, category, note, deleted_at FROM expenses"
+                    " WHERE id = ?",
+                    (expense_id,),
+                ).fetchone()
+                # **所有判断都在动手之前**:M5-15 栽过的是反过来——先写后校验,失败时账已经变了。
+                if row is None:
+                    return (
+                        f"没有 #{expense_id} 这笔,什么都没动。"
+                        f"先用 list_recent 看一眼有哪些,#id 在每行开头。"
+                    )
+                what = f"{row['category']} {_yuan(row['amount_cents'])} 元"
+
+                if undo:
+                    if row["deleted_at"] is None:
+                        return f"#{expense_id}({what})没被删,现在就在账上,不用恢复。"
+                    sql = (
+                        "UPDATE expenses SET deleted_at = NULL, deleted_reason = NULL WHERE id = ?"
+                    )
+                    args: tuple[object, ...] = (expense_id,)
+                    done = f"恢复了 #{expense_id}:{what} 又回到账上了。"
+                else:
+                    if row["deleted_at"] is not None:
+                        # 再删一次不该覆盖第一次的理由,更不该让模型以为"这次才生效"。
+                        return (
+                            f"#{expense_id}({what})已经删过了,账上没有它。要拿回来就带 undo=True。"
+                        )
+                    sql = "UPDATE expenses SET deleted_at = ?, deleted_reason = ? WHERE id = ?"
+                    args = (
+                        datetime.now(tz).replace(tzinfo=None).isoformat(timespec="seconds"),
+                        reason,
+                        expense_id,
+                    )
+                    done = (
+                        f"删了 #{expense_id}:{what}{_render_reason(reason)}。"
+                        f"合计里不算它了。删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+                    )
+
+                conn.execute(sql, args)
+                return done
         except sqlite3.Error as exc:  # E2:没成也要让模型知道,别回话说办好了
             verb = "恢复" if undo else "删除"
             return f"这笔没{verb}成(库写入失败:{exc})。"
-        return done
 
     # 顺序即冻结顺序(前缀第 0 层):**只追加在末尾**,不许插队。
     return [record_expense, query_spending, list_recent, amend_expense, delete_expense]
