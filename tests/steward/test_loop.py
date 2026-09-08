@@ -96,6 +96,8 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         # M5-21:web_search 同样只追加在末尾。多一个工具 = 工具 schema 变 = 前缀
         # 重建一次,这个代价认(prefix_log 会记);插到中间则是**每轮**毁一次缓存。
         "web_search",
+        # M5-22:web_fetch 追加在 web_search 之后,同一条规矩。
+        "web_fetch",
         "propose_fact",
         "list_pending",
     ]
@@ -1220,3 +1222,59 @@ def test_the_search_client_is_wired_only_when_a_key_is_configured(steward_factor
     monkeypatch.setenv("LARARIUM_TAVILY_KEY", "tvly-fake")
     wired, _ = steward_factory()
     assert isinstance(wired.tools._search, TavilySearch)
+
+
+# ── M5-22:web_fetch 是不可信闩的第二个新来源 ─────────────────────────────
+
+
+class FakeFetch:
+    def __init__(self, text="这是一篇正经文章的正文。" * 20):
+        self._text = text
+
+    def fetch(self, url, *, deep):
+        return WebResult(title="一篇文章", url=url, text=self._text)
+
+
+async def test_reading_a_web_page_raises_the_mark(steward_factory):
+    """★ 和 web_search 那条同样要紧:同一轮里**读完一个链接**再 `propose(user_stated)`
+    必须降档成 pending。
+
+    M5-18 那把闩每多一个来源就要复验一次——闩本身没变,漏的是"新来源忘了调它",
+    而漏了不会有任何报错:提案照样自动放行,用户从没见过审批提示。
+    """
+    steward, _ = steward_factory()
+    steward.tools._fetch = FakeFetch()
+    await start_turn(steward, "这篇你看一下 https://x.example/a")
+
+    tool(steward, "web_fetch")("https://x.example/a")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert len(steward.gate.pending()) == 1, "读过网页的这一轮里 user_stated 被自动放行了"
+
+
+async def test_a_page_that_could_not_be_read_does_not_drag_the_turn_down(steward_factory):
+    """反向:抓不到的时候什么都没进上下文,这一轮还是干净的。"""
+    steward, _ = steward_factory()
+    steward.tools._fetch = FakeFetch(text="")
+    await start_turn(steward)
+
+    tool(steward, "web_fetch")("https://x.example/a")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert steward.gate.pending() == [], "一次读不成的抓取把正常路径拖下水了"
+
+
+def test_the_extract_client_is_wired_only_when_a_key_is_configured(steward_factory, monkeypatch):
+    """接线本身要测——M5-18 栽在"测了方法,没测接线"上,M5-21 又提醒了一次。
+
+    两个客户端共用同一个 key:配了就都接上,没配就都不接(`web_fetch` 回一句人话)。
+    """
+    from lararium.steward.websearch import TavilyExtract
+
+    monkeypatch.delenv("LARARIUM_TAVILY_KEY", raising=False)
+    unwired, _ = steward_factory()
+    assert unwired.tools._fetch is None
+
+    monkeypatch.setenv("LARARIUM_TAVILY_KEY", "tvly-fake")
+    wired, _ = steward_factory()
+    assert isinstance(wired.tools._fetch, TavilyExtract)
