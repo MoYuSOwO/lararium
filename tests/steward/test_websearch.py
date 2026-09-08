@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from lararium.steward.websearch import (
+    EXTRACT_CHUNKS_PER_SOURCE,
     TAVILY_EXTRACT_ENDPOINT,
     TavilyExtract,
     TavilySearch,
@@ -330,3 +331,84 @@ def test_the_search_wording_is_byte_for_byte_unchanged(status, sentence):
         _client(handler).search("x", limit=3)
 
     assert str(exc.value) == sentence
+
+
+# ── M5-27:两条端点各多几个可选参数 ────────────────────────────────────────
+#
+# ★ **这一组断的是发出去的报文,不是回来的返回值。** 「不给 question 时请求体里不
+# 出现 query 和 chunks_per_source」这句话只有看 request 才算数——返回值本来就不带
+# 这两个键,断它等于什么都没断(T6 第 5 条:断言锚点太弱)。`MockTransport` 的
+# handler 手里就是 `httpx.Request`,所以下面每一条都落在 body 上。
+#
+# 头两条是**金样**:缺省那一份报文逐字节还是 M5-21 / M5-22 的样子。多塞一个
+# `"topic": null` 进去也算变——服务商那边 null 和缺席未必同义,而这种差别只有
+# 真机才看得见,本地一条测试都不会红。
+
+
+def _sent_body(run) -> dict:
+    """跑一次请求,把**发出去**的那份 JSON 捞回来。"""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.read())
+        return httpx.Response(200, json={"results": []})
+
+    run(handler)
+    return seen["body"]
+
+
+def test_the_default_search_body_is_exactly_what_it_always_was():
+    """★ 金样:不给新参数时,报文和 M5-21 那一份**一个键都不多**。"""
+    body = _sent_body(lambda h: _client(h).search("上海天气", limit=3))
+
+    assert body == {"query": "上海天气", "max_results": 3, "search_depth": "basic"}
+
+
+def test_topic_and_time_range_go_into_the_body_only_when_given():
+    """给了才进,而且**别的键一个都不许跟着变**。"""
+    body = _sent_body(
+        lambda h: _client(h).search("上海这周末天气", limit=3, topic="news", time_range="week")
+    )
+
+    assert body == {
+        "query": "上海这周末天气",
+        "max_results": 3,
+        "search_depth": "basic",
+        "topic": "news",
+        "time_range": "week",
+    }
+
+
+def test_the_default_extract_body_is_exactly_what_it_always_was():
+    """★ 金样:不给 question 时,`query` 和 `chunks_per_source` 两个键都不出现。"""
+    body = _sent_body(lambda h: _extractor(h).fetch("https://x.example/a", deep=False))
+
+    assert body == {
+        "urls": ["https://x.example/a"],
+        "extract_depth": "basic",
+        "format": "markdown",
+    }
+
+
+def test_a_question_brings_the_query_and_the_chunk_cap_along():
+    """`chunks_per_source` 只在给了 `query` 时才起作用(官方文档),所以两个键必须
+    同进同出——只发 `query` 等于用了服务商的缺省段数,那不是我们挑的数。"""
+    body = _sent_body(
+        lambda h: _extractor(h).fetch("https://x.example/a", deep=False, question="他怎么评价 uv")
+    )
+
+    assert body["query"] == "他怎么评价 uv"
+    assert body["chunks_per_source"] == EXTRACT_CHUNKS_PER_SOURCE
+    assert 1 <= EXTRACT_CHUNKS_PER_SOURCE <= 5, "官方文档给的范围是 1 到 5,超出去服务商会打回来"
+
+
+def test_going_advanced_does_not_drop_the_question():
+    """★ 升 advanced 那一次 `question` 也得在——**升了级反而丢焦点**是净亏:
+    多花一倍 credit,换回来一份盲取的整页。"""
+    body = _sent_body(
+        lambda h: _extractor(h).fetch("https://x.example/a", deep=True, question="退款几天到账")
+    )
+
+    assert body["extract_depth"] == "advanced"
+    assert body["query"] == "退款几天到账"
+    assert body["chunks_per_source"] == EXTRACT_CHUNKS_PER_SOURCE
