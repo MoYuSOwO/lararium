@@ -98,6 +98,9 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         "web_search",
         # M5-22:web_fetch 追加在 web_search 之后,同一条规矩。
         "web_fetch",
+        # M5-33:list_threads 追加在内置那一段的末尾——按加入时间排,不按"它和
+        # open/close_thread 是一家"排;挪过去会让后面的工具整体平移一格。
+        "list_threads",
         "propose_fact",
         "list_pending",
     ]
