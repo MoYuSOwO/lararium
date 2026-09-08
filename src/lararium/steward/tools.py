@@ -391,6 +391,9 @@ class BuiltinTools:
         问的是"此刻怎么样"——天气、比分、某件事最新进展、今天的新闻——就填
         topic="news",它换的是一批资讯来源;问的是不随时间变的东西(Python 装饰器
         怎么写、某个成语什么意思、某个库的用法),**别填**,填了会把百科和文档挤掉。
+        问的是行情、财报、某家公司的经营——填 topic="finance",它换的是一批财经来源
+        (实测「英伟达最新财报」:不填和 news 都回聚合站,finance 回的是公司自己的
+        新闻室和 WSJ)。
         time_range 只在你要的确实是"最近的"时候填:day / week / month / year。
         这两个值只有上面列的这些,写别的会被我挡回来,白费一轮。
 
@@ -411,7 +414,12 @@ class BuiltinTools:
         # 而模型按后者会去等一会儿再试,等多久都不会好。顺带省一次白花的往返。
         topic = _picked(topic)
         if topic is not None and topic not in SEARCH_TOPICS:
-            return _rejected("topic", topic, SEARCH_TOPICS, "不填就是普通搜索;查当下的事才填 news")
+            return _rejected(
+                "topic",
+                topic,
+                SEARCH_TOPICS,
+                "不填就是普通搜索;查当下的事填 news,查行情财报填 finance",
+            )
         time_range = _picked(time_range)
         if time_range is not None and time_range not in SEARCH_TIME_RANGES:
             return _rejected("time_range", time_range, SEARCH_TIME_RANGES, "不填就是不限时间")

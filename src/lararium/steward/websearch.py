@@ -62,10 +62,17 @@ EXTRACT_TIMEOUT_SECONDS = 20.0
 # 只做一件事——把表里没有的值挡下来回一句人话;它不需要知道表里有什么,只需要
 # 知道去哪儿对。哪天服务商加一档,改的是这两行,工具那边一个字不动。
 
-# `/search` 的 `topic`。官方还有第三档 `finance`,**PLAN M5-27 选的是这两个**:
-# 那一条的实测只覆盖「资讯」这一类,而多给模型一个没验过的档位,它一定会拿去试。
-# 要加就先补实测,别在这里顺手放开。
-SEARCH_TOPICS = ("general", "news")
+# `/search` 的 `topic`(2026-09-09 核的官方文档)。交付方按 M5-27 任务书只放了
+# 前两档,并把 `finance` 记进回报——**判得对,而复核方补了实测之后放开了第三档**:
+#
+#   查询「英伟达最新财报」
+#     不填        stcn.com、moomoo.com、moomoo.com        ← 聚合站
+#     news        moomoo.com、tradingview.com、cztv.com   ← 还是聚合站
+#     finance     nvidianews.nvidia.com、wsj.com、forbes.com
+#
+# 差别是实的,而 M5-27 这一步的名字就叫「一次选齐,别再一个一个撞」——
+# 明知有第三个值还留着,正是它要治的那个毛病。
+SEARCH_TOPICS = ("general", "news", "finance")
 
 # `/search` 的 `time_range`(2026-09-09 核的官方文档)。长短两套写法服务商都认,
 # **两套都放行**:这张表挡的是它不认识的值(那种发出去会变成一句「搜索服务出错了」,
