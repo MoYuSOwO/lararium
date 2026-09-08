@@ -17,7 +17,7 @@ from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
 from lararium.steward.tools import BuiltinTools
 from lararium.steward.vision import load_images
-from lararium.steward.websearch import TavilySearch
+from lararium.steward.websearch import TavilyExtract, TavilySearch
 
 logger = logging.getLogger("lararium")
 
@@ -103,6 +103,8 @@ class Steward:
             # M5-21:没配 key 就**不接**——`web_search` 会回一句「没接搜索」。
             # 接一个必然打 401 的客户端会让用户去查错的东西(以为 key 配错了)。
             search=TavilySearch(settings.tavily_key) if settings.tavily_key else None,
+            # M5-22:读网页走同一个 key 的第二个端点(`/extract`),同一条规矩。
+            fetch=TavilyExtract(settings.tavily_key) if settings.tavily_key else None,
         )
 
     def all_tools(self) -> list[Callable]:
