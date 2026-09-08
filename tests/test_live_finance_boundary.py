@@ -161,7 +161,7 @@ async def test_saying_delete_it_actually_takes_it_off_the_books(live_steward, tm
     """★ M5-20 验收口径四(真机那一条的自动化版):**说一句"删掉",账上就真没了。**
 
     真机上出的事故:用户说"那之前的那个作废",模型手里只有 `amend`,于是调了
-    `amend_expense(1, note="测试作废:不计入")`——旧行标作废、新行金额原样、仍然有效,
+    `amend_expense(1, note="测试作废:不计入")`——金额原样、这笔仍然有效,
     然后回话"已经标作废了"。**它说的和账上的对不上,而两边都没有报错。**
 
     所以这里断的是**账**,不是工具名:模型爱调哪个调哪个,只要 28 块最后不在有效行里。
@@ -183,10 +183,7 @@ def _live_rows(data_dir) -> list[tuple[int, str]]:
     conn = sqlite3.connect(data_dir / "finance" / "finance.sqlite")
     try:
         return list(
-            conn.execute(
-                "SELECT amount_cents, category FROM expenses"
-                " WHERE voided_by IS NULL AND deleted_at IS NULL"
-            )
+            conn.execute("SELECT amount_cents, category FROM expenses WHERE deleted_at IS NULL")
         )
     finally:
         conn.close()
