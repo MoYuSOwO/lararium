@@ -267,16 +267,48 @@ def build_sweep_runner(settings: Any) -> Callable[[str], Awaitable[str]]:
     return _run
 
 
+# writing-facts 方法篇里"给归拢也看"的那一半到哪儿为止。**分界线是文件里的标记,
+# 不是标题名**:标题会被改写,标记不会——而改写标题的人看不出自己顺手切掉了归拢的判据。
+_SWEEP_CUT = "<!-- SWEEP-CUT"
+
+
+def _fact_rules(registry: Any) -> str:
+    """把 memory 的 `writing-facts` 方法篇拼进归拢 prompt(M5-23)。
+
+    **判据只有一份,归拢借的就是那一份。** 以前 sweep.md 自己写了一套,最后一句还说
+    「写用户的原话,别加你的解读和推断」——正好和账本要的东西相反,而模型听了那句:
+    真机 31 轮跑下来提上来 3 条全是原话(「学校嘛 那天天上课睡觉…」),
+    人工翻同样 31 轮找得出的 4 条事实一条都没提。**打架的三份文档里赢的是最差那份。**
+
+    不给归拢开工具是有意的(`build_sweep_runner`:一次 user 消息、`system_prompt=""`、
+    no tools)——归拢是批处理,不需要探索能力。所以它读不到方法篇,只能在这里拼。
+
+    读不到就**炸在启动时**,不静默降级:降级的样子和"模型今天状态不好"一模一样,
+    而代价是又一晚上的原话(M5-4 那条教训的同一个形状)。
+    """
+    text = registry.read_skill("memory", "writing-facts")
+    head = text.split(_SWEEP_CUT)[0].rstrip()
+    if _SWEEP_CUT not in text or not head:
+        raise ValueError(
+            f"writing-facts 方法篇里找不到 {_SWEEP_CUT} 分界线,归拢就没有判据可拼了"
+            f"——那正是 M5-23 修的那个 bug。别删这个标记,要挪就连着上下两半一起想清楚。"
+        )
+    return f'## 什么算"该记的事实"(memory 的 writing-facts 方法篇原文,别另立一套)\n\n{head}'
+
+
 def make_sweeper(
     settings: Any,
     journal: Any,
     threads: Any,
     gate: Any,
+    registry: Any,
     ledger: Any = None,
     notify: Callable[[str], None] | None = None,
 ) -> Sweeper:
-    """组装根的归拢工厂:读 prompts/sweep.md 指令 + 廉价模型 runner。"""
-    instructions = Path("prompts/sweep.md").read_text(encoding="utf-8")
+    """组装根的归拢工厂:prompts/sweep.md + writing-facts 方法篇 + 廉价模型 runner。"""
+    instructions = (
+        Path("prompts/sweep.md").read_text(encoding="utf-8") + "\n\n" + _fact_rules(registry)
+    )
     return Sweeper(
         journal,
         threads,

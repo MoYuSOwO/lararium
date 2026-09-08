@@ -220,13 +220,15 @@ def make_compactor(
     journal: Any,
     gate: Any,
     threads: Any,
+    registry: Any,
     ledger: Any = None,
     notify: Callable[[str], None] | None = None,
 ) -> Compactor:
     """组装根的压缩工厂:同一廉价模型 runner(切段)+ 复用 M3-5 的 Sweeper 做沉淀筛。"""
     cut_instructions = Path("prompts/cut.md").read_text(encoding="utf-8")
     runner = build_sweep_runner(settings)
-    sweeper = make_sweeper(settings, journal, threads, gate, ledger=ledger, notify=notify)
+    # 沉淀筛复用 M3-5 的 Sweeper,**不写第二份**——所以判据也自动是同一份(M5-23)。
+    sweeper = make_sweeper(settings, journal, threads, gate, registry, ledger=ledger, notify=notify)
     return Compactor(
         journal,
         gate,

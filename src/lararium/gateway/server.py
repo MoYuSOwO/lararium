@@ -196,6 +196,7 @@ def create_app(
             steward.journal,
             gate,
             steward.threads,
+            steward.registry,
             ledger=steward.ledger,
             notify=notify,
         )
@@ -365,6 +366,7 @@ def create_app(
                 steward.journal,
                 steward.threads,
                 gate,
+                steward.registry,
                 ledger=steward.ledger,
                 notify=notify,
             )
@@ -384,6 +386,7 @@ def create_app(
                 steward.journal,
                 gate,
                 steward.threads,
+                steward.registry,
                 ledger=steward.ledger,
                 notify=notify,
             )

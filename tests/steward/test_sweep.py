@@ -7,6 +7,7 @@
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from bundles.memory.server import build_memory_components
@@ -454,3 +455,78 @@ def test_a_failed_push_leaves_no_half_turn(tmp_path):
 
     assert conn.execute("SELECT count(*) FROM journal").fetchone()[0] == 0, "留下了半条"
     assert conn.execute("SELECT count(*) FROM notice_log").fetchone()[0] == 0, "名额被白占了"
+
+
+# ─────────────────────────── M5-23:判据只有一份 ───────────────────────────
+
+
+def test_the_sweep_prompt_carries_the_fact_rules_verbatim(tmp_path, monkeypatch):
+    """★ 归拢的 prompt 里**必须真的有那份判据**——钉的是接线,不是 `_fact_rules` 本身。
+
+    真机 31 轮:主对话 propose 0 次,归拢提上来 3 条**全是原话**
+    (「学校嘛 那天天上课睡觉 那不吃点好的怎么行」),而人工翻同样 31 轮找得出 4 条事实。
+    根因是 `prompts/sweep.md` 最后一句「写用户的原话,别加你的解读和推断」——
+    它和账本要的东西正好相反,而模型听了那句。
+
+    归拢是 no tools 的一次性调用(有意的:批处理不需要探索能力),所以它读不到方法篇,
+    只能拼进 prompt。**只测 `_fact_rules` 返回值是不够的**:把 `make_sweeper` 里那句
+    拼接删掉,函数照样对(M5-18 栽过这一下——测了方法,没测接线)。
+    """
+    from lararium.config import Settings
+    from lararium.steward.registry import Registry
+    from lararium.steward.sweep import make_sweeper
+
+    monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
+    conn = connect(tmp_path / "steward.sqlite")
+    ledger, gate = build_memory_components(tmp_path)
+    sweeper = make_sweeper(
+        Settings.load(),
+        Journal(conn),
+        Threads(conn),
+        gate,
+        Registry.load(Path("bundles")),
+        ledger=ledger,
+    )
+
+    prompt = sweeper._build_prompt([], [])
+
+    assert "四个判据" in prompt and "稳定安排" in prompt, "判据没拼进去"
+    assert "归纳出来的短句" in prompt, "最关键那半句没拼进去——原话 bug 会原样回来"
+    assert "✗" in prompt and "✓" in prompt, "正反例没拼进去"
+    # 另一半不许拼:归拢没有工具、也不填 provenance,拼给它只会添乱
+    assert "provenance" not in prompt and "old_text" not in prompt, "把对话专用的那半也拼了"
+
+
+def test_a_missing_cut_marker_fails_loudly():
+    """分界线没了 → **炸在启动时**,不静默降级。
+
+    静默降级的样子和"模型今天状态不好"一模一样,而代价是又一晚上的原话。
+    """
+    from lararium.steward.sweep import _fact_rules
+
+    class _NoMarker:
+        def read_skill(self, bundle, skill=None):
+            return "# 怎么写账本条目\\n只剩标题,分界线被谁顺手删了"
+
+    with pytest.raises(ValueError, match="SWEEP-CUT"):
+        _fact_rules(_NoMarker())
+
+
+def test_the_fact_criteria_are_written_down_in_exactly_one_place():
+    """★ 收敛:**判据只有一份文档**,别处只准指过去。
+
+    改之前是三份在打架——`discipline.md`(前缀短版)、`writing-facts.md`(方法篇长版)、
+    `sweep.md`(自己一份,而且说反话),**赢的是最差那份**。三份各自都读得通,
+    所以没有任何测试会红;它只在真机上以"提上来的全是原话"的形态出现。
+
+    用判据 3 那句话当探针(它最独特、最容易被顺手抄走)。这条测试的意义不是护着这句话,
+    是让"再抄一份"这个动作有代价。
+    """
+    canary = "三个月后"
+    docs = sorted(Path("prompts").glob("*.md")) + sorted(Path("bundles").glob("*/skills/*.md"))
+    holders = [str(p) for p in docs if canary in p.read_text(encoding="utf-8")]
+
+    assert holders == ["bundles/memory/skills/writing-facts.md"], (
+        f"判据被抄进了不止一份文档:{holders}。指过去,别抄——抄本会漂,"
+        f"而漂了之后打赢的不一定是对的那份(M5-23)。"
+    )
