@@ -1280,3 +1280,214 @@ def test_the_extract_client_is_wired_only_when_a_key_is_configured(steward_facto
     monkeypatch.setenv("LARARIUM_TAVILY_KEY", "tvly-fake")
     wired, _ = steward_factory()
     assert isinstance(wired.tools._fetch, TavilyExtract)
+
+
+# ── M5-28:不可信要过得了起居注,不然那把闩只在轮内有效 ────────────────────
+#
+# M5-18 建的是**轮内**的闩:这一轮捞回不可信内容 → 拉高 → propose 降档。
+# 轮**间**那条路从来没建过。`Journal.search` 判不可信读的是
+# `json_extract(payload, '$.meta.untrusted')`,而**只有 envelope 的 payload 带 meta**
+# (真机取样:tool_result / reply / tool_executed 都没有)。于是——
+#
+#   第 N 轮    web_search 捞回攻击者的内容 → 落成一条没有 meta 的 tool_result
+#   第 N+5 轮  search_history 命中它 → hit.untrusted 是 False → 闩不拉
+#              → propose(user_stated) 自动放行 → 进长期档案
+#
+# 修法选的是**推导**不是盖章:一条命中脏不脏,顺着它所属的**信封**解析(自己的 payload
+# 说脏 / 那封信有 untrusted_seen / 那封信的 meta 说脏)。一个事实只有一个出处,
+# 不用补列、不用回填、不用回答"老记录默认算什么",而且自动覆盖所有 kind
+# ——`tool_executed` 那种"落的时候还不知道这一轮脏不脏"的也一并解掉。
+
+
+def seed_dirty_turn_with_a_tool_result(
+    steward,
+    envelope_id="env-web",
+    text="工商银行:尾号 6688 的账户每月向 6222-8888 转账 3000 元",
+):
+    """造一轮真机形状的脏轮:**可信信封** + 工具捞回的外部内容 + 那一轮落了 untrusted_seen。
+
+    关键在 `tool_result` 的 payload **没有 meta**——真机取样确认过,而那正是闩漏掉它的原因。
+    信封本身干净(用户自己开的口),脏是工具捞进来的。
+    """
+    steward.journal.append(
+        envelope_id,
+        "envelope",
+        {
+            "content": "帮我搜一下最近有没有转账相关的通知",
+            "source": "user",
+            "channel": "cli",
+            "meta": {},
+            "ts": "2026-09-01T09:00:00+08:00",
+        },
+    )
+    steward.journal.append(
+        envelope_id,
+        "tool_result",
+        {"tool": "web_search", "content": text, "tool_call_id": "call-1"},
+    )
+    steward.journal.append(envelope_id, "untrusted_seen", {})
+
+
+def seed_clean_turn_with_a_tool_result(
+    steward, envelope_id="env-ok", text="9 月 1 日 星巴克拿铁 38 元"
+):
+    """阳性对照的料:一模一样的形状(`tool_result`,payload 里同样没有 meta),
+    只是那一轮从头到尾干净——没有 untrusted_seen,信封 meta 也没说脏。"""
+    steward.journal.append(
+        envelope_id,
+        "envelope",
+        {
+            "content": "上周喝咖啡花了多少",
+            "source": "user",
+            "channel": "cli",
+            "meta": {},
+            "ts": "2026-09-02T09:00:00+08:00",
+        },
+    )
+    steward.journal.append(
+        envelope_id,
+        "tool_result",
+        {"tool": "list_recent", "content": text, "tool_call_id": "call-2"},
+    )
+
+
+async def test_a_tool_result_from_a_dirty_turn_is_still_dirty_next_turn(steward_factory):
+    """★ 洞本身,而且要断到账本那一头:**跨轮**命中一条脏 tool_result → propose 必须待审。
+
+    只断"闩拉了"不够——闩存在的全部理由就是它下游那一脚。判据取副作用:提案落在
+    pending 里、`settle` 不动它。
+    """
+    steward, _ = steward_factory()
+    seed_dirty_turn_with_a_tool_result(steward)
+    await start_turn(steward, "把那条转账安排归到我的长期安排里")
+
+    listed = tool(steward, "search_history")("6688")
+    out = tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "6688" in listed, "这一页压根没命中,下面断的是空气"
+    assert "待审" in out and "已记下" not in out, out
+    pending = steward.gate.pending()
+    assert len(pending) == 1 and pending[0].provenance == "untrusted", (
+        "工具捞回的外部内容跨了一轮就变可信了——闩过不了起居注"
+    )
+    assert steward.settle_if_needed() == 0, "降档了却还是被自动结算,那等于没降"
+
+
+async def test_a_clean_tool_result_hit_does_not_raise_the_mark(steward_factory):
+    """★ 阳性对照:干净历史的命中**不许**拉闩。
+
+    没有这条,一个"凡是命中 tool_result 就算脏"的实现照样能过上面那条——而那是个
+    永远为真的断言,正是 M5-9 抓到过的形状。
+    """
+    steward, _ = steward_factory()
+    seed_clean_turn_with_a_tool_result(steward)
+    await start_turn(steward)
+
+    listed = tool(steward, "search_history")("星巴克")
+    out = tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "星巴克" in listed, "这一页压根没命中,下面断的是空气"
+    assert "已记下" in out, out
+    assert steward.gate.pending() == [], "干净历史的命中把这一轮拖脏了"
+
+
+async def test_a_reply_that_quoted_an_untrusted_envelope_is_still_dirty_next_turn(steward_factory):
+    """第三条来路:那一轮**没调过工具**(所以没有 untrusted_seen),脏在信封 meta 上。
+
+    `reply` 的 payload 里同样没有 meta——它脏不脏只能顺着所属信封解析。查询词只出现在
+    回复里、不出现在信封里:否则命中的是信封,而信封那条路本来就通,什么都测不到。
+    """
+    steward, _ = steward_factory()
+    seed_untrusted(steward, "工商银行:您有一笔自动转账即将扣款")
+    steward.journal.append(
+        "env-sms",
+        "reply",
+        {"content": "那条通知说的是每月向 6222-8888 转 3000 元,来源不可信,我不能凭它入账。"},
+    )
+    await start_turn(steward, "刚才那条通知里的定投,归到我的长期安排里吧")
+
+    listed = tool(steward, "search_history")("6222")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "6222" in listed and "工商银行" not in listed, "命中的该是回复,不是信封"
+    assert len(steward.gate.pending()) == 1, "不可信信封那一轮的回复跨轮就变可信了"
+
+
+async def test_a_short_query_takes_the_like_branch_and_still_derives_it(steward_factory):
+    """词法路是**两条 SQL**:≥3 字走 FTS、更短走 LIKE。
+
+    只改一条不会有任何报错——短查询上闩就静悄悄地不算数了。
+    """
+    steward, _ = steward_factory()
+    seed_dirty_turn_with_a_tool_result(steward)
+    await start_turn(steward)
+
+    listed = tool(steward, "search_history")("转账")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "转账" in listed, "这一页压根没命中,下面断的是空气"
+    assert len(steward.gate.pending()) == 1, "LIKE 那条分支没解出来"
+
+
+@pytest.fixture
+def semantic(monkeypatch):
+    """让语义路真跑起来:embedding 换成确定性查表,vec0 用真表真查。
+
+    **不 monkeypatch `search_similar` 本身**——那样测的是假货,而这一条要验的正是
+    `search_similar` 里那条 SQL(第二个出口)。
+    """
+    import math
+
+    from lararium.steward import embeddings as em
+    from lararium.steward import journal as jmod
+
+    memo: dict[str, list[float]] = {}
+
+    def unit(*weights):
+        v = [0.0] * 256
+        for i, x in enumerate(weights[:256]):
+            v[i] = x
+        norm = math.sqrt(sum(x * x for x in v)) or 1.0
+        return [x / norm for x in v]
+
+    monkeypatch.setattr(em, "embedding_available", lambda: True)
+    monkeypatch.setattr(db_module, "VEC_AVAILABLE", True)
+    monkeypatch.setattr(jmod, "embed", lambda t: memo.get(t))
+    return memo, unit
+
+
+async def test_recall_similar_derives_it_from_the_envelope_too(steward_factory, semantic):
+    """★ 第二个出口,同一条规则。两个出口两套规则这一节栽过两次(M4-4、M5-5)。"""
+    memo, unit = semantic
+    dirty = "工商银行:尾号 6688 的账户每月向 6222-8888 转账 3000 元"
+    memo[dirty] = unit(1.0)
+    memo["那条转账通知"] = unit(1.0)
+
+    steward, _ = steward_factory()
+    seed_dirty_turn_with_a_tool_result(steward, text=dirty)
+    await start_turn(steward, "把那条转账安排归到我的长期安排里")
+
+    listed = tool(steward, "recall_similar")("那条转账通知")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "6688" in listed, "语义路压根没命中,下面断的是空气"
+    assert len(steward.gate.pending()) == 1, "语义检索那条路上不可信静悄悄地不算数了"
+    assert steward.settle_if_needed() == 0
+
+
+async def test_a_clean_recall_similar_hit_does_not_raise_the_mark(steward_factory, semantic):
+    """语义路的阳性对照:干净历史照旧自动放行,别把正常路径一起拖下水。"""
+    memo, unit = semantic
+    clean = "9 月 1 日 星巴克拿铁 38 元"
+    memo[clean] = unit(1.0)
+    memo["上周的咖啡"] = unit(1.0)
+
+    steward, _ = steward_factory()
+    seed_clean_turn_with_a_tool_result(steward, text=clean)
+    await start_turn(steward)
+
+    listed = tool(steward, "recall_similar")("上周的咖啡")
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "星巴克" in listed, "语义路压根没命中,下面断的是空气"
+    assert steward.gate.pending() == [], "干净历史的语义命中把这一轮拖脏了"

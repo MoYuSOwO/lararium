@@ -241,6 +241,34 @@ def test_journal_search_finds_3char_after_append(tmp_path):
     assert total2 == 1, "2 字走 LIKE 回退,也必须在"
 
 
+def test_search_derives_untrusted_from_the_owning_envelope(journal):
+    """M5-28:`SearchHit.untrusted` 顺着**信封**解析,不是读这条记录自己的 meta。
+
+    只有 `envelope` 的 payload 带 `meta`(真机取样:`tool_result` / `reply` /
+    `tool_executed` 都没有)。直接读 `$.meta.untrusted` 的话,web_search 捞回来的
+    外部内容跨一轮就洗成"可信"了,而那把闩下游连着账本。
+
+    三条来路各打一次,外加一条干净的做阳性对照——少了对照就是个永远为真的断言。
+    """
+    journal.append("env-sms", "envelope", {"content": "银行通知甲", "meta": {"untrusted": True}})
+    journal.append("env-sms", "reply", {"content": "这条通知乙我不能凭它入账"})
+    journal.append("env-web", "envelope", {"content": "帮我搜丙", "meta": {}})
+    journal.append("env-web", "tool_result", {"tool": "web_search", "content": "外部内容丁"})
+    journal.append("env-web", "untrusted_seen", {})
+    journal.append("env-ok", "envelope", {"content": "上周咖啡戊", "meta": {}})
+    journal.append("env-ok", "tool_result", {"tool": "list_recent", "content": "拿铁己 38 元"})
+
+    def only(query):
+        _, hits = journal.search(query)
+        assert len(hits) == 1, f"{query} 命中 {len(hits)} 条,断言会指不到东西"
+        return hits[0]
+
+    assert only("通知甲").untrusted is True, "① 信封自己的 meta"
+    assert only("通知乙").untrusted is True, "③ 不可信信封那一轮的回复(它自己没有 meta)"
+    assert only("内容丁").untrusted is True, "② 那一轮落过 untrusted_seen"
+    assert only("拿铁己").untrusted is False, "阳性对照:干净轮的工具结果不许被算脏"
+
+
 def test_append_is_atomic_rolls_back_all_tables_on_mid_crash(tmp_path, monkeypatch):
     """崩在写 FTS 前/写 vec 前:一次事务整个回滚,绝不留「有 journal 无 fts/vec」的半套。"""
 
