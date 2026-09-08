@@ -1172,7 +1172,8 @@ class FakeSearch:
     def __init__(self, results):
         self._results = results
 
-    def search(self, query, *, limit):
+    # M5-27:签名跟着 SearchPort 走(这两个参数这一节用不上,但假货得配得上契约)
+    def search(self, query, *, limit, topic=None, time_range=None):
         return list(self._results)
 
 
@@ -1231,7 +1232,8 @@ class FakeFetch:
     def __init__(self, text="这是一篇正经文章的正文。" * 20):
         self._text = text
 
-    def fetch(self, url, *, deep):
+    # M5-27:签名跟着 FetchPort 走(理由同上面那个假货)
+    def fetch(self, url, *, deep, question=None):
         return WebResult(title="一篇文章", url=url, text=self._text)
 
 

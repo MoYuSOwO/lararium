@@ -12069,3 +12069,173 @@ results[0] 的字段: ['images', 'raw_content', 'title', 'url']
 **门禁**:662 passed + 15 skipped(+48 条),mypy 36 files(`websearch.py` 已在严格档),
 contracts 4 kept / 0 broken。前缀指纹 `0eb1721d…` → `03cdce1e…`,1280 → 1617 字节,
 重建**一次**。
+
+---
+
+## M5-27:联网两条工具的参数一次选齐 —— 待验收
+
+`web_fetch(url, question=None)`、`web_search(query, *, limit=5, topic=None, time_range=None)`。
+**没有新工具、没有新端点、没有新的出站目的地**——仍然只有 `api.tavily.com` 那两条常量。
+选进来的每一个参数都是**缺省不发**:给了才进请求体,不给时那份报文和 M5-21/M5-22
+逐字节一样。
+
+### 一、"缺省行为逐字不变"是怎么证的
+
+三条独立的证据,**没有一条是"我看了一眼觉得没变"**:
+
+1. **断请求体的两条金样**(`test_the_default_search_body_is_exactly_what_it_always_was`、
+   `test_the_default_extract_body_is_exactly_what_it_always_was`)——用 `MockTransport`
+   拿到 `httpx.Request`,把发出去的 body **按整个 dict 相等**断言:
+
+   ```python
+   assert body == {"query": "上海天气", "max_results": 3, "search_depth": "basic"}
+   ```
+
+   **整份相等,不是"某个键不在里面"**:后者挡不住"多塞了别的键"。这一条同时否掉了
+   一种很自然的写法——`body["topic"] = topic` 不加判断,于是缺省时报文里多一个
+   `"topic": null`。服务商那边 null 和缺席未必同义,**而这种差别只有真机才看得见**,
+   本地一条测试都不会红。变异验过:把守卫改成 `if True` → 这条立刻红。
+
+2. **端到端跑一遍,和 HEAD 逐字节比。** 把 HEAD 的 `tools.py` / `websearch.py` 取出来
+   放进一份平行的 src,两边各跑一次「缺省 `web_search` 的返回 + 缺省 `web_fetch` 的返回
+   + 两次发出去的请求体」,整段取 sha256:
+
+   ```
+   HEAD  586b30357e6ff766d781b9c3304d59c2116673253b0dae233d0a9d5048929931
+   本次  586b30357e6ff766d781b9c3304d59c2116673253b0dae233d0a9d5048929931
+   ```
+
+   两边唯一的 diff 落在**工具 schema 那一段**(签名 + docstring),那正是这次要改的东西。
+
+3. **M5-21/M5-22 那两批测试的断言一个字没改,全绿。**(改了两个假货的签名,见下。)
+
+### 二、**必须说的一处偏离:两个测试文件里的四个假货改了签名**
+
+任务书说"老测试一个字都不该改;要是必须改,先停下说清楚"。**这里必须改**,理由和
+改法都在这:
+
+`SearchPort.search` / `FetchPort.fetch` 是**我们自己的抽象**,这次给它们各加了带缺省值的
+keyword-only 参数。Python 里没有"只在非 None 时才传这个 kwarg"的写法(除了在调用点
+分叉,或者 `**dict` 展开——前者让端口有两种调用形状,后者正是 F2 禁的那种不可追踪
+传参)。所以 `tools.py` 一律传,四个假货的签名就得跟上:
+
+```python
+def search(self, query, *, limit, topic=None, time_range=None):   # +2
+def fetch(self, url, *, deep, question=None):                     # +1
+```
+
+**改的只有签名,加的只有一行记录,断言一条没动。** 新参数记在**另一个列表**里
+(`options` / `questions`),不往 `calls` 那些元组里塞——`fake.calls == [("x", 5)]`、
+`fake.calls == [(PAGE_URL, False)]` 是 M5-21/22 的金样,元组加一位就得把它们全改一遍,
+那才是任务书警告的那件事。四处:`tests/steward/test_tools.py` 的 `FakeSearch` /
+`FakeFetch`,`tests/steward/test_loop.py` 的同名两个(那两个只加签名,不记)。
+
+判据交给验收方:**这算"更新一个替身去配它替的契约",还是算"改测试迁就代码"?**
+我按前者做了,但它确实动了 M5-21/22 的文件,所以摆在这里而不是埋在 diff 里。
+
+### 三、`topic` / `time_range` 的合法取值,我从哪儿核的
+
+**Tavily 官方 API 文档,2026-09-09 当天拉的**(`/documentation/api-reference/endpoint/search`
+和 `.../extract`),不是照任务书抄的:
+
+| 参数 | 端点 | 官方取值 | 我们放行的 |
+|---|---|---|---|
+| `topic` | `/search` | `general` / `news` / **`finance`** | `general` / `news` |
+| `time_range` | `/search` | `day` `week` `month` `year` + 简写 `d` `w` `m` `y` | 全部 8 个 |
+| `chunks_per_source` | `/extract` | 1–5,缺省 3 | 固定发 5 |
+| `chunks_per_source` | `/search` | **1–3**,缺省 3 | 不发(这次没动搜索的取内容方式) |
+
+三处和任务书不一样,都在这:
+
+1. **`topic` 官方有第三档 `finance`,任务书只写了 general/news。** 我按任务书办,
+   **没有**放开 finance:M5-27 那一条的实测只覆盖「资讯」这一类,而多给模型一个没验过
+   的档位它一定会拿去试。记在这里是因为这一条的名义就是"一次选齐,以后别再一个一个撞"
+   ——下一个人来翻的时候,得看见 finance 存在、且是被想过之后没选的。要加就先补实测。
+2. **`time_range` 的简写(`d`/`w`/`m`/`y`)服务商也认,所以我一并放行。**
+   这张表挡的是**服务商不认识的值**,不是把它认识的值再窄一遍——把 `d` 判成非法只会让
+   模型再试一遍,白烧一轮。docstring 里只教四个长写法。
+3. **`chunks_per_source` 两个端点不是一个数**(`/extract` 是 1–5,`/search` 是 1–3),
+   别互相抄。`/extract` 取满 5:上限 2500 字,是 `MAX_FETCH_CHARS` 那 4000 的六成,
+   **够不着截断线**——不会出现"好不容易挑出来的片段又被我们自己截掉一半"。
+   任务书那次实测回来 1,992 字也只有 5 段装得下(3 段的上限是 1500)。
+
+**取值表放在 `websearch.py`(D2 的适配盒),不在 `tools.py`。** 它是服务商的词汇表,
+不是我们的概念;工具那边只负责"对表 → 不在表里就回一句人话",不需要知道表里有什么。
+
+### 四、挡下来的那一句,以及它为什么必须由工具自己说
+
+```python
+topic = _picked(topic)                       # 折行 + 去空白 + 小写;空 = 没给
+if topic is not None and topic not in SEARCH_TOPICS:
+    return _rejected("topic", topic, SEARCH_TOPICS, "不填就是普通搜索;查当下的事才填 news")
+```
+
+发出去等服务商报错的话,对面回 4xx,我们会把它翻成「搜索服务回了 422,这次查不了,
+**等一下再试**」——于是"你给的词不对"变成了"搜索服务出错了",而模型按后者会去等,
+等多久都不会好。顺带省一次白花的往返(免费档按次数算)。
+
+两个附带的口径,各有一条测试:
+
+- **回显要中和**:那串字是模型可控文本(可能是从上一页网页上抄来的),而这句话整个在
+  围栏外——不中和就能凭一个 `>>>` 伪造框定语(P1-4,和 `web_fetch` 回显 url 同一条)。
+- **挡下来时不许拉高不可信闩**:一个字都没进上下文,拉高是误伤(位置和 M5-21/22 同一条)。
+- 形状上的毛病(` News `、空串、纯空白)**收拾一下就放行**,不判非法:模型把"不填"
+  写成空串是日常,为这个烧掉一轮不值。
+
+### 五、`[...]` 那个坑
+
+`chunks_per_source` 挑出来的是**不连续片段**,服务商用 `[...]` 接起来。渲染要折行
+(`_one_line`),折完片段之间的换行就没了;标记要是也被顺手美化掉,模型会把两段不相干
+的话读成一句,然后转述出一件原文没说过的事。
+
+**现在是安全的,但那是"碰巧"**:`neutralize_fence` 只换 `<<<` / `>>>`,`_one_line` 只
+折空白,`_MD_IMAGE_RE` 要求 `!` 开头——三样都不碰 `[...]`。碰巧的东西要钉住,
+所以加了 `test_the_gap_between_two_chunks_stays_visible`。变异验过:在 `_render_web` 里
+加一句 `.replace("[...]", " ")` → 立刻红。
+
+docstring 里也写了这是**检索不是总结**(挑出来的字与原文逐字相同,只是 markdown 的
+`**` 被去掉),连同一句留给下一个人的话:哪天它变成生成,要动的不是这个参数,
+是渲染里「来源:」那一行——那一行现在是真的,值钱就值钱在这。
+
+### 六、真机冒烟(**由验收方打,我一个真包都没发**)
+
+理由同 M5-21/22:真包测试会因为对面抖动变红,而那种红说明不了任何事。下面四条,
+每条都写了「看什么算过」:
+
+1. **`topic` 的全部理由就是这个对比**(任务书点名要记进 REVIEW):
+   同一个查询各打一次,把**域名列表**抄回来 ——
+   `web_search("上海这周末天气")` vs `web_search("上海这周末天气", topic="news", time_range="week")`。
+   **算过**:第二次的域名里出现资讯站、且内容是"这个周末"而不是常年天气页。
+   **算不过**:两次域名列表一样(那说明参数根本没进请求体)。
+2. **`question` 的上下文对比**:`web_fetch("https://www.ruanyifeng.com/blog/…")`
+   不带 / 带 `question="他怎么评价 XXX"` 各一次,记两次返回的字数。
+   **算过**:带 `question` 那次明显更短(任务书实测 25,354 → 1,992),且开头是答案不是
+   导航栏,也不再出现「正文还有 N 字没取」。
+3. **`[...]` 真的会出现**:上面那次带 `question` 的返回里找 `[...]`。找到 → 说明真机上
+   确实是不连续片段,那条测试钉的是真事;**一次都没出现也记下来**(可能是单段命中),
+   不用改代码。
+4. **★ 不可信闩仍然在**:同一轮里 `web_fetch(url, question=…)` 之后
+   `propose(user_stated)` → **必须落 pending**。加参数不该动这条,但它是每加一个来源
+   /每改一次这条路径都要复验的那一条(M5-18)。
+
+另外**顺手核一件事**:`topic="finance"` 我们现在会挡回去。如果验收方觉得该放开,
+那是补一次实测的事,不是改一行常量的事(见第三节)。
+
+### 七、门禁
+
+```
+ruff check       All checks passed!
+ruff format      84 files already formatted
+mypy             Success: no issues found in 36 source files   (两个文件都在严格档)
+lint-imports     Contracts: 4 kept, 0 broken
+pytest           683 passed, 15 skipped   (+21 条)
+```
+
+前缀指纹 `03cdce1e…`(1617 字符,和 M5-22 验收记录里那个数对上)→ `9d3a8efc…`
+(2299 字符),重建**一次**。**这次没加工具,但加了参数——schema 照样变**,
+代价和加一个工具一样,认它;不能干的还是插队(那是每轮毁一次)。
+
+**变异检查五条,全部判红(看的是 returncode)**:缺省报文里塞 `topic=None`、
+升 advanced 时丢 `question`、渲染时把 `[...]` 美化掉、不挡非法 `topic` 直接发出去、
+`chunks_per_source` 不跟着 `query` 走。每条都先断言锚点唯一(变异真的落地了)、
+跑完再断言文件还原干净。

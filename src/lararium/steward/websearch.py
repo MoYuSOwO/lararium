@@ -24,6 +24,13 @@ access log 原样留下,而那是用户自己掏钱的凭证;失败消息里也�
 `getpeername` 复查这些东西一个都不需要,写了反而会让下一个人以为这里有出站。
 (推翻"自己抓"的那次实测记在 PLAN M5-22:挡我们的是反爬、登录墙、JS 渲染,
 不是地理位置;能抓的 `/extract` 一样能抓,抓不到的自己抓也照样抓不到。)
+
+**M5-27:两个端点各多几个可选参数,一次选齐。** 不新增端点、不新增出站目的地——
+仍然是 `api.tavily.com` 那两条常量。选进来的每一个都**缺省不发**:给了才进请求体,
+不给时那份报文和 M5-21/M5-22 逐字节一样(两条金样测试钉着)。没选的那些
+(`/research`、`include_answer`、`include_raw_content`、`/crawl`、`/map`、`/usage`、
+以及 `country`)连同各自被否的理由都在 PLAN M5-27——**想加之前先去那儿翻,
+别再一个一个撞**。
 """
 
 from dataclasses import dataclass
@@ -48,6 +55,29 @@ TIMEOUT_SECONDS = 10.0
 # 自动升一次 advanced(只升一次),那一轮最多占住线程 40 秒——这是"自动升一次"
 # 换来的代价,认它;真要嫌久,该调的是这个数,不是把升级做成循环。
 EXTRACT_TIMEOUT_SECONDS = 20.0
+
+# ── M5-27 选进来的那几个可选参数,以及它们的取值表 ─────────────────────────
+#
+# **取值表住在这个适配盒里(D2)**:它是服务商的词汇表,不是我们的概念。上面那层
+# 只做一件事——把表里没有的值挡下来回一句人话;它不需要知道表里有什么,只需要
+# 知道去哪儿对。哪天服务商加一档,改的是这两行,工具那边一个字不动。
+
+# `/search` 的 `topic`。官方还有第三档 `finance`,**PLAN M5-27 选的是这两个**:
+# 那一条的实测只覆盖「资讯」这一类,而多给模型一个没验过的档位,它一定会拿去试。
+# 要加就先补实测,别在这里顺手放开。
+SEARCH_TOPICS = ("general", "news")
+
+# `/search` 的 `time_range`(2026-09-09 核的官方文档)。长短两套写法服务商都认,
+# **两套都放行**:这张表挡的是它不认识的值(那种发出去会变成一句「搜索服务出错了」,
+# 而用户按这句会去等一会儿再试,等多久都不会好),不是把它认识的值再窄一遍。
+SEARCH_TIME_RANGES = ("day", "week", "month", "year", "d", "w", "m", "y")
+
+# 带 `question` 时向 `/extract` 要几段(官方范围 1 到 5、缺省 3,每段最多 500 字;
+# 注意 `/search` 那边同名参数的上限是 3,两个端点不是一个数,别互相抄)。
+# **取满 5**:上限也就 2500 字,是 `MAX_FETCH_CHARS` 那 4000 字的六成——够不着截断线,
+# 于是"好不容易挑出来的片段又被我们自己截掉一半"不会发生;而少要几段省不下什么,
+# 丢掉的却可能正是答案那一段。
+EXTRACT_CHUNKS_PER_SOURCE = 5
 
 
 @dataclass(frozen=True)
@@ -96,9 +126,19 @@ class SearchPort(Protocol):
 
     别把它当成插件体系的开端——没有注册表、没有配置项、没有按名字查找的地方。
     生产里的实现只有 `TavilySearch` 一个,测试里塞一个返回固定结果的假货,完。
+
+    M5-27 的两个筛子**缺省是 None,而 None 的意思是"这个键根本不进请求体"**,
+    不是"传个 null 过去"。签名上给了缺省值,所以老调用点一个字都不用改。
     """
 
-    def search(self, query: str, *, limit: int) -> list[WebResult]: ...
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        topic: str | None = None,
+        time_range: str | None = None,
+    ) -> list[WebResult]: ...
 
 
 class FetchPort(Protocol):
@@ -107,9 +147,13 @@ class FetchPort(Protocol):
 
     `deep` 是**兜底那一层的开关**,不是 Tavily 的词:`extract_depth` 这类服务商词汇
     只许出现在本文件里(D2)。上面那层只知道"再深一点试一次"。
+
+    M5-27 的 `question` 是**"这次想从这页里知道什么"**,同样缺省 None = 这个键不进
+    请求体。它和 `deep` 正交:升级那一次也要把它带上,不然多花一倍 credit 换回来的
+    是一份盲取的整页。
     """
 
-    def fetch(self, url: str, *, deep: bool) -> WebResult: ...
+    def fetch(self, url: str, *, deep: bool, question: str | None = None) -> WebResult: ...
 
 
 def parse_results(payload: Any) -> list[WebResult]:
@@ -187,12 +231,29 @@ class TavilySearch:
         self._timeout = timeout
         self._transport = transport
 
-    def search(self, query: str, *, limit: int) -> list[WebResult]:
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int,
+        topic: str | None = None,
+        time_range: str | None = None,
+    ) -> list[WebResult]:
         """同步发一次请求。**同步是对的**:工具函数本来就跑在框架给的线程池里,
-        在这里开一个事件循环反而是给调度添一层。"""
+        在这里开一个事件循环反而是给调度添一层。
+
+        M5-27:两个筛子**给了才进请求体**。塞一个 `"topic": None` 进去不算"缺省行为
+        不变"——服务商那边 null 和缺席未必同义,而这种差别只有真机才看得见,本地
+        一条测试都不会红。金样钉在 `test_the_default_search_body_is_exactly_what_it_always_was`。
+        """
+        body: dict[str, Any] = {"query": query, "max_results": limit, "search_depth": "basic"}
+        if topic is not None:
+            body["topic"] = topic
+        if time_range is not None:
+            body["time_range"] = time_range
         payload = _post_json(
             self._endpoint,
-            {"query": query, "max_results": limit, "search_depth": "basic"},
+            body,
             api_key=self._api_key,
             timeout=self._timeout,
             transport=self._transport,
@@ -226,16 +287,30 @@ class TavilyExtract:
         self._timeout = timeout
         self._transport = transport
 
-    def fetch(self, url: str, *, deep: bool) -> WebResult:
+    def fetch(self, url: str, *, deep: bool, question: str | None = None) -> WebResult:
         """读一页。**`url` 进的是 JSON body,永远不是请求地址**——出站目的地是
-        `self._endpoint`,构造缺省写死。这就是"SSRF 面根本没有"的那一行代码。"""
+        `self._endpoint`,构造缺省写死。这就是"SSRF 面根本没有"的那一行代码。
+
+        M5-27:给了 `question` 才多两个键,**而且这两个键同进同出**——
+        `chunks_per_source` 只在有 `query` 时才起作用(官方文档),单发一个 `query`
+        等于用了服务商的缺省段数,那不是我们挑的数。不给时报文逐字节还是 M5-22 那份。
+
+        **这是检索,不是总结**:回来的是页面里原样的几段,不是服务商的模型改写的。
+        实测挑出来的字与原文逐字相同(只是 markdown 的 `**` 被去掉了),片段之间用
+        `[...]` 接。哪天它变成生成,渲染里「来源:」那一行就成了假的——那时候要动的
+        不是这个参数,是那一行。
+        """
+        body: dict[str, Any] = {
+            "urls": [url],
+            "extract_depth": "advanced" if deep else "basic",
+            "format": "markdown",
+        }
+        if question is not None:
+            body["query"] = question
+            body["chunks_per_source"] = EXTRACT_CHUNKS_PER_SOURCE
         payload = _post_json(
             self._endpoint,
-            {
-                "urls": [url],
-                "extract_depth": "advanced" if deep else "basic",
-                "format": "markdown",
-            },
+            body,
             api_key=self._api_key,
             timeout=self._timeout,
             transport=self._transport,
