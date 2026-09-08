@@ -48,6 +48,7 @@ class Settings:
     compact_index_days: int
     push_channel: str
     vision: bool
+    tavily_key: str
     bind_host: str
     bind_port: int
     control_tokens: dict[str, str]
@@ -87,6 +88,10 @@ class Settings:
             # 的注入面(围栏、折行、中和分隔符保护的全是文本),开它应该是一次明确的选择,
             # 不是装上就有。关着时图照样收、照样存,只是不进模型。
             vision=os.environ.get("LARARIUM_VISION", "off").strip().lower() == "on",
+            # M5-21 联网搜索(Tavily)。**空 = 不接**,不是"接了但会失败":没配 key
+            # 时 web_search 回一句「没接搜索」,而不是去打一个必然 401 的请求——后者
+            # 会让用户以为 key 配错了,真相是压根没配。空着不影响任何别的功能。
+            tavily_key=os.environ.get("LARARIUM_TAVILY_KEY", "").strip(),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
             # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。
