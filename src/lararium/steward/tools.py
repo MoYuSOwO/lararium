@@ -7,10 +7,15 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from lararium.envelope import media_type_of_suffix
-from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, neutralize_fence
+from lararium.steward.assembler import (
+    FENCE_CLOSE,
+    FENCE_OPEN,
+    neutralize_fence,
+    neutralize_model_text,
+)
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
-from lararium.steward.threads import Threads
+from lararium.steward.threads import ThreadInfo, Threads
 from lararium.steward.vision import ImagePart, ImageReturn, cannot_send, framing
 from lararium.steward.websearch import (
     SEARCH_TIME_RANGES,
@@ -27,6 +32,12 @@ from lararium.steward.websearch import (
 # 而压缩是全系统仅有的两个缓存重建点之一,不能让一次检索就触发。
 MAX_SEARCH_HITS = 20
 MAX_HIT_CHARS = 200
+
+# list_threads 单页条数上限,理由和上面那两个一模一样:不封顶,一次调用就能把整张
+# threads 表倒进 L0 并逼出一次压缩。一行最坏 24(topic)+ 80(note)+ 日期标注,
+# 20 行约 2500 字——和一次检索同量级,而它同样是模型可控的。
+# **这不是 MAX_OPEN**:那是"每轮信封里塞几条"的闸,这是"一次查询回几条"的闸。
+MAX_THREAD_ROWS = 20
 
 # 联网搜索的封顶,理由和上面那两个一模一样,只是数更小——网页摘要比起居注命中长得多。
 # **三样都要封,不然"封顶"是句空话**:最坏情况 5 条各 (120 + 500 + 200) 字,合计约 2000
@@ -334,6 +345,39 @@ class BuiltinTools:
             return f"话头已关闭:{topic}"
         return f"没有在开的「{topic}」话头"
 
+    def list_threads(self, page: int = 1, include_closed: bool = False) -> str:
+        """列出所有话头(还没聊完的事)。跟在消息后面的只有最近更新的几条,更早的沉在
+        下面看不见——要看全部、或者找一件很久没提起的事,就用这个。
+        返回「一共 N 条,第 X/Y 页」;翻页换 page(0/负数/超大都会钳到有效范围)。
+        总数是信号:三五条就是全部了,几十条说明有一批早该 close_thread。
+        默认只列开着的;include_closed=True 连关掉的一起列(标「已关」),
+        用来确认某件事是不是已经了结过。"""
+
+        def page_of(_query: str, limit: int, offset: int) -> tuple[int, list[ThreadInfo]]:
+            return self.threads.list_threads(
+                limit=limit, offset=offset, include_closed=include_closed
+            )
+
+        # 借 search_history 那套钳位(页码 → [1, 总页数]),别另写一份;话头没有查询词,
+        # 所以 query 位传空串——_paged_search 只是把它原样递给 page_of。
+        total, rows, cur_page, total_pages = _paged_search(page_of, "", MAX_THREAD_ROWS, page)
+        if total == 0:
+            # "开着的没有" ≠ "从来没有过":混成一句会让模型以为话头这东西是空的。
+            if include_closed:
+                return "一条话头都没有,开着的、关掉的都没有。"
+            return "现在没有开着的话头。关掉的不在这份名单里,include_closed=True 才列。"
+        scope = "(含已关)" if include_closed else "开着"
+        lines = [f"一共 {total} 条话头{scope},第 {cur_page}/{total_pages} 页:"]
+        for t in rows:
+            # topic/note 是**模型写的、会转述不可信来源**的文本(M3-3 那三条规矩),
+            # 重新喂给模型之前照样过折行 + 中和围栏这一刀。
+            topic = neutralize_model_text(t.topic)
+            note = neutralize_model_text(t.note)
+            body = f"{topic}({note})" if note else topic
+            mark = "" if t.state == "open" else " · 已关"
+            lines.append(f"- {body}{mark} · 更新于 {t.updated_at[:10]}")
+        return "\n".join(lines)
+
     def look_at_image(self, image_id: str) -> Any:
         """重新看一眼之前收到的某张图片。图片只在收到的那一轮直接进上下文,之后的历史里
         只留一行 `(图片 · media/xxxxxxxxxxxx…)` 引用;要再看就调这个,image_id 就是
@@ -538,6 +582,9 @@ class BuiltinTools:
         M5-27:**没有新工具,但两条老工具各多了几个可选参数——schema 照样变了**,
         所以前缀照样重建一次(prefix_log 会记)。加参数和加工具是同一个代价,认它;
         真正不能干的还是插队,那是**每轮**毁一次。
+        M5-33:list_threads 追加在 web_fetch 之后——它和 open/close_thread 是一家,
+        但**位置按加入时间排,不按亲缘关系**:挪到 close_thread 旁边好看,代价是
+        后面所有工具的 schema 全平移一格,那是每轮毁一次缓存。
         open_threads() 不在这(是代码路径,组装器调)。
         """
         return [
@@ -550,4 +597,5 @@ class BuiltinTools:
             self.look_at_image,
             self.web_search,
             self.web_fetch,
+            self.list_threads,
         ]

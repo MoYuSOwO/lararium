@@ -86,3 +86,51 @@ def test_empty_topic_is_rejected(threads):
     else:
         raise AssertionError("空 topic 应被拒绝")
     assert threads.open_threads() == []
+
+
+def test_list_threads_is_not_capped_by_max_open(threads):
+    """MAX_OPEN 管的是「每轮信封里塞几条」,和「我要查一下」是两件事(M5-33)。
+
+    这是那个闭环的根:信封只露 5 条 → 第 6 条碰不到 → updated_at 不动 → 永远第 6。
+    """
+    for i in range(8):
+        threads.open_thread(f"事{i}", "在办")
+    assert len(threads.open_threads()) == Threads.MAX_OPEN, "信封那条路仍然只给 5 条"
+    total, rows = threads.list_threads(limit=20, offset=0)
+    assert total == 8
+    assert len(rows) == 8, "查询这条路不受 MAX_OPEN 限制"
+
+
+def test_list_threads_pages_without_overlap(threads):
+    for i in range(8):
+        threads.open_thread(f"事{i}", "在办")
+    total, first = threads.list_threads(limit=3, offset=0)
+    _, second = threads.list_threads(limit=3, offset=3)
+    assert total == 8, "总数是全部,不是这一页"
+    assert len(first) == len(second) == 3
+    assert not ({t.topic for t in first} & {t.topic for t in second}), "翻页不该重复喂"
+
+
+def test_list_threads_does_not_truncate_the_note_a_second_time(threads):
+    """MAX_NOTE_LEN 是**入库时**就截的(open_thread 是唯一写入口,夜间归拢也走它),
+    库里本来就不会更长。在这里再截一遍看着无害,但两处截断迟早漂成两个数
+    ——M4-4 的两套渲染器就是这么来的。
+    """
+    note = "字" * Threads.MAX_NOTE_LEN
+    stored = threads.open_thread("长备注", note)
+    assert len(stored.note) == Threads.MAX_NOTE_LEN, "入库时就该正好这么长"
+    _, rows = threads.list_threads(limit=20, offset=0)
+    assert rows[0].note == stored.note
+    assert len(rows[0].note) == Threads.MAX_NOTE_LEN, "列出来和入库一样长,没有第二刀"
+
+
+def test_list_threads_hides_closed_unless_asked(threads):
+    threads.open_thread("开着的", "在办")
+    threads.open_thread("关掉的", "办完了")
+    assert threads.close_thread("关掉的") is True
+    total, rows = threads.list_threads(limit=20, offset=0)
+    assert total == 1, "默认只数开着的"
+    assert [t.topic for t in rows] == ["开着的"]
+    total, rows = threads.list_threads(limit=20, offset=0, include_closed=True)
+    assert total == 2
+    assert {t.topic: t.state for t in rows} == {"开着的": "open", "关掉的": "closed"}
