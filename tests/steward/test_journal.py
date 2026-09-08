@@ -371,7 +371,79 @@ def test_a_non_text_tool_result_is_not_queued_for_replay(journal):
     )
     journal.append("env-1", "tool_executed", {"tool": "current_time", "result": "老记录没这个字段"})
 
-    assert journal.last_attempt_tool_results("env-1") == [
+    assert journal.established_tool_results("env-1") == [
         ("search_history", "找到 2 条"),
         ("current_time", "老记录没这个字段"),
+    ]
+
+
+def test_an_execution_survives_an_attempt_that_never_reached_a_tool(journal):
+    """★ M5-29:第 2 次尝试一个工具都没调到,不许把第 1 次真跑掉的那次**遮住**。
+
+    口径原来是「最后一个 envelope 事件之后」,而 envelope 是尝试之间的分界线。于是:
+
+    ```
+    第 1 次  envelope → record_expense 真跑了 → 模型调用失败
+    第 2 次  envelope → 还没调到工具就失败(这一段一条 tool_executed 都没有)
+    第 3 次  只看第 2 次那一段 → 空 → 模型重新记一遍账
+    ```
+
+    M5-13 证过这个服务商真的会失败,一次连不上就造得出「第 2 次没调到工具」。
+    **账上凭空多一笔,而且没人会发现。**
+    """
+    journal.append("env-1", "envelope", {"content": "午饭 45"})
+    journal.append(
+        "env-1", "tool_executed", {"tool": "record_expense", "result": "记好了", "replayed": False}
+    )
+    journal.append("env-1", "error", {"content": "503 限流"})
+    journal.append("env-1", "envelope", {"content": "午饭 45"})  # 第 2 次尝试
+    journal.append("env-1", "error", {"content": "503 限流"})  # 一条 tool_executed 都没有
+
+    # 第 3 次尝试认领后、记本次 envelope 之前的那一刻。
+    assert journal.established_tool_results("env-1") == [("record_expense", "记好了")]
+
+
+def test_results_accumulate_across_attempts_in_call_order(journal):
+    """跨尝试**累计**已确立的执行结果,按发生顺序;回放过的那些不许再算一遍。
+
+    第 2 次把 A、B 回放掉又真跑了 C,那么第 3 次要看到的是 A、B、C 三条
+    ——不是「第 2 次那一段」的 A、B、C 里混着重复,也不是只剩 C。
+    """
+    journal.append("env-1", "envelope", {"content": "午饭 45,顺便看下时间"})
+    for tool, result in (("current_time", "12:00"), ("record_expense", "记好了")):
+        journal.append(
+            "env-1", "tool_executed", {"tool": tool, "result": result, "replayed": False}
+        )
+    journal.append("env-1", "envelope", {"content": "午饭 45,顺便看下时间"})  # 第 2 次尝试
+    for tool, result in (("current_time", "12:00"), ("record_expense", "记好了")):
+        journal.append("env-1", "tool_executed", {"tool": tool, "result": result, "replayed": True})
+    journal.append(
+        "env-1", "tool_executed", {"tool": "list_recent", "result": "3 笔", "replayed": False}
+    )
+
+    assert journal.established_tool_results("env-1") == [
+        ("current_time", "12:00"),
+        ("record_expense", "记好了"),
+        ("list_recent", "3 笔"),
+    ]
+
+
+def test_the_same_tool_executed_twice_keeps_both_results(journal):
+    """坑 1 的阳性对照:一轮里合法地记两笔,**不许按工具名去重**。
+
+    「麦当劳 45.5,烧烤 115.77」是常事;去重会把第二笔吃掉——那是把"多记一笔"
+    换成"少记一笔",一样是钱。顺序累计,不去重。
+    """
+    journal.append("env-1", "envelope", {"content": "麦当劳 45.5,烧烤 115.77"})
+    for result in ("记好了:45.5", "记好了:115.77"):
+        journal.append(
+            "env-1",
+            "tool_executed",
+            {"tool": "record_expense", "result": result, "replayed": False},
+        )
+    journal.append("env-1", "envelope", {"content": "麦当劳 45.5,烧烤 115.77"})  # 第 2 次尝试
+
+    assert journal.established_tool_results("env-1") == [
+        ("record_expense", "记好了:45.5"),
+        ("record_expense", "记好了:115.77"),
     ]

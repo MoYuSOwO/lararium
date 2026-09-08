@@ -72,7 +72,7 @@ def system(tmp_path, monkeypatch):
     conn = connect(tmp_path / "steward.sqlite")
     ledger, gate = build_memory_components(tmp_path)
 
-    def make(script, fail_on):
+    def make(script, fail_on, extra_tools=()):
         model = ToolCallingModel(script, fail_on)
         steward = Steward(
             settings=settings,
@@ -88,6 +88,7 @@ def system(tmp_path, monkeypatch):
             bundle_tools=[
                 *memory_tool_functions(gate),
                 *build_finance(tmp_path, timezone="Asia/Shanghai").tools,
+                *extra_tools,
             ],
         )
         return steward, model, gate, ledger
@@ -103,11 +104,28 @@ def rows(tmp_path):
         conn.close()
 
 
+def counting_tool():
+    """一个会**数**的假工具:副作用的最小可见形态,连着调两次就藏不住。
+
+    队列内容对了而副作用跑了两次,照样是错的——只有一个真的在数的东西钉得死这件事。
+    它和 `record_expense`(数库里的行)是两个互相独立的口径:两个数对不上,
+    先查测量本身(T6 第 4 条),别急着信其中一个。
+    """
+    charges: list[str] = []
+
+    def charge_the_card(what: str) -> str:
+        charges.append(what)
+        return f"已扣款:{what}"
+
+    return charge_the_card, charges
+
+
 LUNCH = (
     "record_expense",
     (),
     {"amount": 45, "category": "餐饮", "occurred_at": "2026-08-23T12:00"},
 )
+CHARGE = ("charge_the_card", (), {"what": "房租"})
 ALLERGY = (
     "propose_fact",
     (),
@@ -138,6 +156,64 @@ async def test_a_retried_turn_does_not_double_the_ledger(system, tmp_path):
     gate.settle()
 
     assert ledger.read().count("对花生过敏") == 1, ledger.read()
+
+
+async def test_an_attempt_that_reached_no_tool_does_not_uncover_an_earlier_execution(
+    system, tmp_path
+):
+    """★ M5-29 复现探针:中间那次尝试**一个工具都没调到**,第 1 次那笔不许被它遮住。
+
+    ```
+    第 1 次  真跑了工具 → 模型调用失败
+    第 2 次  还没调到工具就失败(这一段一条 tool_executed 都没有)
+    第 3 次  回放队列若只看第 2 次那一段 → 空 → 重新记一遍账
+    ```
+
+    M5-13 证过这个服务商真的会失败,一次连不上就造得出第 2 次那个空段。
+    **只断队列内容不够**:队列对了而副作用跑了两次,照样是账上多一笔。
+    所以这里钉的是一个会计数的假工具,外加库里的行数当第二个口径。
+    """
+    charge, charges = counting_tool()
+    steward, model, _gate, _ledger = system(
+        [[LUNCH, CHARGE], [], [LUNCH, CHARGE]], fail_on={1, 2}, extra_tools=[charge]
+    )
+    env = Envelope.new(source="user", channel="cli", content="午饭 45,房租也扣了")
+    steward.submit(env)
+
+    outcomes = [(await steward.process_next()).kind for _ in range(3)]
+
+    assert outcomes == ["retry_later", "retry_later", "replied"]
+    assert model.attempts == 3, "三次尝试都真的跑到了模型(不是中途就没跑)"
+    assert charges == ["房租"], f"副作用跑了 {len(charges)} 次,只该跑一次"
+    assert len(rows(tmp_path)) == 1, f"第二个口径:库里有 {len(rows(tmp_path))} 条,只该有一条"
+    executed = [
+        (e["payload"]["tool"], e["payload"]["replayed"])
+        for e in steward.journal.replay(env.id)
+        if e["kind"] == "tool_executed"
+    ]
+    assert executed == [
+        ("record_expense", False),
+        ("charge_the_card", False),
+        # 第 2 次尝试:一条都没有。
+        ("record_expense", True),
+        ("charge_the_card", True),
+    ], "第 3 次必须是**回放**上一次确立的结果,而不是碰巧没调"
+
+
+async def test_two_identical_expenses_survive_a_toolless_attempt(system, tmp_path):
+    """坑 1 的阳性对照,叠在 M5-29 的场景上:两笔一样的午饭,跨空尝试后仍是两笔。
+
+    按工具名去重会在这里塌成 1 条(**少记一笔**),不累计会涨成 4 条(**多记两笔**)。
+    两个方向都是钱,所以这条要断的是精确的 2。
+    """
+    steward, model, _gate, _ledger = system([[LUNCH, LUNCH], [], [LUNCH, LUNCH]], fail_on={1, 2})
+    steward.submit(Envelope.new(source="user", channel="cli", content="今天吃了两顿,各 45"))
+
+    for _ in range(3):
+        await steward.process_next()
+
+    assert model.attempts == 3
+    assert len(rows(tmp_path)) == 2, f"库里 {len(rows(tmp_path))} 条,用户报了两笔"
 
 
 async def test_two_identical_expenses_in_one_turn_are_both_kept(system, tmp_path):

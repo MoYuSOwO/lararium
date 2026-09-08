@@ -279,8 +279,10 @@ class Steward:
         # 渲染没被走到才出的安全洞)。
         self._active_untrusted = bool(env.meta.get("untrusted", False))
 
-        # M4-5d:**必须赶在记本次 envelope 事件之前**取——那个事件是尝试之间的分界线。
-        self._resume_queue = self.journal.last_attempt_tool_results(env.id)
+        # M4-5d 建、M5-29 改口径:取的是这封信下**真跑过**的全部工具结果(累计),
+        # 不是"上一次尝试那一段"——中间有一次还没调到工具就失败,那一段是空的,
+        # 而空段会把更早那次真执行遮住,于是这一次把同一笔账再记一遍。
+        self._resume_queue = self.journal.established_tool_results(env.id)
         self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
