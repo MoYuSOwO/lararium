@@ -11368,3 +11368,84 @@ ruff check ✓  ruff format ✓  mypy 35 files ✓  import-linter 4 kept / 0 bro
 对账(M5-23 记的是 569 passed + 10 skipped,中间只有纯文档提交):
 **569 + 4(新增,全在 `tests/steward/test_sweep.py`)- 5(这个 worktree 没跑过
 `build_embedding_weights.py`,embedding 那 5 条自动跳过)= 568**,收支平衡,没有谁悄悄消失。
+## M5-26:amend 改成就地编辑,拆掉整套作废行 —— 待验收
+
+### 1. `amend_expense` 现在是一条 `UPDATE`
+
+不插新行、不标作废,`id` / `created_at` 不在 SET 里(一个字节不动)。回话从
+「改了 #1 → #2……旧的那条留着,标了作废」改成「改了 #1:餐饮 49.00 元 → 餐饮 22.00 元
+(…)。还是 #1,号没变。」——**箭头指向新号这件事本身就在教模型换号记**,而用户手里
+只有那一个号。
+
+`voided_by` 整列拿掉了:两条聚合 SQL、`_RECENT_WHERE`、`_RECENT_COLUMNS`、
+`list_recent` 的「已作废(见 #N)」分支、`amend` 的「已经改过了」分支、`delete` 的
+「已经被 #N 替代了」分支,一处不留。`include_voided` 改名 `include_deleted`。
+
+**已删的行仍然拒绝 amend**(原 M5-20 補),理由换了:不再是"会复活"(就地改复活不了),
+而是"改了你也看不见"。回话**指向 `record_expense`,一个 `undo` 字样都不出现**
+——「删了的账要改成别的数」不是撤销,是记一笔新的。
+
+### 2. 迁移:补列机制后面加一步 `_retire_the_voided_column`
+
+顺序是死的:**先把 `voided_by IS NOT NULL AND deleted_at IS NULL` 的行标成已删
+(理由写明是这次迁移标的),再 `ALTER TABLE … DROP COLUMN`**,两条包在一个事务里。
+反过来或者只删不标,真机那 3 行就会重新冒到账上——账上凭空多三笔,用户不会知道为什么。
+列一没,下次开库探测不到,自然是空操作(幂等,单钉了一条测试)。
+
+### 3. 硬口径怎么验的:金样是**改动前的代码**跑出来的
+
+照真机造了一份带 `voided_by` 的老库(12 行:#1/#3 互指、#5 被 #6 顶掉,剩 9 行有效),
+**先用改动前的代码**在这份库上跑 `list_recent()` 与
+`query_spending(2026-09-01, 2026-09-30, category)`,把两份输出原样冻成
+`LEGACY_LIST` / `LEGACY_TOTAL`(9 笔、合计 1055.03 元,和真机当前值一致),
+迁移之后**全量相等**——不是断片段:多一行、少一行、顺序变了都红(T6 第五种)。
+
+### 4. M5-25 一起吃掉了
+
+`test_finance_amend.py` 整个重写,**一个裸数字断言都没有**:断 `"22.00 元"` 这样的
+渲染片段,或者直接断 `amount_cents`;顺手把 `test_finance_delete.py` 里三处 `"28"`
+也改成 `"28.00 元"`。文件里几处**故意**把 `occurred_at` 摆在 23:49 / 22:22,
+让这两个坑长住在测试里。
+
+把 finance 的墙上时钟钉死在两个时刻各跑一遍(pytest 插件,不改系统时钟):
+`test_finance_amend.py` + `test_finance_delete.py` **两次都 30 passed**。
+同一套装置下拿旧写法做了探针,两条都复现了:23:49 时 `assert "49" not in default`
+**红**(时间戳喂饱了它),22:22 时记 71 元、amend 一次不调,`assert "22" in default`
+**绿**。
+
+### 5. 变异 7 条,7 条被咬住
+
+插新行而不是 UPDATE(= 直接拿改动前的实现跑新测试,9 red)/ amend 不写金额 /
+迁移只删列不标已删 / 迁移整个不跑 / amend 不看 `deleted_at` / `list_recent` 忽略
+`include_deleted` / 按天那条聚合漏掉 `deleted_at`。
+
+第 5 条**第一版是存活的,而那是变异没落地**(T6 第二种):锚点
+`if row["deleted_at"] is not None:` 在 amend 和 delete 里各有一处,替换命中 2 次
+被脚本自己挡下,换长锚点重跑才咬住。脚本自带两条自检:变异落地了吗、判红看的是
+returncode 吗;跑完比对 sha256 确认还原干净。
+
+### 6. 两处和任务书对不上,都在这儿说明
+
+- **`grep -rn "voided_by\|include_voided" src bundles tests` 做不到零命中**:迁移代码
+  必须写出这个列名(探测 / UPDATE 的 WHERE / DROP COLUMN),迁移测试必须造得出那份老库。
+  实到 **9 处(行数),全部在迁移路径上**:`bundles/finance/server.py` 5 行(退休函数
+  的探测 / UPDATE / DROP,以及它的 docstring)、`tests/bundles/test_finance_amend.py`
+  4 行(列名常量、老库 DDL、INSERT、那条测试的 docstring)。
+  **任何一条查询、任何一个分支里都没有。**真机的库跑过一次迁移之后,
+  这个函数和那条测试可以一起删,那时才真是零。
+- **`ALTER TABLE … DROP COLUMN` 要 SQLite ≥ 3.35**,而全局约束写的是 ≥ 3.34
+  (FTS5 trigram 的门槛)。本机 3.53.1,真机同一个 Python 发行版。要么认这个新下界、
+  要么迁移改成建新表搬数据(12 步,代码量差一个数量级)。我选了前者,**但这是改全局
+  约束,不该我改**——记在这儿由验收人裁决。
+
+### 7. 前缀影响(A1)
+
+`amend_expense` 与 `list_recent` 的 docstring 都改了,`list_recent` 的参数名也改了
+(`include_voided` → `include_deleted`)= **工具 schema 变了,前缀第 0 层重建一次**,
+`prefix_log` 会记。工具个数和顺序没动。
+
+**门禁**:569 passed + 15 skipped,ruff/format 全绿,mypy 35 files,contracts 4 kept / 0 broken。
+
+**要真机验的**:**别手改库**——把代码推上去、开一次库让迁移自己跑,然后核
+`list_recent` 与 `query_spending`(9 笔、1055.03 元,和迁移前一个字节不该差),
+再拿 `include_deleted=True` 看那 3 行是不是标着「已删除 · 原因「M5-26 迁移……」」。
