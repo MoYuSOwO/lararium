@@ -17,9 +17,15 @@ def journal(tmp_path):
     return Journal(connect(tmp_path / "steward.sqlite"))
 
 
-def test_sqlite_supports_trigram_tokenizer():
-    """中文检索的前提。SQLite < 3.34 会在这里失败。"""
-    assert sqlite3.sqlite_version_info >= (3, 34, 0), sqlite3.sqlite_version
+def test_sqlite_builtin_features_this_project_needs():
+    """两个前提,取高者:
+
+    - FTS5 `trigram` 分词器(中文检索)—— 3.34;
+    - `ALTER TABLE … DROP COLUMN`(M5-26 的退休迁移)—— **3.35**。
+
+    下界涨过一次就该写清楚是被谁顶上去的,否则下一个人只会看到一个没有来历的数字。
+    """
+    assert sqlite3.sqlite_version_info >= (3, 35, 0), sqlite3.sqlite_version
 
 
 def test_append_and_replay_preserves_order_and_content(journal):

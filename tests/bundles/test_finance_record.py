@@ -47,7 +47,9 @@ def test_records_the_expense_and_confirms_in_plain_words(record, tmp_path):
     assert len(got) == 1
     assert got[0]["category"] == "餐饮"
     assert got[0]["note"] == "公司楼下"
-    assert "45" in said and "餐饮" in said
+    # M5-25:别断裸数字。这条没传 occurred_at,回话渲染的是 `(%m-%d %H:%M)`
+    # ——分钟正好是 45 的那一分钟里,金额压根没写进去这条也绿。断渲染出来的金额片段。
+    assert "45.00 元" in said and "餐饮" in said
 
 
 def test_amount_is_stored_as_integer_cents_without_float_drift(record, tmp_path):
