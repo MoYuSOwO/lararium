@@ -114,6 +114,10 @@ module = [
     "lararium.steward.registry",
     "lararium.steward.assembler",
     "lararium.steward.tools",
+    # M5-21:交付方按「形状是第三方定的」判它进宽松档,判据没错——但 `WebResult`
+    # 和 `SearchPort` 是**我们自己的形状**,而且是严格档的 tools.py 依赖的那道缝;
+    # M5-22 的 web_fetch 还要再压一遍。它本来就全量标注了,进严格档零成本。
+    "lararium.steward.websearch",
     "lararium.steward.loop",
     "bundles.memory.ledger",
     "bundles.memory.gate",
