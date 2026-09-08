@@ -10,8 +10,13 @@
 
 **幂等(P1-1)**:按**内容**幂等,不是按时间区间字符串——唯一调用方 /sweep 每次传
 now-24h~now,区间永远不同,按区间字符串一秒三次 → 模型调三次 → 三条重复提案。
-光标(sweep_state.cursor_seq)记录本次覆盖到的最大 journal seq,下次**从那之后扫**,
+光标(sweep_state.cursor_seq)记录**实际喂给模型的最大 journal seq**,下次从那之后扫,
 光标之后没有新内容就是 no-op。
+
+**扫哪一段:下界是光标,不是 since(M5-24)**。原来两条边都由时间窗定,而光标推的是
+"窗口内最大 seq"——`光标 < seq < 窗口下界` 那一段谁都没扫过,推完还再也回不来
+(`_advance_cursor` 只增不减)。缺口攒下来要**分批**喂:一次全塞进去,字数上限会把最早的
+砍掉,那是换一种方式丢同样的东西。每批喂完推一次光标,**只推到这一批实际喂进去的那条**。
 
 **账本进 prompt(P1-2)**:喂模型的 prompt 带「已经记在账本里的(别重复提)」——不然模型会
 反复提已入档的事实,那些和重复提交的提案一起把 pending 堵死,压缩又被自己挡住(死循环)。
@@ -40,10 +45,21 @@ PUSH_TRIGGER = "(到点了,把攒下的事跟他说一声)"
 logger = logging.getLogger("lararium")
 
 # sweep.suggest 归进"长期偏好"节(模型推断的事实默认落这里),审批卡上能看到原文。
+# **写死的:归拢这条路上模型从没被问过小节**(对话那条路问了,见 memory 的 propose_fact)。
+# 后果只是账本里归错格——整份账本每轮都进前缀,没有任何代码按小节分支(M5-24 查证)。
 _SECTION = "长期偏好"
 
-# 归拢对话窗口的字数上限:保护廉价模型的窗口,极端涨潮时保留最近部分(见 _render_events)。
+# 一批对话的字数上限:保护廉价模型的窗口。**这是分批的刀口,不是截断的刀口**
+# ——装不下的留给下一批(见 _batches),不是丢掉。原来它是截断:超了就只保留最近部分,
+# 而光标照样推到最新那条,被砍掉的最早那几条**喂都没喂就永久跳过**(M5-24 的第二张脸)。
 _PROMPT_CONVO_MAX_CHARS = 20000
+
+# 一次 run 最多扫几批。缺口攒了两周就是几千条,一次全补完等于一晚上几十次模型调用;
+# 分次补:光标每批都推进,进度不会丢,摘要里会说还剩多少。
+_SWEEP_MAX_BATCHES = 6
+
+# 一次 run 最多从起居注取多少条待扫事件(够填满 _SWEEP_MAX_BATCHES 批,多取没用)。
+_SCAN_LIMIT = 2000
 
 
 @dataclass
@@ -117,7 +133,7 @@ class Sweeper:
             (max_seq, datetime.now(UTC).isoformat()),
         )
 
-    def _build_prompt(self, opens, events) -> str:
+    def _build_prompt(self, opens, events, batch_note: str = "") -> str:
         parts = [self._instructions, ""]
         # P1-2:账本先给模型(避免重复提已入档的事实——重复提案堵 pending,压缩又被自己挡)
         parts.append("## 已经记在账本里的(别重复提)")
@@ -129,80 +145,137 @@ class Sweeper:
         parts.append("\n".join(items) if items else "(无)")
         parts.append("")
         parts.append("## 这段对话(时间正序)")
+        if batch_note:
+            parts.append(batch_note)
         convo = self._render_events(events)
         parts.append(convo if convo else "(无)")
         return "\n".join(parts)
 
     @classmethod
     def _render_events(cls, events) -> str:
-        lines = [render_event_line(e) for e in events]
-        # 字数上限:保护廉价模型的窗口,极端涨潮时保留最近部分,别撑爆。
-        # 撑爆会走"归拢失败",不致命,但可避免就该避免。
+        """把这一批渲染成正文。**这里不再截断**——字数由 `_batches` 在分批时管住了,
+        截断和分批两套机制并存只会让"到底喂进去了哪些"再次说不清(M5-24)。"""
+        return "\n".join(render_event_line(e) for e in events)
+
+    @classmethod
+    def _batches(cls, events) -> list[list[Any]]:
+        """把待扫事件按渲染后的字数切成批,**从最早的那条开始装**,装不下的留给下一批。
+
+        方向是要害:原来的做法是"超了就只保留最近部分",而光标推到最新那条
+        ——最早那几条喂都没喂就被跳过,和 M5-24 的主 bug 是同一个形状。从早往晚装,
+        每批喂完把光标推到这一批的最后一条,下一批接着装,一条都不会被越过去。
+
+        单条就超上限的(理论上到不了:入站正文 16KB 封顶)也自成一批照喂——
+        撑爆走"归拢失败"可重试,悄悄丢掉不可重试。
+        """
+        batches: list[list[Any]] = []
+        current: list[Any] = []
         total = 0
-        kept: list[str] = []
-        for line in reversed(lines):
-            if total + len(line) > _PROMPT_CONVO_MAX_CHARS:
-                kept.insert(0, "…(对话过长,仅保留最近部分)")
-                break
-            kept.insert(0, line)
-            total += len(line)
-        return "\n".join(kept)
+        for event in events:
+            size = len(render_event_line(event)) + 1
+            if current and total + size > _PROMPT_CONVO_MAX_CHARS:
+                batches.append(current)
+                if len(batches) == _SWEEP_MAX_BATCHES:
+                    return batches
+                current, total = [], 0
+            current.append(event)
+            total += size
+        if current:
+            batches.append(current)
+        return batches
 
     async def run(self, since: str, until: str) -> SweepResult:
-        window_events = self._journal.events_in_range(since, until)
+        """扫「光标之后 ~ until」的全部对话,分批喂,每批喂完推一次光标。
+
+        **`since` 不再决定扫哪一段**(M5-24):它只是这次触发的名义窗口,留进起居注和
+        摘要里当由头。下界只能是光标——按时间取下界的那版会把 `光标 < seq < 窗口下界`
+        那一段整段跳过,而且光标只增不减,跳过去就再也回不来。
+        """
         cursor = self._cursor()
-        # P1-1 内容幂等:只归拢光标**之后**的新内容;窗口里没有新内容就是 no-op。
-        # 窗口整个为空(没对话)时照跑(空窗跑一次无害,且兼容手动测窗口)。
-        new_events = [e for e in window_events if e["seq"] > cursor]
-        if window_events and not new_events:
-            return SweepResult(
-                summary=f"区间 {since[:16]} ~ {until[:16]} 自上次归拢后没有新内容,跳过",
-                skipped=True,
-            )
-        events = new_events if new_events else window_events
-        window_max = max((e["seq"] for e in window_events), default=0)
+        pending = self._journal.events_after_seq(cursor, until, limit=_SCAN_LIMIT)
+        batches = self._batches(pending)
+        if not batches:
+            if cursor:
+                # P1-1 内容幂等:光标之后没有新内容就是 no-op(不调模型、不改任何东西)。
+                return SweepResult(
+                    summary=f"起居注 seq {cursor} 之后没有新内容(截至 {until[:16]}),跳过",
+                    skipped=True,
+                )
+            # 从没归拢过、起居注也没有对话:空跑一次无害(且兼容手动测窗口)。
+            batches = [[]]
+        maybe_more = len(pending) >= _SCAN_LIMIT  # 取满上限,后面可能还有
 
-        opens = self._threads.all_open_threads()
-        prompt = self._build_prompt(opens, events)
-        sweep_id = f"sweep-{uuid.uuid4().hex}"
-
-        # 可见即入账:输入先落,输出后落;模型实收的就是这份 prompt 原文
-        self._journal.append(
-            sweep_id,
-            "sweep",
-            {"since": since, "until": until, "phase": "input", "content": prompt},
-        )
-        try:
-            output = await self._run_model(prompt)
-        except Exception as exc:  # 模型调用失败:不影响主循环,可重试(不推进光标)
-            self._journal.append(
-                sweep_id,
-                "sweep",
-                {
-                    "since": since,
-                    "until": until,
-                    "phase": "output",
-                    "content": f"模型调用失败:{type(exc).__name__}: {exc}",
-                },
-            )
-            return SweepResult(summary=f"归拢失败(不影响对话):{type(exc).__name__}")
-        self._journal.append(
-            sweep_id,
-            "sweep",
-            {"since": since, "until": until, "phase": "output", "content": output},
-        )
-
-        try:
-            plan = json.loads(output)
-        except Exception:
-            return SweepResult(summary="归拢:模型输出不是 JSON,本次无动作(可重试)")
-        if not isinstance(plan, dict):
-            return SweepResult(summary="归拢:模型输出不是对象,本次无动作")
-
-        # 只写话头 + pending 提案,绝不动账本正文(Gate.settle 是唯一写路径)
         opened: list[str] = []
         closed: list[str] = []
         suggested = 0
+        stopped = ""
+        fed = 0
+        for index, batch in enumerate(batches, start=1):
+            # 话头每批重取:上一批开/关过的,这一批的模型要看到最新的那份。
+            opens = self._threads.all_open_threads()
+            note = _batch_note(index, len(batches)) if len(batches) > 1 else ""
+            prompt = self._build_prompt(opens, batch, note)
+            sweep_id = f"sweep-{uuid.uuid4().hex}"
+            # 起居注里记清楚**这一批实际喂了哪一段 seq**——原来只有 since/until,
+            # 于是"跳过了什么"在起居注里查不出来,而失效本来就是静默的(M5-24)。
+            span = {
+                "since": since,
+                "until": until,
+                "from_seq": batch[0]["seq"] if batch else None,
+                "to_seq": batch[-1]["seq"] if batch else None,
+                "batch": f"{index}/{len(batches)}",
+            }
+
+            # 可见即入账:输入先落,输出后落;模型实收的就是这份 prompt 原文
+            self._journal.append(sweep_id, "sweep", {**span, "phase": "input", "content": prompt})
+            try:
+                output = await self._run_model(prompt)
+            except Exception as exc:  # 模型调用失败:不影响主循环,可重试(不推进光标)
+                self._journal.append(
+                    sweep_id,
+                    "sweep",
+                    {
+                        **span,
+                        "phase": "output",
+                        "content": f"模型调用失败:{type(exc).__name__}: {exc}",
+                    },
+                )
+                stopped = f"归拢失败(不影响对话):{type(exc).__name__}"
+                break
+            self._journal.append(sweep_id, "sweep", {**span, "phase": "output", "content": output})
+
+            try:
+                plan = json.loads(output)
+            except Exception:
+                stopped = "归拢:模型输出不是 JSON,本次无动作(可重试)"
+                break
+            if not isinstance(plan, dict):
+                stopped = "归拢:模型输出不是对象,本次无动作"
+                break
+
+            self._apply(plan, opened, closed)
+            suggested += self._propose_all(plan)
+            # ★ M5-24 的根:光标绑的是**这一批实际喂进去的最后一条**,不是窗口里最大的那条。
+            if batch:
+                self._advance_cursor(batch[-1]["seq"])
+            fed += len(batch)
+
+        # P1-3:归拢提出提案 → 通知用户(别再让 pending 悄悄压死压缩)。日限由注入的通知器管。
+        if suggested:
+            self._notify(f"夜间归拢提出 {suggested} 条待审提案(/pending 查看)")
+        # 没扫完的要**说出来**(含中途失败剩下的那几批):失效静默是这条 bug 最贵的地方
+        # ——少提的事实和"模型觉得不值得提"长得一模一样,谁都看不出来。
+        left = len(pending) - fed
+        summary = stopped or _summarize(opened, closed, suggested)
+        if left > 0:
+            amount = f"至少 {left}" if maybe_more else f"{left}"
+            summary += f";还有 {amount} 条没扫完,再跑一次 /sweep 接着补"
+        elif maybe_more:
+            summary += f";这次取满了 {_SCAN_LIMIT} 条上限,可能还有没扫完的,再跑一次 /sweep"
+        return SweepResult(summary=summary, opened=opened, closed=closed, suggested=suggested)
+
+    def _apply(self, plan, opened: list[str], closed: list[str]) -> None:
+        """只写话头,绝不动账本正文(Gate.settle 是唯一写路径)。"""
         for item in plan.get("open") or []:
             if isinstance(item, dict) and item.get("topic"):
                 t = self._threads.open_thread(str(item["topic"]), str(item.get("note") or ""))
@@ -210,6 +283,9 @@ class Sweeper:
         for topic in plan.get("close") or []:
             if isinstance(topic, str) and self._threads.close_thread(topic):
                 closed.append(topic)
+
+    def _propose_all(self, plan) -> int:
+        suggested = 0
         for fact in plan.get("suggest") or []:
             if isinstance(fact, str) and fact.strip():
                 try:
@@ -223,13 +299,13 @@ class Sweeper:
                     suggested += 1
                 except Exception:
                     logger.exception("sweep: 单条提案失败被跳过")  # 单条失败不影响其余
+        return suggested
 
-        self._advance_cursor(window_max)
-        # P1-3:归拢提出提案 → 通知用户(别再让 pending 悄悄压死压缩)。日限由注入的通知器管。
-        if suggested:
-            self._notify(f"夜间归拢提出 {suggested} 条待审提案(/pending 查看)")
-        summary = _summarize(opened, closed, suggested)
-        return SweepResult(summary=summary, opened=opened, closed=closed, suggested=suggested)
+
+def _batch_note(index: int, total: int) -> str:
+    """告诉模型这是分批扫的第几批。**不是装饰**:上下文从对话中间开始,不说一声,
+    模型会把"前面没头没尾"当成对话本身的样子去归纳。"""
+    return f"(对话过长,这次分 {total} 批扫,这是第 {index} 批,按时间从早到晚)"
 
 
 def _summarize(opened: list[str], closed: list[str], suggested: int) -> str:

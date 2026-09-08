@@ -370,6 +370,8 @@ def create_app(
                 ledger=steward.ledger,
                 notify=notify,
             )
+            # since 只是这次触发的名义窗口(留进起居注当由头),**不是扫描下界**——
+            # 下界是光标,没归拢过的历史再老也要补(M5-24)。改这里的 24 小时不影响扫哪一段。
             sweep_result = await sweeper.run(
                 since=(now - _td(hours=24)).isoformat(), until=now.isoformat()
             )

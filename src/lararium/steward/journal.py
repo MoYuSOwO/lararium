@@ -306,16 +306,37 @@ class Journal:
             "ORDER BY seq LIMIT ?",
             (since, until, limit),
         ).fetchall()
-        return [
-            {
-                "seq": r["seq"],
-                "envelope_id": r["envelope_id"],
-                "kind": r["kind"],
-                "payload": json.loads(r["payload"]),
-                "ts": r["ts"],
-            }
-            for r in rows
-        ]
+        return [self._conversation_event(r) for r in rows]
+
+    def events_after_seq(
+        self, after_seq: int, until: str, limit: int = 2000
+    ) -> list[dict[str, Any]]:
+        """取 seq **大于** after_seq、且不晚于 until 的对话事件(envelope/reply),seq 正序。
+
+        夜间归拢走这条,不走 `events_in_range`:**下界是光标,不是时间**(M5-24)。
+        按时间取下界的那版会漏——`光标 < seq < 时间窗下界` 那一段一次都没扫过,而光标
+        只增不减,跳过去就再也回不来(真机第一次归拢把光标从 0 推到 147,seq 1..96
+        ——头两天全部对话——永久跳过)。任何让归拢停一天以上的事都会造出同样的缺口。
+
+        上界仍然按时间:归拢不该扫比"这次触发的时刻"更新的东西(别和还在飞的那一轮抢)。
+        """
+        rows = self._conn.execute(
+            "SELECT seq, envelope_id, kind, payload, ts FROM journal "
+            "WHERE seq > ? AND ts <= ? AND kind IN ('envelope','reply') "
+            "ORDER BY seq LIMIT ?",
+            (after_seq, until, limit),
+        ).fetchall()
+        return [self._conversation_event(r) for r in rows]
+
+    @staticmethod
+    def _conversation_event(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "seq": row["seq"],
+            "envelope_id": row["envelope_id"],
+            "kind": row["kind"],
+            "payload": json.loads(row["payload"]),
+            "ts": row["ts"],
+        }
 
     def _turns_by_id(self, env_ids: list[str]) -> dict[str, dict[str, Any]]:
         """一条 SQL 取这批信封的 (envelope, reply),按 env_id 建索引。

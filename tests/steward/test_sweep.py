@@ -530,3 +530,159 @@ def test_the_fact_criteria_are_written_down_in_exactly_one_place():
         f"判据被抄进了不止一份文档:{holders}。指过去,别抄——抄本会漂,"
         f"而漂了之后打赢的不一定是对的那份(M5-23)。"
     )
+
+
+# ─────────────────── M5-24:光标推的是"喂到哪儿",不是"窗口有多大" ───────────────────
+#
+# 真机第一次 /sweep:journal 里 147 条、跨三天,归拢只看了 seq 97..147(since=now-24h),
+# 然后把光标直接推到 147。**seq 1..96——头两天全部对话——一次都没归拢过,以后也不会**
+# (`_advance_cursor` 用 MAX,只增不减)。用户提过五次的"有女朋友"模型从头到尾没见过。
+# 不是只有首次会踩:服务停了、定时没跑、跑了抛异常、关机过夜,都造出同样的缺口,
+# 而且失效是静默的——少提的事实和"模型觉得不值得提"长得一模一样。
+
+
+def _append_at(sweeper, conn, env_id, content, ts):
+    """往起居注塞一条**指定时刻**的用户消息(journal.append 只会盖 now)。"""
+    seq = sweeper._journal.append(env_id, "envelope", {"content": content})
+    conn.execute("UPDATE journal SET ts=? WHERE seq=?", (ts.isoformat(), seq))
+    return seq
+
+
+def _cursor_of(conn):
+    row = conn.execute("SELECT cursor_seq FROM sweep_state WHERE id=1").fetchone()
+    return int(row["cursor_seq"]) if row else 0
+
+
+async def test_sweep_covers_history_older_than_the_time_window(sweeper_factory):
+    """★ M5-24 的复现:光标之前那一段没归拢过的历史,**必须扫到**,不许被时间窗跳过。
+
+    since=now-24h 只是这次触发的由头;真正的下界是光标。三天前那条一次都没归拢过,
+    它就该进这次的 prompt——而不是"因为不在 24 小时窗口里"被永久跳过。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    prompts: list[str] = []
+
+    async def rm(prompt):
+        prompts.append(prompt)
+        return '{"open": [], "close": [], "suggest": []}'
+
+    sweeper, conn, _, _ = sweeper_factory(rm)
+    now = datetime.now(UTC)
+    seqs = [
+        _append_at(sweeper, conn, "env-1", "三天前:我女朋友说想吃日料", now - timedelta(days=3)),
+        _append_at(sweeper, conn, "env-2", "两天前:别以为我是法拉利粉", now - timedelta(days=2)),
+        _append_at(sweeper, conn, "env-3", "今天:食堂 12 块", now - timedelta(hours=1)),
+    ]
+
+    result = await sweeper.run((now - timedelta(hours=24)).isoformat(), now.isoformat())
+
+    fed = "\n".join(prompts)
+    assert not result.skipped, result.summary
+    assert "三天前:我女朋友说想吃日料" in fed, "窗口下界外、没归拢过的历史被跳过了(M5-24)"
+    assert "两天前:别以为我是法拉利粉" in fed
+    assert "今天:食堂 12 块" in fed
+    assert _cursor_of(conn) == seqs[-1], "全喂完了,光标该在最后一条上"
+
+
+async def test_the_cursor_only_advances_to_what_was_actually_fed(sweeper_factory, monkeypatch):
+    """★ 钉死"光标 = 实际喂到的最大 seq":范围里有更大的 seq、但这次没喂,光标就不许过去。
+
+    这是 M5-24 的根。原来光标绑的是"窗口里最大的那条",于是没喂进模型的那些
+    也被当成扫过了;而光标只增不减,跳过去就再也回不来。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from lararium.steward import sweep as sweep_module
+
+    # 把一批的字数上限和批数压到最小,造出"喂不完"的局面(真机上这是缺口攒了两周的样子)
+    monkeypatch.setattr(sweep_module, "_PROMPT_CONVO_MAX_CHARS", 70)
+    monkeypatch.setattr(sweep_module, "_SWEEP_MAX_BATCHES", 1)
+
+    prompts: list[str] = []
+
+    async def rm(prompt):
+        prompts.append(prompt)
+        return '{"open": [], "close": [], "suggest": []}'
+
+    sweeper, conn, _, _ = sweeper_factory(rm)
+    now = datetime.now(UTC)
+    seqs = [
+        _append_at(sweeper, conn, f"env-{i}", f"第{i}条", now - timedelta(days=3, minutes=-i))
+        for i in range(5)
+    ]
+
+    result = await sweeper.run((now - timedelta(hours=24)).isoformat(), now.isoformat())
+
+    assert len(prompts) == 1, "上限压到 1 批,只该喂一批"
+    fed_last = max(seq for i, seq in enumerate(seqs) if f"第{i}条" in prompts[0])
+    assert fed_last < seqs[-1], "场景没造出来:这一批把所有事件都喂完了,钉不住任何东西"
+    assert _cursor_of(conn) == fed_last, "光标越过了没喂给模型的那几条(M5-24 的根)"
+    assert "没扫完" in result.summary, "还有没扫完的却不吭声——失效必须是响的,不是静默的"
+
+    # 剩下的不是丢了,是排队:再跑一次接着补,直到覆盖到最后一条
+    for _ in range(5):
+        if _cursor_of(conn) == seqs[-1]:
+            break
+        await sweeper.run((now - timedelta(hours=24)).isoformat(), now.isoformat())
+    assert _cursor_of(conn) == seqs[-1], "分批补不完:剩下的那几条永远轮不到"
+    fed_all = "\n".join(prompts)
+    for i in range(5):
+        assert f"第{i}条" in fed_all, f"第{i}条一次都没进过 prompt"
+
+
+async def test_a_long_backlog_is_batched_and_the_oldest_goes_first(sweeper_factory):
+    """缺口很长时**分批**喂,而且从最早的那条开始装——不是"截断只留最近部分"。
+
+    截断保留最近、光标推到最新,等于换一种方式把最早那几条永久跳过(同一个 bug 的第二张脸)。
+    """
+    from datetime import UTC, datetime, timedelta
+
+    prompts: list[str] = []
+
+    async def rm(prompt):
+        prompts.append(prompt)
+        return '{"open": [], "close": [], "suggest": []}'
+
+    sweeper, conn, _, _ = sweeper_factory(rm)
+    now = datetime.now(UTC)
+    seqs = [
+        _append_at(sweeper, conn, f"env-{i}", f"第{i:02d}条:" + "话" * 900, now - timedelta(days=2))
+        for i in range(30)
+    ]
+
+    await sweeper.run((now - timedelta(hours=24)).isoformat(), now.isoformat())
+
+    assert len(prompts) > 1, "30 条 x 900 字远超一批的上限,应该分批"
+    assert prompts[0].index("第00条") < prompts[0].index("第01条"), "批内仍是时间正序"
+    assert "第00条" in prompts[0], "第一批装的必须是最早的那几条,不是最近的"
+    for index, prompt in enumerate(prompts):
+        assert len(prompt) < 22000, f"第 {index + 1} 批把廉价模型的窗口撑爆了:{len(prompt)} 字"
+    fed = "\n".join(prompts)
+    for i in range(30):
+        assert f"第{i:02d}条" in fed, f"第{i:02d}条一条都没喂进去就被跳过了"
+    assert _cursor_of(conn) == seqs[-1]
+
+
+async def test_a_filled_gap_does_not_get_swept_twice(sweeper_factory):
+    """补完缺口之后再跑一次 → no-op(P1-1 的内容幂等不能被这次改动破坏)。"""
+    from datetime import UTC, datetime, timedelta
+
+    calls: list[str] = []
+
+    async def rm(prompt):
+        calls.append(prompt)
+        return json.dumps({"open": [], "close": [], "suggest": ["在上学"]})
+
+    sweeper, conn, gate, _ = sweeper_factory(rm)
+    now = datetime.now(UTC)
+    for i in range(3):
+        _append_at(sweeper, conn, f"env-{i}", f"三天前第{i}条", now - timedelta(days=3, minutes=-i))
+
+    since, until = (now - timedelta(hours=24)).isoformat(), now.isoformat()
+    await sweeper.run(since, until)
+    again = await sweeper.run(since, until)
+
+    assert again.skipped, "缺口补完之后再跑该是 no-op"
+    assert len(calls) == 1, "模型只该被调一次"
+    assert len(gate.pending()) == 1, "不因重跑重复提案"
