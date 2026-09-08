@@ -5,6 +5,7 @@
 """
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -321,3 +322,176 @@ async def test_p1_death_loop_broken_sweep_proposal_blocks_then_notice_then_conti
         gate.resolve(p.id, approved=True)
     r2 = await compactor.run(s, u)  # 同窗口:沉淀筛的光标已推进(无新内容),pending 已清
     assert r2.index_count == 1 and journal.is_compressed("env-1"), "结案后再压能继续,不是永久挡死"
+
+
+# ── M5-30:前置步骤失败了,那批对话不许退出 L0 ────────────────────────────────
+#
+# `_cut` 失败时返回 `[]`,而 `[]` 同时也是"模型说没什么可切"——`run()` 分不出这两件事,
+# 于是模型抖一下 = **索引一条没建,那批对话却已经被标记压缩**。正文没删(不可协商第 3 条
+# 守着),但自动可见性没了,而"能翻到"和"会被翻到"不是一回事。
+# 三条切段失败路径各钉一条,外加归拢失败、以及索引与标记之间那道缝。
+
+
+def _nothing_committed(journal, *envelope_ids):
+    """前置步骤没成功时的共同断言:一条索引都没建,一个信封都没退出 L0。"""
+    assert journal.l1_block(90) == "", "前置步骤没成功,一条索引都不该建"
+    for eid in envelope_ids:
+        assert journal.is_compressed(eid) is False, f"{eid} 不许退出 L0"
+
+
+async def test_cut_model_failure_keeps_the_batch_in_l0(compact_factory):
+    """失败路径一:切段模型抛。那批 ids 不许被标记已压缩,索引也不许有。"""
+    sweep_calls = []
+
+    async def cut(p):
+        raise RuntimeError("上游 502")
+
+    async def sweep_p(p):
+        sweep_calls.append(p)
+        return '{"open": [], "close": [], "suggest": []}'
+
+    compactor, conn, journal, _, _, _ = compact_factory(cut, sweep_model=sweep_p)
+    journal.append("env-1", "envelope", {"content": "外卖这个月花超了"})
+    s, u = _window()
+    result = await compactor.run(s, u)
+
+    assert result.failed and result.stopped, "切段失败 = 这一轮压缩没完成"
+    assert result.compressed_count == 0 and result.index_count == 0
+    assert "切段" in result.summary, f"摘要要说清楚卡在哪一步:{result.summary}"
+    _nothing_committed(journal, "env-1")
+    assert sweep_calls == [], "切段就没成,不必再往下烧一次模型调用"
+    rows = list(conn.execute("SELECT payload FROM journal WHERE kind='sweep'"))
+    assert any("切段模型失败" in r["payload"] for r in rows), "吞下来的失败必须落起居注"
+
+
+async def test_unparseable_cut_output_keeps_the_batch_in_l0(compact_factory):
+    """失败路径二:模型回了东西但 JSON 解不开(别只测抛异常那条)。
+
+    这里原来有个「按一段整块处理」的兜底——把整窗压成一条内容是空话的索引行,
+    然后照常标记压缩。那是**拿一条假书签换掉整批对话的自动可见性**,比不压更糟。
+    """
+
+    async def cut(p):
+        return "抱歉,我没法完成这个请求。"
+
+    compactor, _, journal, _, _, _ = compact_factory(cut)
+    journal.append("env-1", "envelope", {"content": "外卖这个月花超了"})
+    s, u = _window()
+    result = await compactor.run(s, u)
+
+    assert result.failed and result.stopped
+    assert result.index_count == 0
+    _nothing_committed(journal, "env-1")
+
+
+async def test_zero_segments_for_a_nonempty_window_is_a_failure(compact_factory):
+    """失败路径三:JSON 解得开、格式也对,但一段都没切出来。
+
+    `ids` 非空却切出 0 段本身就是失败信号——有轮要压就该至少有一段;
+    把它当成"成功地什么都没切"就正好走进了这条 bug。
+    """
+
+    async def cut(p):
+        return '{"segments": []}'
+
+    compactor, _, journal, _, _, _ = compact_factory(cut)
+    journal.append("env-1", "envelope", {"content": "外卖这个月花超了"})
+    s, u = _window()
+    result = await compactor.run(s, u)
+
+    assert result.failed and result.stopped
+    _nothing_committed(journal, "env-1")
+
+
+async def test_sweep_failure_blocks_compression(compact_factory):
+    """归拢(沉淀筛)失败 → 压缩同样不提交。
+
+    第 4 步「审批屏障再查」存在的理由正是"沉淀筛刚提的新 pending 也不能毁证据";
+    筛子**根本没跑成**的时候,那一步查到的 0 条是**假的安全**。
+
+    这条同时钉住了 compact 认定"归拢失败"的判据(它只能从 SweepResult.summary 认):
+    sweep.py 哪天改了那句措辞,这条当场红。
+    """
+
+    async def cut(p):
+        return '{"segments": [{"topic": "消费", "conclusion": "外卖超支"}]}'
+
+    async def sweep_boom(p):
+        raise RuntimeError("上游 502")
+
+    compactor, _, journal, _, _, _ = compact_factory(cut, sweep_model=sweep_boom)
+    journal.append("env-1", "envelope", {"content": "外卖这个月花超了"})
+    s, u = _window()
+    result = await compactor.run(s, u)
+
+    assert result.failed and result.stopped
+    assert "归拢" in result.summary, f"摘要要说清楚卡在哪一步:{result.summary}"
+    _nothing_committed(journal, "env-1")
+
+
+async def test_sweep_not_finishing_does_not_block_compression(compact_factory):
+    """判断的分界:归拢**失败**挡住压缩,归拢**没扫完**(批数上限)不挡。
+
+    没扫完时筛子真的跑过、也真的提过它看到的那些,而且光标只推到实际喂进去的那条
+    (M5-24),剩下的下次接着补。拿"没扫完"当红灯的话,积压期间压缩永远轮不上
+    ——而那正是上下文最满、最需要压的时候。
+    """
+
+    async def cut(p):
+        return '{"segments": [{"topic": "消费", "conclusion": "外卖超支"}]}'
+
+    async def sweep_p(p):
+        return '{"open": [], "close": [], "suggest": []}'
+
+    compactor, conn, journal, _, _, _ = compact_factory(cut, sweep_model=sweep_p)
+    # 造出"一次 run 扫不完":50 条、每条 3000 字 ≈ 15 万字,远超「6 批,每批 2 万字」的上限。
+    for i in range(50):
+        journal.append(f"env-{i}", "envelope", {"content": "账" * 3000})
+    s, u = _window()
+    result = await compactor.run(s, u)
+
+    cursor = conn.execute("SELECT cursor_seq FROM sweep_state WHERE id=1").fetchone()["cursor_seq"]
+    last = conn.execute("SELECT MAX(seq) AS s FROM journal WHERE kind='envelope'").fetchone()["s"]
+    assert cursor < last, "阳性对照:这一批必须真的没扫完,否则下面几句钉不住任何东西"
+    assert not result.failed and not result.stopped, "没扫完不是失败,压缩照常提交"
+    assert result.index_count == 1 and result.compressed_count == 50
+    assert journal.is_compressed("env-0")
+
+
+async def test_index_and_mark_commit_together(compact_factory, monkeypatch):
+    """`add_index` 和 `mark_compressed` 之间那道缝:索引写到一半崩掉,不许留下半份。
+
+    留下半份的后果不是"少一行":标记没写上,下次同一窗口会重压,那半份索引跟着再写一遍。
+    """
+
+    async def cut(p):
+        return json.dumps(
+            {
+                "segments": [
+                    {"topic": "A", "conclusion": "c1", "envelope_ids": ["env-a"]},
+                    {"topic": "B", "conclusion": "c2", "envelope_ids": ["env-b"]},
+                ]
+            }
+        )
+
+    compactor, _, journal, _, _, _ = compact_factory(cut)
+    journal.append("env-a", "envelope", {"content": "第一段"})
+    journal.append("env-b", "envelope", {"content": "第二段"})
+
+    real_add = journal.add_index
+    written: list[str] = []
+
+    def boom(date, line, envelope_id):
+        written.append(envelope_id)
+        if len(written) == 2:
+            raise sqlite3.OperationalError("database is locked")
+        real_add(date, line, envelope_id)
+
+    monkeypatch.setattr(journal, "add_index", boom)
+    s, u = _window()
+    with pytest.raises(sqlite3.OperationalError):
+        await compactor.run(s, u)
+
+    assert len(written) == 2, "阳性对照:第一条索引确实写进去过,崩的是第二条"
+    assert journal.l1_block(90) == "", "半份索引必须跟着回滚,不能留在库里"
+    _nothing_committed(journal, "env-a", "env-b")

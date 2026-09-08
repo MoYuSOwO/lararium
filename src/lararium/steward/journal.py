@@ -1,5 +1,7 @@
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -195,6 +197,21 @@ def _searchable_text(payload: dict[str, Any]) -> str:
 class Journal:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """把几次写并成一次原子提交:块内**一起成、一起不成**。
+
+        M5-30 的用处是压缩收尾——`add_index` 写到一半崩掉、或者索引写完了
+        `mark_compressed` 没写上,都会留下"半份索引 + 没标记",而没标记意味着下次
+        重压同一窗口、那半份索引再写一遍。
+
+        不把连接交出去:调用方伸手拿 `_conn` 去拼是 S3 明令禁止的(`db.transaction`
+        的 docstring 也这么说),它需要的只是"这几步是一件事"这个表达。
+        可重入——块内的 `append` 自己也开事务,走 SAVEPOINT(见 `db._transaction`)。
+        """
+        with _db.transaction(self._conn):
+            yield
 
     def append(self, envelope_id: str, kind: str, payload: dict[str, Any]) -> int:
         ts = datetime.now(UTC).isoformat()
