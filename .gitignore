@@ -33,3 +33,4 @@ htmlcov/
 .idea/
 .vscode/*
 !.vscode/settings.json
+.claude/worktrees/
