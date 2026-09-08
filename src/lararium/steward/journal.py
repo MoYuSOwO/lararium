@@ -127,6 +127,62 @@ class SearchHit:
     untrusted: bool = False
 
 
+# M5-28:一条命中脏不脏是**推导**出来的,不是盖在每条记录上的章。
+#
+# 只有 `envelope` 的 payload 带 `meta`(真机取样:`tool_result` / `reply` /
+# `tool_executed` 都没有),所以直接读 `$.meta.untrusted` 只对信封自己成立。
+# web_search 捞回的外部内容落成一条没有 meta 的 `tool_result`,下一轮被检索命中时
+# `hit.untrusted` 就是 False —— M5-18 那把闩不拉、`propose(user_stated)` 自动放行、
+# 攻击者的内容进长期档案。**M5-18 修的是轮内的闩,轮间靠起居注传递这条路从来没建过。**
+#
+# 判据顺着**信封**解析,三条任一为真即为真:
+#   ① 这条记录自己的 payload 说脏 —— 信封走这条;
+#   ② 它所属的信封有 `untrusted_seen` 事件 —— M5-18 已经按信封落好了,直接读;
+#   ③ 它所属的那条 `envelope` 事件的 meta 说脏 —— 不可信入站的那一轮可能一个工具都没调,
+#      没有 `untrusted_seen`,而那一轮的 `reply` 里就复述着短信原文。
+#
+# 为什么不往每条记录上盖章(另一条路,放弃了):**一个事实只有一个出处**。推导这条
+# 不用补列、不用回填、不用回答"老记录默认算可信还是要审"(老记录顺着它的信封解析,
+# 和新记录同一个答案),而且自动覆盖所有 kind —— `tool_executed` 是在执行点落的,
+# 那时这一轮脏不脏还没定,盖章那条路上它无解。代价是每条命中多一次相关子查询:
+# 走 `idx_journal_envelope`(envelope_id 前缀),而命中集就是一页(≤20 条)。
+#
+# **三条 SQL 共用这一个表达式**(FTS / LIKE / 语义),所以三条查询都把 journal 别名成
+# `j`。两个出口两套规则这一节栽过两次(M4-4、M5-5),别再让它们各写各的。
+_UNTRUSTED_SQL = """(
+        COALESCE(json_extract(j.payload, '$.meta.untrusted'), 0)
+        OR EXISTS (
+            SELECT 1 FROM journal e WHERE e.envelope_id = j.envelope_id AND (
+                e.kind = 'untrusted_seen'
+                OR (e.kind = 'envelope'
+                    AND COALESCE(json_extract(e.payload, '$.meta.untrusted'), 0))
+            )
+        )
+    )"""
+
+# 命中行的公共投影。三条查询逐字共用,别名齐了才谈得上"同一条规则"。
+_HIT_COLUMNS = (
+    "j.envelope_id, j.kind, j.ts, "
+    "json_extract(j.payload, '$.source') AS source, "
+    "json_extract(j.payload, '$.channel') AS channel, "
+    f"{_UNTRUSTED_SQL} AS untrusted"
+)
+
+
+def _hit(row: sqlite3.Row, text: str) -> SearchHit:
+    """把一行 `_HIT_COLUMNS` 转成 `SearchHit`。正文由调用方给——FTS 那条取的是
+    `journal_fts.text`,另外两条取 `journal.search_text`。"""
+    return SearchHit(
+        row["envelope_id"],
+        row["kind"],
+        text,
+        row["ts"],
+        source=row["source"],
+        channel=row["channel"] or "",
+        untrusted=bool(row["untrusted"]),
+    )
+
+
 def _searchable_text(payload: dict[str, Any]) -> str:
     """只把人话丢进检索索引,避免 JSON 结构噪声淹没查询。"""
     for key in ("content", "text", "summary"):
@@ -207,10 +263,7 @@ class Journal:
                 "SELECT COUNT(*) FROM journal_fts WHERE journal_fts MATCH ?", (f'"{escaped}"',)
             ).fetchone()[0]
             rows = self._conn.execute(
-                "SELECT j.envelope_id, j.kind, f.text AS text, j.ts, "
-                "json_extract(j.payload, '$.source') AS source, "
-                "json_extract(j.payload, '$.channel') AS channel, "
-                "json_extract(j.payload, '$.meta.untrusted') AS untrusted "
+                f"SELECT {_HIT_COLUMNS}, f.text AS text "  # noqa: S608 - 投影是本模块常量,零外部输入
                 "FROM journal_fts f JOIN journal j ON j.seq = f.seq "
                 "WHERE journal_fts MATCH ? ORDER BY j.seq DESC LIMIT ? OFFSET ?",
                 (f'"{escaped}"', limit, offset),
@@ -224,26 +277,12 @@ class Journal:
                 (f"%{escaped}%",),
             ).fetchone()[0]
             rows = self._conn.execute(
-                "SELECT envelope_id, kind, search_text AS text, ts, "
-                "json_extract(payload, '$.source') AS source, "
-                "json_extract(payload, '$.channel') AS channel, "
-                "json_extract(payload, '$.meta.untrusted') AS untrusted "
-                "FROM journal "
-                "WHERE search_text LIKE ? ESCAPE '\\' ORDER BY seq DESC LIMIT ? OFFSET ?",
+                f"SELECT {_HIT_COLUMNS}, j.search_text AS text "  # noqa: S608 - 同上,投影是常量
+                "FROM journal j "
+                "WHERE j.search_text LIKE ? ESCAPE '\\' ORDER BY j.seq DESC LIMIT ? OFFSET ?",
                 (f"%{escaped}%", limit, offset),
             ).fetchall()
-        hits = [
-            SearchHit(
-                r["envelope_id"],
-                r["kind"],
-                r["text"],
-                r["ts"],
-                source=r["source"],
-                channel=r["channel"] or "",
-                untrusted=bool(r["untrusted"]),
-            )
-            for r in rows
-        ]
+        hits = [_hit(r, r["text"]) for r in rows]
         return int(total), hits
 
     def search_similar(
@@ -276,18 +315,10 @@ class Journal:
         hits: list[SearchHit] = []
         if page:
             qmarks = ",".join("?" * len(page))
-            q = f"SELECT seq, envelope_id, kind, search_text AS text, ts, json_extract(payload, '$.source') AS source, json_extract(payload, '$.channel') AS channel, json_extract(payload, '$.meta.untrusted') AS untrusted FROM journal WHERE seq IN ({qmarks})"  # noqa: S608 - qmarks 全是 ?,参数是内部 seq int,无用户数据
+            q = f"SELECT j.seq, {_HIT_COLUMNS}, j.search_text AS text FROM journal j WHERE j.seq IN ({qmarks})"  # noqa: S608 - qmarks 全是 ?,参数是内部 seq int,无用户数据;投影是本模块常量
             by_seq: dict[int, SearchHit] = {}
             for jrow in self._conn.execute(q, page).fetchall():
-                by_seq[int(jrow["seq"])] = SearchHit(
-                    jrow["envelope_id"],
-                    jrow["kind"],
-                    jrow["text"],
-                    jrow["ts"],
-                    source=jrow["source"],
-                    channel=jrow["channel"] or "",
-                    untrusted=bool(jrow["untrusted"]),
-                )
+                by_seq[int(jrow["seq"])] = _hit(jrow, jrow["text"])
             # page 按 vec0 余弦序(最相似在前);SQL 取回的行序未知,按 page 对齐
             hits = [by_seq[s] for s in page if s in by_seq]
         return total, hits
