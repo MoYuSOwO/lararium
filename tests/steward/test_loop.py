@@ -816,7 +816,7 @@ async def test_a_missing_original_says_the_replay_is_incomplete(steward_factory,
 async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, tmp_path):
     """★ 写入侧:带字节的工具结果落起居注时必须标成**不可回放**。
 
-    只测读取侧(`last_attempt_tool_results` 跳过它)不够——把这里写死成 True,
+    只测读取侧(`established_tool_results` 跳过它)不够——把这里写死成 True,
     整个机制就是死的,而读取侧那条测试照样绿(变异 K 就是这么活下来的)。
     重试那一轮会把图**悄悄换成一句话**,模型不会知道自己少看了一张。
     """
@@ -838,7 +838,7 @@ async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, 
         ("current_time", True),
     ]
     assert "\\xff" not in str(executed[0]["result"]), "字节顺着 result 溜进起居注了"
-    assert steward.journal.last_attempt_tool_results("env-x") == [
+    assert steward.journal.established_tool_results("env-x") == [
         ("current_time", executed[1]["result"])
     ]
 

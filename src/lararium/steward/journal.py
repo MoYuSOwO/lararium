@@ -399,12 +399,28 @@ class Journal:
         ).fetchone()
         return row is not None
 
-    def last_attempt_tool_results(self, envelope_id: str) -> list[tuple[str, str]]:
-        """上一次尝试里**已经确立**的工具结果,按调用顺序(M4-5d)。
+    def established_tool_results(self, envelope_id: str) -> list[tuple[str, str]]:
+        """这封信下**已经确立**的工具结果,按发生顺序累计(M4-5d 建,M5-29 改口径)。
 
-        取的是最后一个 `envelope` 事件之后的 `tool_executed` —— 每次 claim 都会先记一条
-        `envelope`,所以"最后一个之后"正好是上一次尝试那一段。**必须在本次 claim 记
-        envelope 事件之前调用**,否则取到的是空段。
+        判据是 `tool_executed` 的 `replayed`:`False` = 那一次**真跑了**(副作用已经
+        发生),`True` = 那一次是回放上一次的结果(世界上什么都没发生)。取全部
+        `replayed=False` 的、按 seq 排——这正好是"这封信到此为止真的发生过的那些事",
+        每件只算一次。
+
+        **原来取的是最后一个 `envelope` 事件之后那一段**(envelope 是尝试之间的分界线)。
+        那个口径假设"每次重试都恰好把旧结果重新回放一遍",而这个假设会塌:
+
+        ```
+        第 1 次  envelope → record_expense 真跑了 → 模型调用失败
+        第 2 次  envelope → 还没调到工具就失败(这一段一条 tool_executed 都没有)
+        第 3 次  只看第 2 次那一段 → 空 → 模型重新记一遍账
+        ```
+
+        第 1 次那笔账被第 2 次的空记录遮住了。M5-13 证过这个服务商真的会失败,
+        一次连不上就够。**账上凭空多一笔,而且没人会发现。**
+
+        累计口径顺带解掉了调用时机的约束:分界线不再参与判断,本次 `envelope` 记没记
+        都是同一个答案。
 
         为什么不用 `tool_result`:那是 `model.run` **成功返回之后**才记的,
         而这里要的恰好是"跑失败了、但工具已经执行掉"的那一批。
@@ -413,19 +429,20 @@ class Journal:
         (`look_at_image` 带着图片字节)照着 `str()` 回放,等于把图悄悄换成一句话,
         而模型不会知道自己少看了一张。老记录没有这个字段,默认按可回放算
         ——它们当初本来就都是文本。
+
+        `replayed` 缺字段时按**真跑过**算。两个方向的代价不对称:漏掉一条 = 副作用再跑
+        一遍(**多记一笔**),多算一条 = 那次调用被旧结果顶掉(丢一次调用)。这条修的
+        就是"多"。实际上 `tool_executed` 和 `replayed` 是同一次提交加的,没有缺它的老记录。
         """
         rows = self._conn.execute(
-            "SELECT kind, payload FROM journal WHERE envelope_id=? ORDER BY seq", (envelope_id,)
+            "SELECT payload FROM journal WHERE envelope_id=? AND kind='tool_executed' ORDER BY seq",
+            (envelope_id,),
         ).fetchall()
-        start = 0
-        for i, r in enumerate(rows):
-            if r["kind"] == "envelope":
-                start = i + 1
         out: list[tuple[str, str]] = []
-        for r in rows[start:]:
-            if r["kind"] != "tool_executed":
-                continue
+        for r in rows:
             payload = json.loads(r["payload"])
+            if payload.get("replayed", False):
+                continue  # 回放不是执行:算进来等于把同一次执行数两遍
             if not payload.get("replayable", True):
                 continue
             out.append((str(payload.get("tool")), str(payload.get("result", ""))))

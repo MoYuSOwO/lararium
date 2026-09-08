@@ -12302,3 +12302,93 @@ pytest           683 passed, 15 skipped   (+21 条)
 
 **门禁**:683 passed + 15 skipped(+21 条)。前缀指纹 `03cdce1e…` → 重建一次
 ——**这次没加工具,只加了参数,schema 照样变**,这一点值得记:A1 的代价不只由工具个数决定。
+
+---
+
+## M5-29:连续失败时第三次尝试会重复记账 —— 待验收
+
+`Journal.last_attempt_tool_results` 改口径并改名 `established_tool_results`:
+从「最后一个 `envelope` 事件之后那一段」改成「这封信下全部 `replayed=False` 的
+`tool_executed`,按 seq 顺序」。改动一共两处代码:`journal.py` 那个方法的方法体
+(12 行)、`loop.py` 的调用点(只是名字和注释)。
+
+### 一、`replayed` 那个方向对不对:对,而且它是**唯一**在数据里的判据
+
+`loop.py` 的包装层在**执行点**落 `tool_executed`,`replayed = replayed is not None`
+——`False` 那一条是 `original(*args, **kwargs)` 真的返回过之后才写的(抛异常就没有这条
+记录)。所以 `replayed=False` 精确等于「这次调用真的发生了,副作用已经在世界上」,
+不是"以为跑过的"。走一遍三次尝试:
+
+```
+第 1 次  真跑 A、真跑 B                        → False, False
+第 2 次  回放 A、回放 B → 真跑 C → 失败        → True, True, False
+第 3 次  取全部 False → A, B, C,顺序就是发生顺序
+```
+
+**旧口径为什么会塌**:它假设「每次重试都恰好把旧结果重新回放一遍」,于是第 2 次那一段
+里既有回放也有新执行,看起来总是对的。这个假设在「第 2 次还没调到工具就失败」时不成立
+——那一段是空的,而空段会把第 1 次真跑掉的那笔**遮住**。M5-13 证过这个服务商真的会失败。
+
+顺带解掉一条约束:旧实现要求**必须赶在本次 `envelope` 事件之前调用**,否则取到空段;
+新口径不看分界线,记没记 envelope 都是同一个答案。调用点没动位置,但那条注释删了
+——它现在是假的,留着比没有更坏。
+
+**改名的理由**:`last_attempt_*` 说的是"上一次尝试",而返回值现在是跨尝试累计的。
+一个管钱的函数上挂一个反着说的名字,下一个人会照名字推理。改了 1 处生产调用 + 3 处测试引用。
+
+### 二、副作用只跑一次:**拿会计数的东西钉的,不是只断队列**
+
+`tests/steward/test_retry_resume.py::test_an_attempt_that_reached_no_tool_does_not_uncover_an_earlier_execution`
+——假模型:第 1 次调完工具就抛可重试错,第 2 次立刻抛(一个工具都没调到),第 3 次正常跑完
+(`max_attempts=3`,第 3 次正好是最后一次)。**三个互相独立的口径**:
+
+```
+charges == ["房租"]          ← 一个会数的假工具(counting_tool),数的是调用本身
+len(rows()) == 1             ← 真 finance 库里的行数,第二个口径
+executed == [(record_expense, False), (charge_the_card, False),
+             (record_expense, True),  (charge_the_card, True)]   ← 全量断言
+```
+
+第三条是**全量**不是片段(T6 第 5 条):它同时排除了「第 3 次是碰巧没调工具」这种假绿
+——两条 `replayed=True` 说明那两次调用真的发生了、走的是回放。
+
+**修之前跑过,红的,而且红在正确的地方**:`AssertionError: 副作用跑了 2 次,只该跑一次`
+(`['房租', '房租']`)。不是"断言没成立",是**真的扣了两次款**。
+
+### 三、三个坑各配一条变异,**都咬住了**
+
+| 变异(改 `journal.py`) | 结果 | 咬住它的 |
+|---|---|---|
+| A 去掉 `replayed` 过滤(全都算) | 红 | `test_results_accumulate_across_attempts_in_call_order` |
+| B 按工具名去重 | 红 ×3 | 新的两条 + M4-5d 原有的 `..._survive_a_retry_without_duplicating` |
+| C 去掉 `replayable` 过滤 | 红 ×2 | M5-5 那两条(读取侧 + 写入侧) |
+
+- **A** 是「同一个 `tool_executed` 回放两次也是错的」那条:朴素的"全都累计"会把 A、B
+  各数两遍,第 3 次队列变成 `A B A B C`,后面的调用配到错位的旧结果上。
+  **交代清楚:这条测试在修之前就是绿的**(旧口径下第 2 次那一段恰好也是 `A B C`),
+  它不是复现,是挡住这个朴素修法的护栏。
+- **B** 是坑 1:一轮里合法地记两笔(「麦当劳 45.5,烧烤 115.77」)去重会吃掉第二笔。
+  新加的 `test_two_identical_expenses_survive_a_toolless_attempt` 断的是**精确的 2**
+  ——去重塌成 1(少记一笔)、不累计涨成 4(多记两笔),两个方向都是钱。
+- **C** 是坑 2:`replayable=False` 仍然不进队列,M5-5 的两条原样绿,没碰。
+
+### 四、坑 3:M4-5d 治好的病没放回来
+
+队列变长的那一部分,**每一条都是 `replayed=False`**,也就是包装层在工具真的返回之后才
+写下的记录。变长只发生在「某次尝试没能把旧结果全部回放一遍」这一种情形——而那正是旧
+口径丢数据的那一种。其余情形(每次重试都完整回放)新旧口径返回的是同一个列表,
+M4-5d 的 8 条测试一条没改、全绿。
+
+**残余风险没有变化**:M4-5d 说破的那条(重试把某个早先调用换成另一个同名、事实上是
+另一件事的调用 → 向后查找拿旧结果顶掉它 → **这是丢,不是重**)照旧存在,这次没碰配对
+逻辑。它的作用域从"上一次尝试"扩到"这封信全部尝试",而扩出来的那部分,另一条路是
+**重复副作用**——这条修的就是那个。
+
+### 五、门禁
+
+```
+ruff ✓ / format 84 ✓ / mypy 36 files ✓ / lint-imports 4 kept 0 broken
+688 passed + 15 skipped(+5 条:journal 3、retry_resume 2)
+```
+
+前缀区没碰(没动工具 schema、没动 assembler),`bundles/finance/` 和 `websearch.py` 一字未改。
