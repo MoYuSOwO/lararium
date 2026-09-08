@@ -6680,7 +6680,7 @@ POST /ilink/bot/sendmessage
   /usage     查额度        免费
   ```
 
-  ### 要加的三处,**每一处都有实测**
+  ### 要加的两处,**每一处都有实测**(原本是三处,`country` 那条实测之后撤了)
 
   1. **`/extract` 加 `query` + `chunks_per_source`**(`web_fetch` 多一个 `question` 参数)
 
@@ -6700,10 +6700,28 @@ POST /ilink/bot/sendmessage
      另外这是**检索不是总结**:实测挑出来的字与原文逐字相同,只是 markdown 的 `**`
      被去掉了。这一点要写进 docstring——如果哪天它变成生成,「来源」那一行就成了假的。
 
-  2. **`/search` 固定带上 `country`**(跟 `LARARIUM_TIMEZONE` 走,或单独一个环境变量)
+  2. ~~**`/search` 固定带上 `country`**~~ —— **撤了,我判错了,理由在下面**
 
-     实测「上海这周末天气」:不给的时候回**日文的 weathernews.jp** 和繁体 AccuWeather;
-     给了 `country="china"` 之后全是国内站。**这条不用模型判断,是部署事实,固定带上。**
+     动机是一次搜「上海这周末天气」回来**日文的 weathernews.jp**。用户当场质疑:
+     「万一我搜美国天气或者英文内容呢」。去测,他是对的:
+
+     ```
+     【旧金山这周末天气怎么样】
+       不给 country   … www.weather.gov     ← 美国官方气象台
+       country=china  … www.msn.com         ← weather.gov 被挤掉了
+
+     【Python asyncio TaskGroup best practices】
+       不给 country   dev.to, towardsdatascience, bruceeckel.substack…
+       country=china  shanechang.com 挤进来,dev.to 掉了
+
+     【上海这周末天气】
+       不给 country   accuweather, tianqi.so.com, nmc.cn   ← 本来就全是对的
+     ```
+
+     两条都不利:它**是加权不是硬过滤,但确实伤外国查询**;而**当初那个动机没能复现**
+     ——不给 `country` 时结果本来就是国内站,那个日文结果我只见过一次就当成了证据。
+
+     **查询语言本身已经在定位了。** 不加。
 
   3. **`/search` 加 `topic` + `time_range`**(`web_search` 多两个可选参数)
 
@@ -6744,7 +6762,6 @@ POST /ilink/bot/sendmessage
   - `question` 给了 → 请求体里有 `query` 和 `chunks_per_source`;不给 → 两个键都不出现
     (**断请求体,不是断返回**);不给时输出与 M5-27 之前**逐字一致**(现有测试当金样);
   - 升 advanced 那一次 `question` 也在;片段间的 `[...]` 没被折行吃掉;
-  - `country` **每一次搜索都带**,拿请求体钉死;取值来源在一处,不散落;
   - `topic` / `time_range` 给了才出现在请求体里,值不合法时**工具自己挡下来回人话**,
     不要发出去等服务商报错;
   - 真机冒烟:同一个查询各打一次(带/不带 `topic=news`),把两次的域名列表记进 `REVIEW.md`
