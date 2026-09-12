@@ -4,7 +4,11 @@
 ——模型手里只有课程名,只有一个内部函数知道目录在哪(同 M6-5,同 M5-4 那条教训:
 `Attachment` 上根本没有可写的 path 字段)。
 
-课件(`add_file` / `list_materials` / `read_pdf`)是 M6-6b,这一轮一个字都没碰。
+M6-6b 追加了课件那两个工具(`add_file` / `list_materials`),行为测试在
+`test_courses_materials.py`。**这个文件为此改了三张表和两条形状测试**(课程名参数表、
+填充参数表、冻结签名表;"课件工具还没来"那条换成"read_pdf 不在 bundle 里"),
+笔记那七个工具的行为测试一条没动。机械检查(没有路径参数、非法课程名什么都不动)
+靠这几张表自动覆盖新的两个工具。
 """
 
 import inspect
@@ -27,6 +31,9 @@ COURSE_NAME_PARAMS = {
     "search_notes": ("course",),
     "rename_course": ("old", "new"),
     "delete_course": ("course",),
+    # M6-6b
+    "add_file": ("course",),
+    "list_materials": ("course",),
 }
 
 # 调一次工具要填的其余参数(和课程名无关的那些)。
@@ -36,6 +43,9 @@ FILLERS = {
     "new": "determinant",
     "reason": "记错课程名了",
     "query": "行列式",
+    # M6-6b
+    "media_id": "77aa99bb00cc",
+    "name": "第3讲",
 }
 
 BAD_NAMES = ["", "   ", "../../etc/passwd", "..", "a/b", "/etc/passwd", ".trash", "课" * 41]
@@ -100,6 +110,8 @@ def test_every_tool_signature_is_frozen(tools):
         "search_notes": ["query", "course", "page"],
         "rename_course": ["old", "new"],
         "delete_course": ["course", "reason", "undo"],
+        "add_file": ["course", "media_id", "name"],
+        "list_materials": ["course", "page"],
     }
 
 
@@ -109,10 +121,12 @@ def test_there_is_no_write_note_tool(tools):
     assert "write_note" not in tools
 
 
-def test_materials_tools_are_not_here_yet(tools):
-    """课件那一半是 M6-6b。**工具清单里不许出现没有实现的东西**
-    ——能力边界写在清单里比写在错误信息里强。"""
-    assert not {"add_file", "list_materials", "read_pdf"} & set(tools)
+def test_reading_a_material_is_not_a_bundle_tool(tools):
+    """M6-6b 之前这里钉的是"课件工具还没来";来了之后换成它的另一半:**读课件不在这个
+    bundle 里**——`read_pdf` / `read_image` 是 Steward 侧的内置工具(bundle 摸不到媒体池,
+    也不含模型)。而没有实现的读取器不许出现在清单里(能力边界写在清单里比写在错误信息里强)。"""
+    assert {"add_file", "list_materials"} <= set(tools)
+    assert not {"read_pdf", "read_image", "read_file", "read_docx"} & set(tools)
 
 
 def test_manifest_declares_the_same_tools_in_the_same_order(runtime):

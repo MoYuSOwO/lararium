@@ -18,13 +18,12 @@
 **路径不出现在接口上**:模型手里只有课程名,只有 `CourseStore.locate` 知道目录在哪
 (`test_no_tool_signature_has_a_path_parameter` 机械地钉着这一条,同 M6-5、同 M5-4)。
 
-**课件那一半是 M6-6b**(`add_file` / `list_materials`,加上 Steward 侧的 `read_pdf`)。
-这一轮**一个字都没碰**:没有实现的读取器不许出现在工具清单里——**能力边界写在清单里,
-比写在错误信息里强**。而落点的单位已经是**整个课程目录**,所以那一轮往里加
-`materials/` 时,这七个签名一个字都不用动,改名和删除也天然把课件一起搬走。
-**但模型看得见的话里(docstring、回话)这一轮一个「课件」都不提**:清单里没有课件工具,
-说"笔记和课件都跟过来了"就是在描述一个它摸不到的东西——那一轮加工具时一起改,
-反正同一次前缀重建。
+**课件那一半(M6-6b)**:`add_file` / `list_materials` 追加在七个笔记工具之后,
+读课件是 Steward 侧的 `read_pdf` / `read_image`。**只记归属,不拷字节**——归属表在
+`materials.py`,键是课程目录的相对路径,所以改名 / 删除 / 撤回在搬目录的同时把那一列
+改过去,回话里说一声几份课件跟着走了(没有课件的课,回话一个字不变)。
+**不转文字、不建缓存、不搜课件**(那是 6c,要用户拍板):两个新工具的 docstring 里
+没有一个字暗示课件能搜,`list_materials` 反而明说不在任何搜索范围里。
 
 ★ **换行不用管**(M6-5 探针量过,真实字符串见 REVIEW):工具结果在**调用它的那一轮是
 逐字节原样进模型的**,组装器的折行与 200 字截断只作用在**历史轮**的 L0 回放。所以
@@ -33,11 +32,14 @@
 """
 
 import functools
+import re
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 
 from fastmcp import FastMCP
 
+from bundles.courses.materials import Material, Materials
 from bundles.courses.store import (
     NOTE_PAGE_CHARS,
     CourseSpot,
@@ -56,11 +58,14 @@ from lararium.docstore import (
     clip,
     excerpt,
     find_all,
+    normalize_name,
     one_line,
     page_of,
     replace_once,
     scan,
 )
+from lararium.envelope import MAX_NAME_CHARS as MATERIAL_NAME_CHARS
+from lararium.envelope import is_media_id
 
 # 一页多少门课。口径照 `list_recipes`:一次工具调用不许顶穿 L0。
 LIST_PER_PAGE = 30
@@ -69,6 +74,8 @@ SEARCH_PER_PAGE = 10
 # 一本笔记里最多取多少处命中。**上限要有,而且超了要说出口**——静默截断读起来和
 # "就这些"一模一样(M4-3)。
 NOTE_HIT_CAP = 50
+# 课件名里拒掉的控制字符(空白由 `normalize_name` 先折成空格)。
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _inline(text: str) -> str:
@@ -77,10 +84,10 @@ def _inline(text: str) -> str:
 
 
 def _speak_errors(fn: Callable[..., str]) -> Callable[..., str]:
-    """把文件系统那一类失败翻成人话,**一处包住全部七个工具**(E2 + G8)。
+    """把文件系统那一类失败翻成人话,**一处包住全部工具**(E2 + G8)。
 
     E2:模型可调的工具不许把异常抛给模型——抛了整轮炸掉,用户看到的是助手死掉。
-    而"每个工具自己 try 一遍"是**七处守同一条不变量**,漏一处就是无声的;所以包在
+    而"每个工具自己 try 一遍"是**九处守同一条不变量**,漏一处就是无声的;所以包在
     构造工具列表那一步,新加的工具(M6-6b 那两个)自动在里面。
 
     **为什么这一份没有跟着搬进共用层**:它翻的是给**这个** bundle 说的那句话,
@@ -101,6 +108,10 @@ def _speak_errors(fn: Callable[..., str]) -> Callable[..., str]:
             # 磁盘满、权限、名字太长被文件系统拒……都归这里。**说清没成**,
             # 别回一句"好了"——那是 M5-20 那个失效形态:用户以为办了,其实没办。
             return f"这一步没办成(文件读写失败:{exc})。稍后再试,或者看一眼磁盘。"
+        except sqlite3.Error as exc:
+            # M6-6b:课件归属表那一侧。`atomically` 里失败时事务已经回滚、目录没搬,
+            # 删除那一支会先把目录搬回来再抛——所以"没办成"是实话。
+            return f"这一步没办成(课件归属表读写失败:{exc})。稍后再试。"
 
     return speaking
 
@@ -113,9 +124,35 @@ def _missing(spot: CourseSpot) -> str:
     )
 
 
-def _tool_functions(store: CourseStore) -> list[Callable]:
-    """七个工具。**顺序即冻结顺序**(工具 schema 是前缀第 0 层,DESIGN §4),
+def _material_name_error(name: str) -> str | None:
+    """课件名的校验。**它是给人看的名字,不是文件名**——不拷贝就没有落点,所以课程名那套
+    路径白名单(拒 `/`、`..`、前导 `.`)**不套在这里**(G7:「2026/9/13 讲义」是个正常的名字)。
+
+    剩下真要挡的三样:空的(列表里一行空名字,谁也指不出是哪份)、太长(名字每次列出来
+    都付钱;上限和附件原名同一个数——课件名多半就是照着那个原名起的)、控制字符。
+    伪造列表行靠渲染挡(折行 + 中和「」),不靠拒。
+    """
+    if not name:
+        return '课件名是空的,没归。给一个用户认得出的名字,比如 add_file("线性代数", id, "第3讲")。'
+    if len(name) > MATERIAL_NAME_CHARS:
+        return (
+            f"课件名太长了({len(name)} 字,最多 {MATERIAL_NAME_CHARS} 字),没归。"
+            "取个短名字,比如「第3讲」。"
+        )
+    if _CONTROL.search(name):
+        return "课件名里有控制字符,没归。重打一遍名字。"
+    return None
+
+
+def _carried(count: int) -> str:
+    """改名 / 删除 / 撤回回话尾巴上那半句。**没有课件就什么都不加**:6a 的回话一个字不变。"""
+    return f"{count} 份课件的归属也跟着过去了。" if count else ""
+
+
+def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
+    """九个工具。**顺序即冻结顺序**(工具 schema 是前缀第 0 层,DESIGN §4),
     manifest.yaml 的 tools 顺序是设计时的权威,`test_manifest_declares_...` 逐名对齐。
+    M6-6b 的两个课件工具只追加在末尾。
     """
 
     def list_courses(page: int = 1, include_deleted: bool = False) -> str:
@@ -273,8 +310,16 @@ def _tool_functions(store: CourseStore) -> list[Callable]:
                 f"已经有「{dst.name}」这门课了,没改——改名会把两门课的笔记合到一起,"
                 f"而那是静默的破坏。两边都 read_note 看一眼,自己决定留哪份。"
             )
-        store.rename(src.folder, dst.folder)
-        return f"「{src.name}」改名成「{dst.name}」了。整个课程目录一起搬的,内容一个字节没动。"
+        # M6-6b:**表先改、目录后搬,在同一个事务里**——搬失败(OSError)表就回滚,
+        # 不会出现"归属到了新名字下、课却还叫老名字"。漏了这一步就是改名后课件凭空消失。
+        moved = shelf.count(store.label(src.folder))
+        with shelf.atomically():
+            shelf.relabel(store.label(src.folder), store.label(dst.folder))
+            store.rename(src.folder, dst.folder)
+        return (
+            f"「{src.name}」改名成「{dst.name}」了。整个课程目录一起搬的,内容一个字节没动。"
+            f"{_carried(moved)}"
+        )
 
     def delete_course(course: str, reason: str = "", undo: bool = False) -> str:
         """删掉一门课。**删的时候 reason 必填**:说清为什么删,三个月后回头看才看得懂
@@ -297,8 +342,13 @@ def _tool_functions(store: CourseStore) -> list[Callable]:
                     f"已经有一门课占着「{spot.name}」这个名字了,没恢复——"
                     f"盖上去会把现在那份弄丢。先给现在这门改个名(rename_course)再来。"
                 )
-            store.out_of_trash(trashed, spot.folder)
-            return f"「{spot.name}」拿回来了,一个字节没变。"
+            # 同改名:表先改回活着的键、目录后搬回来,一个事务。
+            key = store.label(trashed)
+            moved = shelf.count(key)
+            with shelf.atomically():
+                shelf.relabel(key, store.label(spot.folder))
+                store.out_of_trash(trashed, spot.folder)
+            return f"「{spot.name}」拿回来了,一个字节没变。{_carried(moved)}"
 
         if not reason.strip():
             return (
@@ -311,16 +361,110 @@ def _tool_functions(store: CourseStore) -> list[Callable]:
                     f"「{spot.name}」已经删过了,现在没有这门课。要拿回来就再调一次、带 undo=True。"
                 )
             return f"没有「{spot.name}」这门课,什么都没动。list_courses 看看有哪些。"
-        if store.into_trash(spot.folder, spot.name, reason) is None:
+        live = store.label(spot.folder)
+        moved = shelf.count(live)
+        trashed = store.into_trash(spot.folder, spot.name, reason)
+        if trashed is None:
             return (
                 f"「{spot.name}」没删——回收站的落点不在课程目录里面(有人把 "
                 f"{store.root.name}/.trash 换成了指到别处的链接?)。先看一眼那个目录。"
             )
+        # M6-6b:回收站的键(带时间戳)要等搬完才知道,所以这里是**目录先搬、表后改**。
+        # 表没改成就把目录搬回来再抛:宁可没删成,也不许归属还挂在活着的课名下
+        # ——那样同名再建一门课,旧课件就冒出来了(G8 点名的那条路)。
+        try:
+            shelf.relabel(live, store.label(trashed))
+        except sqlite3.Error:
+            store.out_of_trash(trashed, spot.folder)
+            raise
         return (
             f"删了「{spot.name}」,原因{OPEN}{_inline(reason)}{CLOSE}。"
             f"整个课程目录搬到一边存着、一个字节没销毁,"
-            f"删错的话再调一次、带 undo=True 就能原样拿回来。"
+            f"删错的话再调一次、带 undo=True 就能原样拿回来。{_carried(moved)}"
         )
+
+    def add_file(course: str, media_id: str, name: str) -> str:
+        """把收到的一份文件(课件 PDF、板书照片)归到一门课下面,以后 list_materials 列得出来。
+
+        media_id 是附件那行报告里 `id` 后面那串十六进制,**整串照抄**;name 用用户的叫法
+        (「第3讲」「期中复习提纲」),别拿 id 当名字。用户没说是哪门课的,先问一句,别猜。
+        **只记"这个 id 归哪门课、叫什么",不拷文件**——所以这里核对不了文件在不在、
+        是不是 PDF,读的时候(read_pdf / read_image)才知道。
+        这门课之前没有时会顺手新建,回话里会说一声。同一门课里名字重了、或者这份已经归过,都不归。
+        """
+        spot = store.locate(course)
+        if spot.folder is None:
+            return spot.error
+        if not is_media_id(media_id):
+            # 回显是模型可控文本:折行 + 中和 + 截短,伪造不出第二行、顶不穿预算。
+            return (
+                f"认不出这个 id:{OPEN}{clip(one_line(media_id), 20)}{CLOSE},没归。"
+                "它应该是附件那行报告里 id 后面那串十六进制(小写,6 到 64 位),整串照抄。"
+            )
+        label = normalize_name(name)
+        error = _material_name_error(label)
+        if error is not None:
+            return error
+        material = Material(name=label, media_id=media_id)
+        key = store.label(spot.folder)
+        # 查重和插入在同一把锁里(`atomically`):一条消息里并发的两次 add_file 不会一起查到"没有"。
+        with shelf.atomically():
+            clash = shelf.clash(key, material)
+            if clash is not None and clash.name == label:
+                return (
+                    f"「{spot.name}」下面已经有一份叫{OPEN}{_inline(label)}{CLOSE}的课件了"
+                    f"(id {clash.media_id}),没归——同名的两份,之后谁也说不清指的是哪份。"
+                    "换个名字,或者 list_materials 看一眼。"
+                )
+            if clash is not None:
+                return (
+                    f"这份(id {media_id})已经归在「{spot.name}」下面了,叫"
+                    f"{OPEN}{_inline(clash.name)}{CLOSE},没再归一次。"
+                )
+            existed = spot.folder.is_dir()
+            shelf.add(key, material)
+            if not existed:
+                store.create(spot.folder)
+        filed = (
+            f"归好了:{OPEN}{_inline(label)}{CLOSE}(id {media_id})放进「{spot.name}」。"
+            "只记了归属、没拷文件——文件在不在、是不是 PDF,读的时候才知道。"
+        )
+        if existed:
+            return filed
+        # ★ 同 append_to_note:打错课程名的唯一防线是说一声。
+        return (
+            f"「{spot.name}」这门课之前没有,给你新建了。{filed}"
+            "要是课程名打错了,rename_course 能改过来。"
+        )
+
+    def list_materials(course: str, page: int = 1) -> str:
+        """一门课下面归了哪些课件:每份的名字和 id。一页一页给(page 从 1 起)。
+
+        要看内容就按 id 读:PDF 用 read_pdf(id, 页码),图片用 read_image(id)。
+        课件里写了什么只能这样一页页看,不在任何搜索范围里。
+        """
+        spot = store.locate(course)
+        if spot.folder is None:
+            return spot.error
+        if not spot.folder.is_dir():
+            return _missing(spot)
+        listed = shelf.listed(store.label(spot.folder))
+        if not listed:
+            return (
+                f"「{spot.name}」下面还没有课件。收到文件后用 "
+                f'add_file("{spot.name}", id, "名字") 归进来。'
+            )
+        rows = [f"- {OPEN}{_inline(m.name)}{CLOSE} · id {m.media_id}" for m in listed]
+        shown, page, pages = page_of(rows, page, LIST_PER_PAGE)
+        # 这边**不标类型**:bundle 摸不到媒体池,核对不了;让模型在 add_file 时填一个 kind
+        # 就是把"猜"写成一个看起来很确定的标签(M5-5 那句:"我不知道"变成"我确定")。
+        # 所以把两条路和"拿不准先走哪条"说在抬头里——read_pdf 碰上图片会指路到 read_image。
+        head = (
+            f"「{spot.name}」下面归了 {len(listed)} 份课件,第 {page}/{pages} 页。"
+            "PDF 用 read_pdf(id, 页码) 看,图片用 read_image(id);"
+            "拿不准是哪种就先 read_pdf,不是 PDF 它会说。"
+        )
+        return "\n".join([head, *shown])
 
     return [
         _speak_errors(fn)
@@ -332,6 +476,8 @@ def _tool_functions(store: CourseStore) -> list[Callable]:
             search_notes,
             rename_course,
             delete_course,
+            add_file,
+            list_materials,
         )
     ]
 
@@ -412,7 +558,8 @@ def build(data_dir: Path, *, timezone: str) -> BundleRuntime:
     # 目录先建出来:用户要能在自己电脑上 cd 进去看自己的笔记、用编辑器直接改
     # (那正是选文件而不是 SQLite 的全部理由),空目录也得在。
     store.root.mkdir(parents=True, exist_ok=True)
-    return BundleRuntime(tools=_tool_functions(store))
+    # M6-6b:课件归属表和笔记同在课程根下(`.materials.sqlite`),理由见 materials.py。
+    return BundleRuntime(tools=_tool_functions(store, Materials(store.root)))
 
 
 def create_server(data_dir: Path, *, timezone: str) -> FastMCP:

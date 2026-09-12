@@ -20,6 +20,17 @@ dependencies = [
     # 直接 import 就显式声明);二是拿 150 行自己搓的 AES 换掉一个被反复审计过的实现,
     # 省的是依赖账上的一行,赔的是没人会再复核的位运算。
     "cryptography>=43",
+    # M6-6b 把 PDF 的一页画成图(模型只吃图片,三条直喂 PDF 的路 PLAN M6-6 里全试死了)。
+    # 选它的理由,逐条核过(2026-09-13,实际加载的是 pypdfium2 5.13.0 / PDFium 153.0.7999.0):
+    # - 许可:绑定 Apache-2.0 或 BSD-3-Clause;轮子里带的 PDFium 及其依赖(freetype、icu、
+    #   libjpeg-turbo、openjpeg、lcms、libpng、libtiff、abseil……)全是宽松许可,和 MIT 兼容。
+    #   PyMuPDF 是 AGPL,不行;pdf2image 要系统装 poppler,不行。
+    # - 零 Python 依赖、零系统依赖:linux x86_64 那个 .so 只链 libc / libm / libpthread /
+    #   libgcc_s / ld-linux(读 ELF 的 DT_NEEDED 核过),glibc 2.17 起;轮子 3.7 MB、装开 7 MB。
+    #   musllinux 也有轮子。**不需要 Pillow**:PNG 自己编(`steward/pdf.py` 里十几行 zlib)。
+    # - 渲染不是瓶颈:一页 A4 讲义渲染 3 ms、编 PNG 20 ms 上下。
+    # 它**不是线程安全的**(不加锁并发渲染实测进程直接崩),锁在 `steward/pdf.py`。
+    "pypdfium2>=5.13",
 ]
 
 [dependency-groups]
@@ -133,6 +144,11 @@ module = [
     # 它的 FastMCP 那一侧(`bundles/courses/server.py`)留宽松档。
     "lararium.docstore",
     "bundles.courses.store",
+    # M6-6b:PDF 光栅化那一层对外的形状是我们定的(`UnreadablePdf` / `page_count` /
+    # `render_page`),严格档的 tools.py 靠它;第三方的那一半被 ignore_missing_imports 关成
+    # Any,不会逼出 type: ignore。课件归属表(`Material` / `Materials`)判据同 courses.store。
+    "lararium.steward.pdf",
+    "bundles.courses.materials",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
@@ -140,5 +156,5 @@ warn_return_any = true
 
 # 第三方库没有完整 stub —— 这不是我们的锅,别让它污染信噪比
 [[tool.mypy.overrides]]
-module = ["fastmcp.*", "pydantic_ai.*", "mcp.*", "sqlite_vec", "model2vec.*"]
+module = ["fastmcp.*", "pydantic_ai.*", "mcp.*", "sqlite_vec", "model2vec.*", "pypdfium2.*"]
 ignore_missing_imports = true

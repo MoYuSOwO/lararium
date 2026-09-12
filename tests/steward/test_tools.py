@@ -2,6 +2,7 @@ import hashlib
 from pathlib import Path
 
 import pytest
+from tests import pdf_samples
 
 from lararium.db import connect
 from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN
@@ -74,7 +75,9 @@ def test_tool_function_order_is_fixed(tools):
     M5-22:web_fetch 追加在 web_search 之后,同一条规矩。
     M5-33:list_threads 追加在**末尾**——它和 open/close_thread 是一家,但位置按
     加入时间排,不按亲缘关系:挪到 close_thread 旁边会让后面五个工具的 schema
-    整体平移一格,那是每轮毁一次缓存。"""
+    整体平移一格,那是每轮毁一次缓存。
+    M6-6b:read_pdf 追加在**末尾**,不挪到 read_image 旁边——同一条理由(M6-6b 为此改了
+    这条测试:只在末尾加一个名字,前面十个一个没动)。"""
     names = [f.__name__ for f in tools.as_tool_functions()]
     assert names == [
         "current_time",
@@ -87,6 +90,7 @@ def test_tool_function_order_is_fixed(tools):
         "web_search",
         "web_fetch",
         "list_threads",
+        "read_pdf",
     ]
 
 
@@ -1249,3 +1253,220 @@ def test_a_refused_value_does_not_raise_the_untrusted_mark(tmp_path):
     searching(tmp_path, fake, on_untrusted=lambda: marks.append(1)).web_search("x", topic="娱乐")
 
     assert marks == []
+
+
+# ── M6-6b read_pdf:一页给一张图,和读图共用内部件,不共用接口 ────────────────
+#
+# **共用的是内部件**(id 的形状、从池子里取那一份、每轮的看图额度、拉闩那一步),
+# **不是接口**:`read_pdf(pdf_id, page)` 和 `read_image(image_id)` 各是各的工具(G7,
+# 用户原话「以后还有 read_docx 什么的也总不能混在一起吧」)。上面 read_image 那一节的
+# 测试**一条没改**——抽公共件之后它们原样绿,就是"行为逐字节不变"的第一份证据。
+
+
+def put_pdf(tmp_path, blob):
+    """按内容哈希落一份 PDF 进池子(和微信适配器落盘同一个形状),返回短 id。"""
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(blob).hexdigest()
+    (tmp_path / "media" / f"{digest}.pdf").write_bytes(blob)
+    return digest[:12]
+
+
+def test_read_pdf_hands_back_one_page_as_a_png_and_says_the_total(tmp_path, tools):
+    """★ 给**那一页**的图,并说**共几页**——模型拿着总数才知道还能往后翻几页。"""
+    pdf_id = put_pdf(tmp_path, pdf_samples.pdf(3))
+
+    result = tools.read_pdf(pdf_id, 2)
+
+    assert not isinstance(result, str), f"没交出图:{result}"
+    [image] = result.images
+    assert image.media_type == "image/png"
+    assert pdf_samples.png_size(image.data) == (1131, 1600)
+    assert "第 2 页" in result.text and "共 3 页" in result.text, result.text
+    assert pdf_id in result.text
+    assert str(result) == result.text, "落进起居注/日志的必须是这一行人话,不是一坨字节"
+
+
+def test_a_pdf_page_carries_the_same_framing_as_an_image(tmp_path, tools):
+    """★ 一页 PDF 画成图进模型,**就是**图片那个注入面:图里的字绕开了围栏/折行/中和/
+    来源标注全部四刀(M6-2)。所以框定语一个字都不能少——和 read_image 取的是同一句。"""
+    image_id = put_images(tmp_path, 1)[0]
+    pdf_id = put_pdf(tmp_path, pdf_samples.pdf(1))
+
+    picture = tools.read_image(image_id)
+    page = tools.read_pdf(pdf_id, 1)
+
+    assert picture.text.split("\n", 1)[1] == page.text.split("\n", 1)[1]
+
+
+@pytest.mark.parametrize("page", [0, -1, 4, 999])
+def test_a_page_out_of_range_is_refused_and_the_total_is_said(tmp_path, tools, page):
+    """页码超了(含 0 和负数)→ 人话 + **说共几页**。只说"没有这一页"的话,模型只能一页页
+    往回试,每次一个往返。"""
+    pdf_id = put_pdf(tmp_path, pdf_samples.pdf(3))
+
+    out = tools.read_pdf(pdf_id, page)
+
+    assert isinstance(out, str), f"第 {page} 页居然交出了图"
+    assert "共 3 页" in out, out
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../../prompts/character.default", "ab", "ab*", "abcdef/../../x", "'; DROP TABLE", "abcdef\n"],
+)
+def test_read_pdf_refuses_anything_that_is_not_a_hash(tmp_path, tools, bad_id):
+    """pdf_id 是模型可控文本,会被拿去当文件名的一部分。形状和 read_image 同一个常量;
+    这里用整串匹配,所以末尾带换行的也挡下(`re.match` 的 `$` 会放过它)。"""
+    put_pdf(tmp_path, pdf_samples.pdf(1))
+
+    out = tools.read_pdf(bad_id, 1)
+
+    assert isinstance(out, str) and "认不出" in out, out
+    assert "\n" not in out, "回显把模型给的换行原样带出来了"
+
+
+def test_read_pdf_says_plain_words_when_the_file_is_gone(tmp_path, tools):
+    """★ `add_file` 只记归属、核对不了 id 在不在池子里——**不存在的 id 在这一步被发现,
+    由 read_pdf 说出来**,而不是抛。"""
+    out = tools.read_pdf("ab" * 6, 1)
+
+    assert isinstance(out, str) and "没找到" in out, out
+
+
+@pytest.mark.parametrize(
+    ("suffix", "blob", "words"),
+    [
+        (".jpg", b"\xff\xd8\xff\xe0 photo", ("图片", "read_image")),
+        (".silk", b"#!SILK_V3 xxxx", ("语音",)),
+        (".mp4", b"\x00\x00\x00 ftypmp42", ("视频",)),
+        (".bin", b"%PDF-1.7 but stored as bin", ("认不出",)),
+    ],
+)
+def test_read_pdf_says_what_it_is_when_it_is_not_a_pdf(tmp_path, tools, suffix, blob, words):
+    """★ **认不出就说清它是什么,绝不兜底成另一种类型**(M5-5 真正的教训)。
+
+    图片要指路到 read_image;`.bin`(嗅不出魔数的)哪怕字节里有 `%PDF-` 也不去当 PDF 打开
+    ——"它像 PDF"是猜,而类型的权威是落盘时嗅出来的那个后缀。
+    """
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(blob).hexdigest()
+    (tmp_path / "media" / f"{digest}{suffix}").write_bytes(blob)
+
+    out = tools.read_pdf(digest[:12], 1)
+
+    assert isinstance(out, str), f"{suffix} 居然被当成 PDF 画出来了"
+    for word in words:
+        assert word in out, out
+
+
+@pytest.mark.parametrize(
+    ("blob", "page", "words"),
+    [
+        (pdf_samples.truncated(), 1, "坏"),
+        (pdf_samples.zero_pages(), 1, "坏"),
+        (b"", 1, "坏"),
+        (pdf_samples.encrypted(), 1, "密码"),
+        (pdf_samples.lying_count(), 2, "第 2 页"),
+    ],
+    ids=["截断", "零页", "空文件", "加密", "页树撒谎"],
+)
+def test_a_broken_pdf_becomes_a_sentence_not_an_exception(tmp_path, tools, blob, page, words):
+    """★ E2:坏 PDF 不许让异常逃出工具边界——逃出去这一轮就炸了,用户看到的是助手死掉。
+
+    五份都是真打过 pdfium 的样本(`tests/pdf_samples.py`),不是推演。
+    """
+    pdf_id = put_pdf(tmp_path, blob)
+
+    out = tools.read_pdf(pdf_id, page)
+
+    assert isinstance(out, str) and words in out, out
+
+
+def test_read_pdf_degrades_when_the_model_cannot_see(tmp_path):
+    """PDF 只能画成图才进得了模型(三条直喂的路 PLAN 里全试死了),视觉关着就读不了。"""
+    blind = wired(tmp_path, vision=False)
+    pdf_id = put_pdf(tmp_path, pdf_samples.pdf(1))
+
+    out = blind.read_pdf(pdf_id, 1)
+
+    assert isinstance(out, str) and "看不了图" in out
+
+
+def test_pdf_pages_and_images_share_one_quota_per_turn(tmp_path, tools):
+    """★ **一轮能进模型的图只有一份额度**:read_image 看了 3 张,read_pdf 就只剩 1 页。
+
+    两个工具各记一份的话一轮能进 8 张图——注入面不随轮次累积、L0 预算不被一轮顶穿,
+    靠的都是这一个数。
+    """
+    images = put_images(tmp_path, MAX_IMAGES_PER_TURN - 1)
+    pdf_id = put_pdf(tmp_path, pdf_samples.pdf(3))
+    tools.begin_turn()
+
+    for image_id in images:
+        assert not isinstance(tools.read_image(image_id), str)
+    last = tools.read_pdf(pdf_id, 1)
+    refused = tools.read_pdf(pdf_id, 2)
+
+    assert not isinstance(last, str), f"额度还剩一张,却拒了:{last}"
+    assert isinstance(refused, str), "看图用掉的额度没算到 PDF 头上"
+    assert str(MAX_IMAGES_PER_TURN) in refused, f"拒绝了却没说清上限是多少:{refused}"
+
+
+def test_pdf_pages_eat_the_same_quota_that_images_use(tmp_path, tools):
+    """反方向:PDF 翻满一轮之后,read_image 也看不了了。"""
+    image_id = put_images(tmp_path, 1)[0]
+    pdf_id = put_pdf(tmp_path, pdf_samples.pdf(MAX_IMAGES_PER_TURN))
+    tools.begin_turn()
+
+    for page in range(1, MAX_IMAGES_PER_TURN + 1):
+        assert not isinstance(tools.read_pdf(pdf_id, page), str)
+
+    assert isinstance(tools.read_image(image_id), str), "PDF 用掉的额度没算到看图头上"
+
+
+def test_a_refused_pdf_page_does_not_eat_the_quota(tmp_path, tools):
+    """读不了的不扣额度(同 read_image 那条):页码超了、坏 PDF、错 id,都没有图进上下文。"""
+    good = put_pdf(tmp_path, pdf_samples.pdf(1))
+    broken = put_pdf(tmp_path, pdf_samples.truncated())
+    tools.begin_turn()
+
+    for _ in range(MAX_IMAGES_PER_TURN):
+        tools.read_pdf(good, 9)
+        tools.read_pdf(broken, 1)
+        tools.read_pdf("ff" * 6, 1)
+
+    assert not isinstance(tools.read_pdf(good, 1), str)
+
+
+def test_only_a_page_that_really_went_in_raises_the_untrusted_mark(tmp_path):
+    """闩的位置和 web_fetch 一致:放在"确实有图要进上下文"之后——读不了时回的全是我们
+    自己的字,拉高是误伤。(拉高本身由 test_loop 那条拿副作用钉着。)"""
+    marks = []
+    tools = wired(tmp_path, vision=True, on_untrusted=lambda: marks.append(1))
+    good = put_pdf(tmp_path, pdf_samples.pdf(2))
+    broken = put_pdf(tmp_path, pdf_samples.encrypted())
+
+    tools.read_pdf(good, 5)
+    tools.read_pdf(broken, 1)
+    assert marks == [], "什么都没进上下文就拉高了"
+
+    tools.read_pdf(good, 1)
+    assert marks == [1]
+
+
+def test_read_pdf_docstring_says_this_turn_only_and_how_to_keep_what_matters(tools):
+    """★ docstring 就是工具 schema,是唯一能在模型决定之前说上话的地方。
+
+    - 不调就等于没看过(和 read_image 同一条最要紧的话);
+    - **图只在这一轮**进模型,之后的轮里没有;要留下的当场说,或者 append_to_note 写进笔记;
+    - **看过的页不会留下文字,之后搜不到**——这一轮不转文字、不建缓存(那是 6c 的事),
+      所以绝不许暗示"能搜课件内容";
+    - 数字不写进 docstring(同 read_image:两处维护同一个事实)。
+    """
+    doc = tools.read_pdf.__doc__ or ""
+
+    assert "没看过" in doc
+    assert "这一轮" in doc and "append_to_note" in doc
+    assert "搜不到" in doc
+    assert "共几页" in doc
+    assert str(MAX_IMAGES_PER_TURN) not in doc

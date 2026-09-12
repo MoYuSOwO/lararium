@@ -26,7 +26,7 @@ _KIND_WORDS: dict[str, str] = {
 # `(视频 · media/xxx)` 后面什么都没有,等于让模型自己猜有没有路——猜"有"就去试一个
 # 不存在的工具,猜"没有"就对着一行引用编内容。**有路的说清怎么走,没路的说清没有。**
 #
-# 图片那句里带工具名,是因为**它是唯一有路的那一种**:图不再在到达轮被塞进上下文,
+# 图片那句里带工具名,是因为**它是有路的那一种**(M6-6b 起 PDF 也有,见 `_PDF_HINT`):图不再在到达轮被塞进上下文,
 # 模型不调 `read_image` 就等于没看过。`{id}` 由 `as_line()` 填成短 id
 # ——让模型照抄,别让它自己从别处拼。
 _KIND_HINTS: dict[str, str] = {
@@ -37,6 +37,16 @@ _KIND_HINTS: dict[str, str] = {
     "file": "文件存着,里面写了什么我读不了——现在没有读文件的路",
     "video": "视频存着,里面是什么我读不了——现在没有读视频的路",
 }
+# M6-6b:**PDF 有路了**(`read_pdf`),所以它不能再跟着"文件"那句说"没有读文件的路"
+# ——那句从那一刻起就是假话,而模型会信它、永远不去调。
+#
+# **按 media_type 挑,不按 kind**:微信那头叫 FILE 的东西什么都可能是,只有嗅出来确实是
+# PDF 的才有路;一份认不出来的文件照旧说读不了(不许把"不知道是什么"兜底成 PDF,M5-5)。
+# 反过来,微信叫 IMAGE、字节却是 PDF 的那种,也指到 read_pdf——指到 read_image 只会换回
+# 一句"不是图片"。页码给个能照抄的 1,并说清一次一页、会报共几页:模型第一次调的时候
+# 还不知道这份有几页。
+PDF_MEDIA_TYPE = "application/pdf"
+_PDF_HINT = '要看里面写了什么就调 read_pdf("{id}", 1)——一次一页,它会说共几页'
 # 文件名的上限。名字也是长度输入,而那行报告**每一轮都在 L0 里付钱**。
 MAX_NAME_CHARS = 60
 # 文件名里一律丢掉的那几类字符。**丢掉,不转义。**
@@ -80,6 +90,27 @@ _MEDIA_TYPE_BY_SUFFIX: dict[str, str] = {v: k for k, v in SUFFIXES.items()}
 SHORT_ID_CHARS = 12
 # 一条消息最多挂几个附件。信封是所有外部输入的入口,列表长度也是输入。
 MAX_ATTACHMENTS = 8
+
+# 一份媒体的 id 长什么样——**全仓库只有这一处写着**(M6-6b 从 `steward/tools.py` 搬来)。
+#
+# 它是**模型可控文本**,而它会被当成文件名的一部分用(按前缀 glob 池子)。只认十六进制:
+# 路径分隔符、`..`、glob 通配符一个都进不来。下界 6 位是为了挡住"给个 a 就把 media/
+# 底下第一张捞出来"。
+#
+# **为什么住在这里**:三个地方要认它——Steward 侧的 `read_image` / `read_pdf`,和学习
+# bundle 的 `add_file`(它把 id 存进归属表,之后原样交给 `read_pdf`)。bundle import
+# 不到 steward(`.importlinter`),而信封这一层两边都够得着;id 本来就是信封那行报告
+# 发出去的东西(`Attachment.short`)。各写一份的那天就开始漂,漂的样子是「add_file 收下的
+# id,read_pdf 认不出来」。
+MEDIA_ID_RE = re.compile(r"^[0-9a-f]{6,64}$")
+
+
+def is_media_id(text: str) -> bool:
+    """整串是不是一个媒体 id。**整串匹配**,不是 `MEDIA_ID_RE.match`:`$` 会放过末尾一个
+    换行,而 `add_file` 要把 id 存进表、之后渲染进一行一条的列表——带着换行进去就能伪造出
+    下一行。(`read_image` 用的是 `.match`,M6-6b 按"行为逐字节不变"没动它:在它那里末尾
+    换行只会让 glob 找不到文件,回一句"没找到"。)"""
+    return MEDIA_ID_RE.fullmatch(text) is not None
 
 
 def media_type_of_suffix(suffix: str) -> str | None:
@@ -161,7 +192,7 @@ class Attachment(BaseModel):
 
         ★ **M6-2:这一行要够模型据此决定要不要去取它。** 四样各有各的理由:
 
-        - **类型**——它决定有没有路(只有图片有);
+        - **类型**——它决定有没有路(图片有;M6-6b 起 PDF 也有,按 media_type 认);
         - **名字**——`id` 是把手,名字才是人看的:模型要说得出「你发的那份第3讲.pdf」;
         - **完整的 id,不带省略号**——12 位就是取回原件要的全部。`…` 让模型以为拿到的是
           残件,这不是推测:M5-5 补那一轮,回绝措辞里的 `…` 让它认定"id 被截断了",
@@ -173,9 +204,10 @@ class Attachment(BaseModel):
         if self.name:
             fields.append(self.name)
         fields.append(f"id {self.short}")
-        # `.format` 只对图片那句起作用(别的句子里没有占位符),不是巧合:
-        # 有路的那一种才需要把 id 复述一遍给模型照抄。
-        fields.append(_KIND_HINTS[self.kind].format(id=self.short))
+        # `.format` 只对有路的那几句起作用(别的句子里没有占位符),不是巧合:
+        # 有路的才需要把 id 复述一遍给模型照抄。
+        hint = _PDF_HINT if self.media_type == PDF_MEDIA_TYPE else _KIND_HINTS[self.kind]
+        fields.append(hint.format(id=self.short))
         return f"({' · '.join(fields)})"
 
 

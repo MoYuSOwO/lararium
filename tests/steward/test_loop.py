@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from bundles.memory.server import build_memory_components, memory_tool_functions
+from tests import pdf_samples
 
 from lararium import db as db_module
 from lararium.config import Settings
@@ -103,6 +104,9 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         # M5-33:list_threads 追加在内置那一段的末尾——按加入时间排,不按"它和
         # open/close_thread 是一家"排;挪过去会让后面的工具整体平移一格。
         "list_threads",
+        # M6-6b:read_pdf 同样追加在内置那一段的末尾,不挪到 read_image 旁边
+        # (M6-6b 为此改了这条测试:只加这一个名字,前后顺序一个没动)。
+        "read_pdf",
         "propose_fact",
         "list_pending",
     ]
@@ -1216,6 +1220,64 @@ async def test_reading_an_image_raises_the_untrusted_mark(steward_factory, tmp_p
     tool(steward, "propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1
+
+
+def _put_pdf(tmp_path, blob):
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(blob).hexdigest()
+    (tmp_path / "media" / f"{digest}.pdf").write_bytes(blob)
+    return digest[:12]
+
+
+async def test_reading_a_pdf_page_raises_the_untrusted_mark(steward_factory, tmp_path):
+    """★ M6-6b 第 2 处论证选的那一边:**一页 PDF 画成图进模型,和一张图是同一个注入面**。
+
+    PLAN 里「不拉不可信闩:课件是用户自己给的材料」那句,讲的是 6c 转出来的**文字**
+    ——那份文字读的时候还要过围栏 + 中和 + 来源标注。**页图一刀都不过**(M6-6b 没有文字),
+    而 M6-2 立的规矩是"每一张进模型的图都拉高"。PDF 还常常是转发来的(群里的讲义、网上
+    下的资料),"用户给的"不等于"用户写的"。不拉的话,把一张注入图包进 PDF 就绕开了
+    read_image 那把闩——两个出口一严一松,正是 M4-4 / M5-5 栽过的形状。
+
+    判据取副作用:同一轮里 `propose(user_stated)` 落进 pending,不看返回文本。
+    """
+    steward, _ = steward_factory(vision=True)
+    pdf_id = _put_pdf(tmp_path, pdf_samples.pdf(2))
+    await start_turn(steward)
+
+    tool(steward, "read_pdf")(pdf_id, 1)
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert len(steward.gate.pending()) == 1
+
+
+async def test_a_pdf_that_could_not_be_read_leaves_the_turn_trusted(steward_factory, tmp_path):
+    """反向:加了密码、一页都没画出来——什么都没进上下文,这一轮照旧可信,提案照旧放行。"""
+    steward, _ = steward_factory(vision=True)
+    pdf_id = _put_pdf(tmp_path, pdf_samples.encrypted())
+    await start_turn(steward)
+
+    out = tool(steward, "read_pdf")(pdf_id, 1)
+    tool(steward, "propose_fact")(**ALLERGY)
+
+    assert "密码" in out
+    assert steward.gate.pending() == []
+
+
+async def test_a_pdf_page_is_journalled_as_not_replayable(steward_factory, tmp_path):
+    """带字节的结果不许照着一行字回放(同 read_image 那条):重试那一轮会把一页课件
+    悄悄换成一句「附上第 1 页」,模型不会知道自己少看了一页。"""
+    steward, _ = steward_factory(vision=True)
+    pdf_id = _put_pdf(tmp_path, pdf_samples.pdf(1))
+    steward._active_envelope_id = "env-pdf"
+    wrapped = {f.__name__: f for f in steward.all_tools()}
+
+    wrapped["read_pdf"](pdf_id, 1)
+
+    executed = [
+        e["payload"] for e in steward.journal.replay("env-pdf") if e["kind"] == "tool_executed"
+    ]
+    assert [(p["tool"], p["replayable"]) for p in executed] == [("read_pdf", False)]
+    assert "PNG" not in str(executed[0]["result"]), "字节顺着 result 溜进起居注了"
 
 
 # ── M5-21:web_search 是不可信闩的第一个新来源 ────────────────────────────

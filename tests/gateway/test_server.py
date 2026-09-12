@@ -80,6 +80,9 @@ def test_bundle_tool_order_memory_first_then_finance_then_recipes_then_courses(t
 
     **M6-6a 又改了这条测试,同样如实说明**:学习 bundle 的 7 个工具追加在 recipes 之后,
     上面 20 个一格没动(名字逐条保留,只在末尾加);测试名跟着加一段 `_then_courses`。
+
+    **M6-6b 第三次改,只在末尾加两个名字**:课件那两个工具追加在学习 bundle 自己那一段的
+    末尾(那一段本来就在最后,所以前面 27 个一格没动);测试名不用改。
     """
     from lararium.gateway.server import _assemble_bundle_tools
 
@@ -113,6 +116,8 @@ def test_bundle_tool_order_memory_first_then_finance_then_recipes_then_courses(t
         "search_notes",  # courses[4]
         "rename_course",  # courses[5]
         "delete_course",  # courses[6]
+        "add_file",  # courses[7] —— M6-6b 课件,只追加在末尾
+        "list_materials",  # courses[8]
     ]
 
 
