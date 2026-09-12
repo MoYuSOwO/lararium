@@ -97,6 +97,10 @@ def test_tool_order_is_frozen_and_matches_manifest(runtime):
         # M6-3:收入/退款那两个,同样只追加在末尾,前五位一个都没动
         "record_income",
         "list_income",
+        # M6-4:预算那三个,同样只追加在末尾,前七位一个都没动
+        "set_budget",
+        "list_budgets",
+        "remove_budget",
     ]
     assert got == list(manifest["tools"])
 
