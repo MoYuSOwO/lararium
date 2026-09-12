@@ -7129,3 +7129,73 @@ POST /ilink/bot/sendmessage
 
   **动手前先把判据写出来给复核方看,别直接交实现。** 在一条修复里临时发明守卫
   正是 M5-11 那个错的形状。
+
+- **M6-5 语音听不懂——不是缺 ASR,是微信转好的文字我们没读**
+
+  用户:「你的 asr 也没加 语音识别 我发语音她好像还搞不定」。
+  **查下来根本不用做 ASR。**
+
+  ### 真机证据:语音压根没进来
+
+  6 天 68 轮,`data/media/` 里只有 3 张图、**零条音频**;
+  `lararium-wechat` 的日志里 6 天**一次没提过 voice/silk/audio**。
+  而 `envelope.SUFFIXES` 里 `audio/silk` 是有的——落盘那层认得,**是更前面就丢了**。
+
+  ### 官方源码给的答案(`npm pack @tencent-weixin/openclaw-weixin`,源码是权威的)
+
+  ```javascript
+  // dist/src/messaging/inbound.js:150
+  if (item.type === MessageItemType.VOICE && item.voice_item?.text) {
+      return item.voice_item.text;        // ← 微信自己转好的文字
+  }
+  // dist/src/messaging/process-message.js:78
+  hasDownloadableMedia(i.voice_item?.media) && !i.voice_item?.text
+  //                                           ↑ 只在没有 text 时才当媒体下载
+  ```
+
+  **微信自己做了语音转文字,放在 `voice_item.text`。** 而我们取文字那一支只认 `TEXT`:
+
+  ```python
+  parts = [str(item.get("text_item", {}).get("text", ""))
+           for item in item_list if item.get("type") == _ITEM_TYPE_TEXT]   # ← 只认 TEXT
+  ```
+
+  语音条目于是掉到 `_media_refs`,而那里**两处 `continue` 都不打日志**
+  ——所以"日志里零次提到 voice"既可能是没转发,也可能是我们静默丢了,**分不出来**。
+  这和 M5-4 修的是同一类病(图片当初就是被协议层 `if not text: continue` 静默整条丢掉的)。
+
+  ### 要做的
+
+  1. **取文字那一支加上语音**:`type == VOICE` 且 `voice_item.text` 非空 → 那就是这条消息的文字。
+     **和 TEXT 那支拼成同一个 `content`**,顺序按 `item_list` 原序,别把语音的话排到最后。
+  2. **有 `text` 就不当媒体下载**(照官方那个 `&& !i.voice_item?.text`)。
+     一段语音又存一份 silk 又给一份文字,存的那份没人读——按 G6,它没有消费者。
+  3. **没有 `text` 的语音**(微信没转出来,比如太长或太吵)才走媒体那一支。
+     这时候**模型拿不到内容**,所以那行占位文本要说实话:
+     不是"(语音 · media/xxx)"就完了,要让她知道**这条语音没有文字、她听不了**
+     ——否则她会像 M5-19 之后那样对着一行占位符编内容。
+  4. **`_media_refs` 那两处 `continue` 必须打日志**(`logger.warning`,带上 `item.get("type")`
+     和有哪些键)。**这一条比上面三条都重要**:没有它,下一次协议变形又是一次
+     "六天之后用户来问我为什么不行,而日志里什么都没有"。
+  5. **语音的 `aes_key` 检查补上**(官方对语音是 `|| !voice?.media?.aes_key`,我们没有)。
+
+  ### 验收口径
+
+  - 造一条 `type=3` + `voice_item.text="麦当劳 45.5"` 的报文 → `content` 里有这句话,
+    **且 `attachments` 是空的**(没有 text 才下载);
+  - 造一条 `type=3` 有 `media` 无 `text` → 走媒体那一支,占位文本**说得出"没有文字"**;
+  - 造一条 `type=3` 既无 `media` 也无 `text` → **打一条 warning**,不静默;
+  - 文本 + 语音混在一条消息里 → 两段都在 `content` 里,**顺序和 `item_list` 一致**;
+  - 现有图片那条路逐字不变(拿现有测试当金样)。
+
+  ### 真机冒烟(验收方打不了,要用户配合)
+
+  **让用户发一条语音**,然后看:`content` 里有没有转出来的文字、
+  `data/media/` 有没有多一个文件(不该多)、日志里有没有 warning。
+  **这一条只有用户能打**,写进 REVIEW 时注明。
+
+  ### 明确不做
+
+  **不做 ASR。** 微信已经转了;真遇到它转不出来的语音,正确的回话是"这条我听不了,
+  你打字说一下"——而不是在 2C2G 的机子上塞一个 whisper。
+  真到了那一步再说,而现在连"微信转不出来"发生的频率都没有数。
