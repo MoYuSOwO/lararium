@@ -7,7 +7,7 @@ from typing import Any, Literal
 from lararium.config import Settings
 from lararium.db import transaction
 from lararium.envelope import Envelope
-from lararium.steward.assembler import Turn, assemble, journalable_messages
+from lararium.steward.assembler import Turn, assemble
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal, estimate_tokens
 from lararium.steward.model import ModelCallError, ModelClient, format_cache_log
@@ -16,7 +16,7 @@ from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
 from lararium.steward.tools import BuiltinTools
-from lararium.steward.vision import load_images
+from lararium.steward.vision import unreadable_notes
 from lararium.steward.websearch import TavilyExtract, TavilySearch
 
 logger = logging.getLogger("lararium")
@@ -164,7 +164,7 @@ class Steward:
                         "positional": [str(a) for a in args],
                         "result": str(result),
                         "replayed": replayed is not None,
-                        # M5-5:只有**纯文本结果**能回放。`look_at_image` 返回的
+                        # M5-5:只有**纯文本结果**能回放。`read_image` 返回的
                         # ImageReturn 带着字节,`str()` 出来是一行人话——照着它回放
                         # 等于把图悄悄换成一句话,而模型不会知道自己少看了一张。
                         # 它是纯读、无副作用,重试时真跑一遍才是对的。
@@ -288,6 +288,11 @@ class Steward:
         self._active_envelope_id = env.id
         # 重试是同一个信封:上一次尝试里见过不可信内容,这一次不能当没见过。
         self._adopt_untrusted_history(env.id)
+        # M6-2:本轮的看图额度清零(`MAX_IMAGES_PER_TURN` 现在由 `read_image` 按轮数)。
+        # **和不可信标记刻意相反**:那个按信封继承(见过就是见过),这个按尝试重置
+        # ——上一次尝试的那几张图跟着那个失败的请求一起没了,不重置的话一次 429 之后
+        # 这一轮就再也看不了图,而症状是"它忽然不看图了",没有任何报错。
+        self.tools.begin_turn()
 
         # M3-3:认领后把当前开着的話头**冻结**进 meta——定时/事件信封也能带上。
         # 冻结的是此刻的快照,历史轮渲染的是这份,不是未来的最新(M3 全局约束第 2 条)。
@@ -315,10 +320,11 @@ class Steward:
             prefix_text = self.persona + directory + ledger_text
             # M3-6:L1(压缩索引块)供数给 assemble;一轮算一次,预算和渲染共用。
             l1_text = self.journal.l1_block(self.settings.compact_index_days)
-            # M5-5:图只在**到达的这一轮**取字节送进模型;历史轮只留那行文本引用
-            # (约束 1)。取不到 / 视觉关着 / 超张数上限都走人话,不抛异常(不许崩)。
-            images, image_notes = load_images(
-                media_dir=self.settings.data_dir / "media",
+            # M6-2:**到达轮不再取字节。** 附件那几行报告已经在 `env.content` 里
+            # (类型 · 文件名 · 完整 id · 能拿它干什么),字节要等模型自己调 `read_image`
+            # 才进上下文。这里只补一句"哪几张它根本读不了"——那是只有 Steward 这一侧
+            # 知道的事(视觉开关、送得进去的格式清单),适配器写不出来。
+            image_notes = unreadable_notes(
                 attachments=env.attachments,
                 enabled=self.settings.vision,
             )
@@ -330,7 +336,6 @@ class Steward:
                 l0=self._recent_turns(prefix_text, l1_text),
                 envelope=env,
                 timezone=self.settings.timezone,
-                images=images,
                 image_notes=image_notes,
             )
             self.journal.append(
@@ -338,9 +343,11 @@ class Steward:
                 "prompt",
                 {
                     "system_prompt": ctx.system_prompt,
-                    # 约束 3:落引用 + 哈希,**不落字节**。字节在 media/ 下按哈希不可变;
-                    # 塞进来就是存第二遍,还会顺着 SEARCHABLE_KINDS 进全文索引。
-                    "messages": journalable_messages(ctx.messages),
+                    # 约束 3(落引用不落字节)在 M6-2 之后是**结构事实**:组装器挂不上
+                    # 图片,所以 ctx.messages 里全是字符串,不需要再擦一遍
+                    # (`journalable_messages` 因此删掉了——一个永远走不到的分支)。
+                    # 唯一那条真带字节的路是工具返回,它落的是 `str(result)` 那行人话。
+                    "messages": ctx.messages,
                 },
             )
 

@@ -1,12 +1,12 @@
 """报文级测试:断言真正发出去的 HTTP body。"""
 
-import base64
 import json
 from typing import Any
 
 import httpx
 import pytest
 
+from lararium.envelope import Attachment
 from lararium.steward.assembler import AssembledContext
 from lararium.steward.model import ModelCallError, unwrap_tool_args
 from lararium.steward.vision import ImagePart, ImageReturn
@@ -151,67 +151,45 @@ async def test_history_tool_exchange_is_sent_as_native_tool_calls(wire):
     assert all("record_expense" not in (m.get("content") or "") for m in msgs)
 
 
-# ── M5-5 读图 ───────────────────────────────────────────────────────────
+# ── M5-5 读图 → M6-2 报 id ───────────────────────────────────────────────
 
 
-def ctx_with_image(*, history: tuple[tuple[str, str], ...] = ()) -> AssembledContext:
+def ctx_with_an_image_attachment(*, history: tuple[tuple[str, str], ...] = ()) -> AssembledContext:
+    """一条"带了图"的到达轮——**按 M6-2 的形状**:正文里只有那行报告,没有字节。"""
+    a = Attachment(kind="image", sha256="ab" * 32, media_type="image/jpeg")
     messages: list[dict[str, Any]] = []
     for user, assistant in history:
         messages.append({"role": "user", "content": user})
         messages.append({"role": "assistant", "content": assistant})
-    messages.append(
-        {
-            "role": "user",
-            "content": "这是啥",
-            "images": [ImagePart(sha256="ab" * 32, media_type="image/jpeg", data=b"JPEGBYTES")],
-        }
-    )
+    messages.append({"role": "user", "content": f"这是啥\n{a.as_line()}"})
     return AssembledContext(system_prompt=PREFIX, messages=messages)
 
 
-async def test_the_image_actually_goes_out_on_the_wire(wire):
-    """报文级:图真的发出去了,而且和那句正文在**同一条 user 消息**里。
+async def test_no_image_ever_rides_on_the_arriving_turn(wire):
+    """★ **报文级证明:到达轮整份报文里一个 image_url 都没有。**
 
-    断言发出去的字节而不是内部状态——"框定语和图在一起"这条,只有在这里才算证到。
+    这条替掉了 M5-5 那两条(「图真的发出去了」+「历史轮不带字节」):那两条测的是
+    "字节只出现在最后一条 user 消息上",而 M6-2 之后**哪一条都不许有**——组装器已经
+    没有挂载点了(`test_the_assembler_cannot_carry_a_single_byte_of_image`),这里再从
+    发出去的那份字节上确认一遍。图片唯一的那条路是工具返回,见下面那条。
+
+    **报文形状也跟着回到了纯字符串**:从前带图的轮次发的是 `[正文, 图…]` 的多模态
+    列表,现在每一条 content 都是字符串。这不是顺手的简化——那一支的输入永远是空的,
+    留着它就是留一扇随手能推开的门。
     """
     client, bodies = wire
-    await client.run(ctx_with_image(), [], [])
+    await client.run(ctx_with_an_image_attachment(history=(("昨天那张呢", "看过了"),)), [], [])
 
-    last = bodies[-1]["messages"][-1]
-    assert last["role"] == "user"
-    kinds = [p["type"] for p in last["content"]]
-    assert kinds == ["text", "image_url"], f"报文形状不对:{kinds}"
-    assert last["content"][0]["text"] == "这是啥"
-    assert last["content"][1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
-    assert base64.b64decode(last["content"][1]["image_url"]["url"].split(",", 1)[1]) == b"JPEGBYTES"
-
-
-async def test_history_turns_carry_no_image_bytes(wire):
-    """★ 约束 1 的报文级证明:历史轮里一个字节的图都不许有。
-
-    只看组装器的结构断言不够——真正要证的是"发出去的那份"里没有。图片留在历史里的话,
-    成本和注入面都会**永久地**乘进后续每一轮。
-    """
-    client, bodies = wire
-    await client.run(
-        ctx_with_image(history=(("昨天那张呢", "(图片 · media/abababababab…)"),)), [], []
-    )
-
-    parts = [
-        p
-        for m in bodies[-1]["messages"]
-        if isinstance(m.get("content"), list)
-        for p in m["content"]
-    ]
-    assert [p["type"] for p in parts] == ["text", "image_url"], "整份报文里图不止一张"
-    earlier = bodies[-1]["messages"][:-1]
-    assert all(isinstance(m.get("content"), str) for m in earlier), f"历史轮不是纯文本:{earlier}"
+    msgs = bodies[-1]["messages"]
+    assert all(isinstance(m.get("content"), str) for m in msgs), f"报文里有多模态部件:{msgs}"
+    assert "image_url" not in json.dumps(msgs), "到达轮的报文里有图"
+    assert "id abababababab" in msgs[-1]["content"], "那行报告没上报文"
 
 
 async def test_a_tool_can_hand_an_image_back_without_putting_bytes_in_the_journal(
     http_spy_factory, reply_factories
 ):
-    """★ 「重新看一眼」这条路要同时满足两件事,而它们互相拉扯:
+    """★ 「取图」这条路要同时满足两件事,而它们互相拉扯:
 
     图必须真的到达模型(否则这个工具是摆设),但**进起居注的那一份不能是字节**
     ——`tool_result` 会进全文索引、进 L0、被 replay 反复 json.loads。所以工具返回的
@@ -219,6 +197,9 @@ async def test_a_tool_can_hand_an_image_back_without_putting_bytes_in_the_journa
     字节走 content(那份只上报文)。
 
     这里断言的是**发出去的字节**和**上报的 tool_events**两头,不是内部状态。
+
+    **M6-2 之后这是图片进模型的唯一一条路**(到达轮那条拆了),所以这条测试从"重看那条
+    支路也得守规矩"升格成了"图片这件事的全部"。
     """
     text_reply, tool_call_reply = reply_factories
     bodies: list[dict[str, Any]] = []
@@ -228,19 +209,19 @@ async def test_a_tool_can_hand_an_image_back_without_putting_bytes_in_the_journa
         bodies.append(body)
         if not any(m.get("role") == "tool" for m in body["messages"]):
             reply = tool_call_reply()
-            reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = "look_at_image"
+            reply["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = "read_image"
             return httpx.Response(200, json=reply)
         return httpx.Response(200, json=text_reply("看到了"))
 
-    def look_at_image() -> Any:
-        """重新看一眼"""
+    def read_image() -> Any:
+        """看一眼那张图"""
         return ImageReturn(
-            text="(重新附上 media/abababababab…)",
+            text="(附上 id abababababab 这张图)",
             images=(ImagePart(sha256="ab" * 32, media_type="image/png", data=b"PNGBYTES"),),
         )
 
     client = http_spy_factory(handler)
-    reply = await client.run(ctx(), [look_at_image], [])
+    reply = await client.run(ctx(), [read_image], [])
 
     # ① 图真的发出去了(第二次请求里)
     parts = [
@@ -253,7 +234,7 @@ async def test_a_tool_can_hand_an_image_back_without_putting_bytes_in_the_journa
 
     # ② 要落起居注的那一份是一行人话,没有任何字节
     results = [e for e in reply.tool_events if e["type"] == "tool_result"]
-    assert results and results[0]["content"] == "(重新附上 media/abababababab…)"
+    assert results and results[0]["content"] == "(附上 id abababababab 这张图)"
 
 
 # ── M5-13:工具重试耗尽时,把重试提示原文捞出来 ──────────────────────────

@@ -337,6 +337,10 @@ class WeChatAdapter:
             kind=ref.kind,
             sha256=hashlib.sha256(data).hexdigest(),
             media_type=_sniff(data, ref.kind),
+            # M6-2:原名**只进那行报告**,给人看。落盘位置仍由哈希算、类型仍由魔数嗅
+            # ——上面 `_sniff` 那句「不信对方给的文件名」一个字都没松:名字在这里
+            # 影响不了任何决定,洗干净(`Attachment._clean_name`)之后纯展示。
+            name=ref.file_name,
         )
         self._write_once(attachment, data)
         return attachment
