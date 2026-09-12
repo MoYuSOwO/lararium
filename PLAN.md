@@ -6878,7 +6878,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   只有一个内部函数知道目录在哪——同 M6-5,同 M5-4 那条教训
   (`Attachment` 上根本没有可写的 path 字段)。
 
-  ### 工具:七个
+  ### 工具:bundle 侧八个,读课件走 Steward 侧那两个
 
   ```
   list_courses()                              有哪些课
@@ -6886,13 +6886,15 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   append_to_note(course, text)                追加一段
   replace_in_note(course, old, new)           定点改(匹配不上就拒绝)
   search_notes(query, course=None, page=1)    搜内容;不给 course 就全搜
-  list_materials(course, page=1)              这门课有哪些课件(每份几页也要给)
   list_materials(course, page=1)              这门课有哪些课件(名字 + id + 共几页)
-  （读课件走内置的 `read_pdf(id, page)` / `read_image(id)`——**都在 Steward 侧,见下**）
-  add_file(course, media_id, name)            **把微信发来的课件归到这门课下(只记归属,不拷字节)**
+  add_file(course, media_id, name)            把课件归到这门课下(**只记归属,不拷字节**)
   rename_course(old, new)                     改名(打错了得能救)
-  delete_course(course, reason, undo=False)   删 / 撤回——**移到回收站,不是删文件**
+  delete_course(course, reason, undo=False)   删 / 撤回(**移到回收站,不是删文件**)
   ```
+
+  **读课件不在这个 bundle 里**——`read_pdf(id, page)` / `read_image(id)` 是
+  **Steward 侧的内置工具**,因为转换要调模型而 bundle 不含 LLM(见下面那节)。
+  所以模型的动作链是:`list_materials(course)` 拿到名字 + id → `read_pdf(id, page)`。
 
   ### ★ 打错名字得能救——用户点出来的缺口
 
@@ -7364,7 +7366,9 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
     非法 `name`(`../x`、`.hidden`、空、超长)→ 拒绝;
     认不出的 `media_id` → 人话;**正则和 `look_at_image` 共用同一个常量**
     (加一条测试或机械检查钉住,别各写一份);
-  - **前缀影响(A1)**:新 bundle = 目录行 + 10 个工具 schema,前缀重建一次。
+  - **前缀影响(A1)**:新 bundle 目录行 + **bundle 侧 9 个工具** schema;
+    外加 Steward 侧 `read_pdf` 新增、`look_at_image` → `read_image` 改名。
+    前缀重建**一次**(同一个提交发布)。
 
 - **M6-7 结构化的事务 / 待办**——用户点的;**这是话头承不起的那一半(M5-32)**
 
