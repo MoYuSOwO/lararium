@@ -7003,6 +7003,27 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   **不许悄悄只送前 4 页然后装作读完了**(M5-5 的 `load_images` docstring 钉的那条:
   静默截断读起来和"就这些"一模一样)。
 
+  ### 模型读不了 PDF——**三条路全试死了,这是"必须先变成图"的全部依据**
+
+  用户问过两次「模型能不能读 pdf 之类的」。**不能。** 实测(2026-09-12,真 key):
+
+  ```
+  a. image_url 送 PDF              → 400「unsupported image」
+  b. file.file_data 送 PDF         → 400「unsupported file … webp, png, jp…」
+  c. POST /files 上传              → 400「unsupported file … formats: webp, png, jpeg, and gif」
+     (purpose=user_data,这个合法值是它自己在上一个错误里告诉我的——assistants 不支持)
+
+  另外 content part 只有三种:text / image_url / file
+  (故意传一个不存在的 type,错误里的 expected one of 就是权威清单)
+  ```
+
+  **它只吃那四种图片格式。** 所以 PDF 想进模型**必须先变成图**,
+  剩下的选择只是"变成图之后谁来读"。
+
+  **c 那条是复核方第一次漏掉的**:`/files` GET 回 200、`file_id` 字段也被接受,
+  **看着像有路,一直到真去上传才知道没有**。
+  ——纪律:**"看着像有路"和"有路"之间只差一次真请求,而那次请求很便宜。**
+
   ### 文字从哪来:**渲染成图,交给我们自己那个模型转,并且给它指令**
 
   **先说清这不是绕路,是唯一的路**:上面 ① 已经把三条"直接喂 PDF"全试死了。
