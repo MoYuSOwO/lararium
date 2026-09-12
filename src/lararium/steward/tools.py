@@ -1,3 +1,4 @@
+import hashlib
 import re
 from collections.abc import Callable
 from datetime import datetime
@@ -6,7 +7,7 @@ from re import sub
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from lararium.envelope import media_type_of_suffix
+from lararium.envelope import MEDIA_ID_RE, PDF_MEDIA_TYPE, is_media_id, media_type_of_suffix
 from lararium.steward.assembler import (
     FENCE_CLOSE,
     FENCE_OPEN,
@@ -14,6 +15,7 @@ from lararium.steward.assembler import (
     neutralize_model_text,
 )
 from lararium.steward.journal import Journal, SearchHit
+from lararium.steward.pdf import UnreadablePdf, page_count, render_page
 from lararium.steward.registry import Registry
 from lararium.steward.threads import ThreadInfo, Threads
 from lararium.steward.vision import (
@@ -22,6 +24,7 @@ from lararium.steward.vision import (
     ImageReturn,
     cannot_send,
     framing,
+    not_image_word,
 )
 from lararium.steward.websearch import (
     SEARCH_TIME_RANGES,
@@ -73,10 +76,8 @@ MIN_FETCH_CHARS = 120
 # 是有人在拿 data: blob 灌预算,而一次白花的往返也是一次额度。
 MAX_FETCH_URL_CHARS = 2000
 
-# read_image 的 image_id 是**模型可控文本**,而它会被当成文件名的一部分用。
-# 只认十六进制:路径分隔符、`..`、glob 通配符一个都进不来。下界 6 位是为了挡住
-# "给个 a 就把 media/ 底下第一张捞出来"。
-_IMAGE_ID_RE = re.compile(r"^[0-9a-f]{6,64}$")
+# read_image / read_pdf 的 id 形状在 `envelope.MEDIA_ID_RE`(M6-6b 从这里搬过去):
+# 学习 bundle 的 add_file 也要认它,而 bundle import 不到这个文件。
 
 
 def _paged_search(
@@ -229,6 +230,20 @@ def _rejected(name: str, given: str, allowed: tuple[str, ...], hint: str) -> str
         f"{name} 只认这几个值:{' / '.join(allowed)}。"
         f"你给的「{neutralize_fence(given[:40])}」不在里面,这次没去搜——{hint}。"
     )
+
+
+def _not_pdf(media_type: str | None, short: str) -> str:
+    """`read_pdf` 碰上不是 PDF 的东西时,说清**它到底是什么**,有路的指路。
+
+    **认不出就说认不出**(`media_type` 为 None 或嗅不出魔数的 octet-stream),不猜成 PDF,
+    也不猜成别的。词和 `read_image` 的回绝共用 `vision.not_image_word`,只多图片这一支
+    ——那边不会碰上图片,这边会,而图片有自己的路。
+    """
+    if media_type is None or media_type == "application/octet-stream":
+        return "格式我认不出来,不是能当 PDF 打开的东西,我读不了。"
+    if media_type.startswith("image/"):
+        return f'是一张图片,不是 PDF——看图用 read_image("{short}")。'
+    return f"是{not_image_word(media_type)},不是 PDF,我读不了。"
 
 
 def _is_fetchable_url(url: str) -> bool:
@@ -413,12 +428,10 @@ class BuiltinTools:
         """
         if not self.vision:
             return "当前模型看不了图,只能看那行引用。"
-        if not (self.media_dir and _IMAGE_ID_RE.match(image_id)):
+        if not (self.media_dir and MEDIA_ID_RE.match(image_id)):
             return f"认不出这个图片 id:{image_id[:20]}。它应该是那行报告里的一串十六进制。"
-        # glob 而不是拼后缀:短 id 不带后缀,而后缀由内容嗅探决定(jpg/png/webp…)。
-        # 通配符进不来——image_id 已经被 _IMAGE_ID_RE 限死成纯十六进制。
-        matches = sorted(self.media_dir.glob(f"{image_id}*")) if self.media_dir.is_dir() else []
-        if len(matches) != 1:
+        found = self._pool_file(image_id)
+        if found is None:
             return f"没找到 {image_id[:12]} 这张图(原件可能已经不在了)。"
         # **只认图片,和到达轮那个出口同一条规则**(`vision.cannot_send`,一个函数管
         # 两边)。两个出口各写一套的那天,总有一个
@@ -426,7 +439,7 @@ class BuiltinTools:
         # 一段语音、一份 PDF 都会被贴上 image/jpeg 交出去,而服务商回的是
         # `invalid image format`:这一轮当场死掉,用户看到的是一句全是黑话的
         # 「处理失败,已放弃」。真模型自己就走进去了(发一份 PDF 问「最大的一笔是多少」)。
-        media_type = media_type_of_suffix(matches[0].suffix)
+        media_type = media_type_of_suffix(found.suffix)
         reason = cannot_send(media_type)
         if reason is not None or media_type is None:
             # 措辞里**不带省略号**:实测模型会盯着那个 `…` 认定"图片 id 被截断了",
@@ -437,26 +450,120 @@ class BuiltinTools:
         # 都不扣额度(扣的话一份 PDF 加几个错 id 就能把这一轮的图额度吃光,而模型完全
         # 看不出自己为什么忽然"看不了图了")。**拒绝要说清**:静默返回一句没有图的话,
         # 读起来和"我看了,没什么"一模一样。
-        if self._images_this_turn >= MAX_IMAGES_PER_TURN:
+        if not self._images_left():
             return (
                 f"这一轮已经看了 {MAX_IMAGES_PER_TURN} 张图,到上限了——图按分辨率吃 token,"
                 "一轮最多这么多。剩下的先说说你想从哪张里看什么,或者下一轮再看。"
             )
-        # M5-18:**无条件**把这一轮拉成不可信。选的是严的那一支,理由:
-        # 图片是绕开全部文本防线的注入面(M5-5),而"这张图当初是哪一轮进来的"起居注里
-        # 现在查不到(envelope 事件不记 attachments,只能反扫 prompt 事件推)。
-        # 为"稍微宽松一点"付一次额外扫描不划算,而在注入面上"假设可信"是错的默认。
-        # 代价:重看过图的那一轮,propose 要走一次审批。哪天嫌烦了,升级路径是让
-        # envelope 事件记下 attachments,再按来源轮判。
+        digest = found.stem
+        return self._admit(
+            text=f"(附上 id {digest[:12]} 这张图)",
+            sha256=digest,
+            media_type=media_type,
+            load=found.read_bytes,
+        )
+
+    def read_pdf(self, pdf_id: str, page: int) -> Any:
+        """看一份 PDF 的**某一页**(page 从 1 数)。**PDF 不会自己进上下文,不调这个就等于没看过。**
+
+        pdf_id 是附件那行报告里 `id` 后面那串十六进制(归到课下的课件,list_materials
+        也列得出来),**整串照抄**。一次给一页的图,并告诉你这份共几页;页码超了会说共几页。
+        用户问的是文件里的东西(第几页讲了什么 / 这道题怎么做 / 帮我看看这份讲义),
+        **就先调它,再回答**——没调就不许说里面写了什么。
+
+        图**只在这一轮**进模型,之后的轮里就没了;**看过的页也不会留下文字,之后搜不到**。
+        要留下什么得当场说出来,或者用 append_to_note 写进那门课的笔记。
+        和看图共用一轮的张数上限(一页算一张),超了会拒绝并说清。
+        读不了的时候(不是 PDF、加了密码、文件坏了、原件不在)会回一句人话,照实告诉用户。
+        """
+        if not self.vision:
+            return "当前模型看不了图,而 PDF 只能一页页画成图来看,所以这份读不了。"
+        if not (self.media_dir and is_media_id(pdf_id)):
+            shown = neutralize_fence(_one_line(pdf_id)[:20])
+            return f"认不出这个文件 id:{shown}。它应该是那行报告里(或 list_materials 列出来的)那串十六进制,整串照抄。"
+        found = self._pool_file(pdf_id)
+        if found is None:
+            return f"没找到 id {pdf_id[:12]} 这份文件(原件可能已经不在了,或者 id 抄错了)。"
+        # ★ **认不出就说清它是什么,绝不兜底成另一种类型**(M5-5 真正的教训)。
+        # 类型的权威是落盘时嗅出来的后缀;一份 `.bin` 哪怕字节里有 `%PDF-` 也不去当 PDF 开
+        # ——"它像 PDF"是猜。图片指到 read_image,那才是它的路。
+        media_type = media_type_of_suffix(found.suffix)
+        if media_type != PDF_MEDIA_TYPE:
+            return f"id {pdf_id[:12]} {_not_pdf(media_type, pdf_id[:12])}"
+        try:
+            total = page_count(found)
+            if not 1 <= page <= total:
+                # 0、负数、超了都走这一句,**并说共几页**:只说"没有这一页",模型只能一页页
+                # 往回试,每次一个往返。
+                return f"id {pdf_id[:12]} 这份 PDF 共 {total} 页,没有第 {page} 页——页码从 1 数到 {total}。"
+            if not self._images_left():
+                return (
+                    f"这一轮已经看了 {MAX_IMAGES_PER_TURN} 张图(PDF 的一页也算一张),到上限了"
+                    f"——图按分辨率吃 token,一轮最多这么多。这份共 {total} 页,"
+                    "先说说要从哪几页里找什么,或者下一轮接着看。"
+                )
+            png = render_page(found, page)
+        except UnreadablePdf as exc:
+            # E2:坏 PDF(截断、加密、零页、某一页装不上)不许让异常逃出工具边界。
+            # 这里还没拉闩:读不了的时候回的全是我们自己的字,拉高是误伤(同 web_fetch)。
+            return f"id {pdf_id[:12]}:{exc}"
+        return self._admit(
+            text=f"(附上 id {pdf_id[:12]} 这份 PDF 的第 {page} 页,共 {total} 页)",
+            sha256=hashlib.sha256(png).hexdigest(),
+            media_type="image/png",
+            load=lambda: png,
+        )
+
+    # ── 读图和读 PDF 共用的内部件 ────────────────────────────────────────
+    #
+    # **共用的是内部件,不是接口**(G7):id 的形状(`envelope.MEDIA_ID_RE`)、从池子里取
+    # 那一份、每轮的看图额度、"一张图进上下文"那一步(拉闩 + 扣额度 + 框定)。
+    # 不合成一个 `read_file`——用户原话「以后还有 read_docx 什么的也总不能混在一起吧」;
+    # 两个签名各是真的(图片没有页码),docstring 各讲各的。
+    # 而额度**必须**是同一个计数:两个工具各记一份,一轮就能进 8 张图。
+
+    def _pool_file(self, media_id: str) -> Path | None:
+        """池子里按 id 找**恰好一份**;找不到、或者这个前缀撞上不止一份,都回 None。
+
+        调用方先用 `MEDIA_ID_RE` 核过形状、确认 `media_dir` 配了。
+        glob 而不是拼后缀:短 id 不带后缀,而后缀由内容嗅探决定(jpg/png/pdf…)。
+        通配符进不来——id 已经被限死成纯十六进制。
+        """
+        assert self.media_dir is not None
+        matches = sorted(self.media_dir.glob(f"{media_id}*")) if self.media_dir.is_dir() else []
+        return matches[0] if len(matches) == 1 else None
+
+    def _images_left(self) -> bool:
+        """这一轮还能不能再进一张图。**读图和读 PDF 问的是同一个数**(见上)。"""
+        return self._images_this_turn < MAX_IMAGES_PER_TURN
+
+    def _admit(
+        self, *, text: str, sha256: str, media_type: str, load: Callable[[], bytes]
+    ) -> ImageReturn:
+        """一张图进上下文的**唯一**出口:拉闩 → 取字节 → 扣额度 → 带框定。
+
+        M5-18:**无条件**把这一轮拉成不可信。选的是严的那一支,理由:
+        图片是绕开全部文本防线的注入面(M5-5),而"这张图当初是哪一轮进来的"起居注里
+        现在查不到(envelope 事件不记 attachments,只能反扫 prompt 事件推)。
+        为"稍微宽松一点"付一次额外扫描不划算,而在注入面上"假设可信"是错的默认。
+        代价:看过图的那一轮,propose 要走一次审批。哪天嫌烦了,升级路径是让
+        envelope 事件记下 attachments,再按来源轮判。
+        **M6-6b:PDF 的一页照样过这里**——画成图之后它就是一张图,图里的字一刀防线都不过
+        (理由写在 test_loop 那条 `test_reading_a_pdf_page_raises_the_untrusted_mark` 上)。
+
+        `load` 是个取字节的函数而不是字节本身:读图那条路从 M5-5 起就是"先拉闩、再读盘",
+        抽成公共件时顺序一格不动(硬口径:read_image 行为逐字节不变)。读 PDF 那边渲染
+        会失败,所以它先渲染、成了才走到这里——读不了的不拉闩、不扣额度。
+
+        **这条路必须带框定**,而 M6-2 之后它是**唯一**一条:图进上下文必带框定,
+        从"两个挂载点都记得带"变成了结构事实。
+        """
         self._on_untrusted()
-        data = matches[0].read_bytes()
-        digest = matches[0].stem
+        data = load()
         self._images_this_turn += 1
-        # **这条路必须带框定**,而 M6-2 之后它是**唯一**一条:图进上下文必带框定,
-        # 从"两个挂载点都记得带"变成了结构事实。
         return ImageReturn(
-            text=f"(附上 id {digest[:12]} 这张图)\n{framing(1)}",
-            images=(ImagePart(sha256=digest, media_type=media_type, data=data),),
+            text=f"{text}\n{framing(1)}",
+            images=(ImagePart(sha256=sha256, media_type=media_type, data=data),),
         )
 
     def web_search(
@@ -625,6 +732,7 @@ class BuiltinTools:
         M5-33:list_threads 追加在 web_fetch 之后——它和 open/close_thread 是一家,
         但**位置按加入时间排,不按亲缘关系**:挪到 close_thread 旁边好看,代价是
         后面所有工具的 schema 全平移一格,那是每轮毁一次缓存。
+        M6-6b:read_pdf 追加在 list_threads 之后,**不挪到 read_image 旁边**——同一条理由。
         open_threads() 不在这(是代码路径,组装器调)。
         """
         return [
@@ -638,4 +746,5 @@ class BuiltinTools:
             self.web_search,
             self.web_fetch,
             self.list_threads,
+            self.read_pdf,
         ]

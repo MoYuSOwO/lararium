@@ -1,13 +1,17 @@
+import re
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from lararium.envelope import (
     MAX_NAME_CHARS,
+    MEDIA_ID_RE,
     SUFFIXES,
     Attachment,
     Envelope,
+    is_media_id,
     media_type_of_suffix,
 )
 
@@ -250,3 +254,64 @@ def test_is_image_is_the_single_rule_for_what_may_reach_the_model(media_type, ex
     """
     a = Attachment(kind="image", sha256="ab" * 32, media_type=media_type)
     assert a.is_image is expected
+
+
+# ── M6-6b:PDF 有路了,那行报告得说出来;id 的形状只有一份 ─────────────────────
+
+
+def test_a_pdf_line_says_how_to_read_it_now_that_there_is_a_way():
+    """★ **有路的说清怎么走**(M6-2 那条规矩)。M6-6b 之前 PDF 那句是「现在没有读文件的路」
+    ——那时是实话;`read_pdf` 进了工具清单之后还这么说,就是那行报告在撒谎,而模型会信它、
+    永远不去调。完整 id 照样放进调用示例里,让它照抄。"""
+    line = Attachment(
+        kind="file",
+        sha256="77aa99bb00cc" + "0" * 52,
+        media_type="application/pdf",
+        name="第3讲.pdf",
+    ).as_line()
+
+    assert 'read_pdf("77aa99bb00cc"' in line, line
+    assert "读不了" not in line and "没有读文件的路" not in line, line
+    assert line.startswith("(文件 · 第3讲.pdf · id 77aa99bb00cc · ")
+
+
+def test_a_file_that_is_not_a_pdf_still_says_there_is_no_way():
+    """反向:**只有 PDF 有路**。一份认不出来的文件照旧说读不了,不许顺手也指到 read_pdf
+    ——那就是把"不知道是什么"兜底成 PDF(M5-5)。"""
+    line = Attachment(
+        kind="file", sha256="ab" * 32, media_type="application/octet-stream"
+    ).as_line()
+
+    assert "read_pdf" not in line and "读不了" in line, line
+
+
+def test_the_media_id_shape_is_written_down_in_exactly_one_place():
+    """★ 一份媒体的 id 长什么样,**全仓库只有一处写着**(`envelope.MEDIA_ID_RE`)。
+
+    三个地方要认它:Steward 侧 `read_image` / `read_pdf`、学习 bundle 的 `add_file`。
+    bundle import 不到 steward,所以这个常量住在两边都够得着的 `envelope` 里;
+    各写一份的那天就开始漂——漂的样子是「add_file 收下的 id,read_pdf 认不出来」。
+    """
+    pattern = MEDIA_ID_RE.pattern
+    holders = [
+        str(path)
+        for root in (Path("src"), Path("bundles"))
+        for path in sorted(root.rglob("*.py"))
+        if "[0-9a-f]{6" in path.read_text(encoding="utf-8")
+    ]
+    assert holders == ["src/lararium/envelope.py"]
+    assert re.fullmatch(pattern, "ab12cd34ef56")
+
+
+@pytest.mark.parametrize("text", ["ab12cd34ef56", "ab12cd", "ab" * 32])
+def test_a_media_id_is_six_to_sixty_four_hex(text):
+    assert is_media_id(text)
+
+
+@pytest.mark.parametrize(
+    "text", ["", "ab12c", "AB12CD34EF56", "ab12cd34ef56\n", "ab*", "../ab12cd34ef56", "ab" * 33]
+)
+def test_anything_else_is_not_a_media_id(text):
+    """整串匹配:`re.match` 的 `$` 会放过末尾一个换行,而 add_file 要把 id 存进表、之后
+    渲染进一行一条的列表里——带着换行进去就能伪造出下一行。"""
+    assert not is_media_id(text)

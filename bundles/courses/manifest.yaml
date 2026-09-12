@@ -1,8 +1,8 @@
 name: courses
 description: 学习:一门课一个笔记本,记着、改着、按内容搜
 skills: []      # 没有方法篇:怎么记笔记不需要一套方法论,记就是了(G5,同 recipes)
-# 顺序即冻结顺序(§5 示例);以后加工具**只追加在末尾**(M6-6b 的 add_file / list_materials)
+# 顺序即冻结顺序(§5 示例);以后加工具**只追加在末尾**(M6-6b 的课件那两个就是这么加的)
 tools: [list_courses, read_note, append_to_note, replace_in_note, search_notes,
-        rename_course, delete_course]
+        rename_course, delete_course, add_file, list_materials]
 triggers: []
 events: []
