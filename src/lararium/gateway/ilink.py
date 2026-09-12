@@ -254,12 +254,25 @@ def _transcript_marker(text: str, *, seconds: int) -> str:
 
 
 def _playtime_seconds(voice_item: dict[str, Any]) -> int:
-    """语音时长。真机上 `playtime` 是个整数,但报文是外部输入,**认不出就当没有**
-    ——标注里少一个时长不影响判断,编一个数字出去才会。"""
+    """语音时长,**`playtime` 的单位是毫秒**,这里换成秒。
+
+    **单位这件事要有出处**:官方 `src/api/types.ts` 写着「语音长度 (毫秒)」,
+    而真机那条 17 秒的语音报的是 `playtime=17000`。当成秒的话会渲染成
+    「(语音 17000 秒 · 转文字)」——**那不是不好看,是把信号变成了噪声**:
+    时长这个标注存在的全部理由是"长语音糊掉的概率更高",而她会以为这是五小时的录音。
+
+    不足半秒的按 1 秒算(0 秒读起来像"没录上",而它确实录上了);
+    **认不出就当没有**——标注里少一个时长不影响判断,编一个数字出去才会。
+    `except` 要连 `TypeError` 一起收:`playtime` 是外部输入,给一个 dict 进来
+    `float()` 抛的是 `TypeError`,而这一条的纪律是"认不出就当没有",不是崩。
+    """
     try:
-        return max(0, int(float(str(voice_item.get("playtime") or 0))))
-    except ValueError:
+        ms = float(voice_item.get("playtime") or 0)
+    except (TypeError, ValueError):
         return 0
+    if ms <= 0:
+        return 0
+    return max(1, round(ms / 1000))
 
 
 def _text_of(item_list: Any) -> str:

@@ -429,7 +429,7 @@ async def test_an_oversized_download_is_refused_instead_of_eating_the_box():
 # ── M6-1 语音:微信给了转写,我们原来没读 ────────────────────────────────
 
 
-def voice_item(*, text="", playtime=None, aes_key="dGVzdC1rZXktMTZieXRlcw==", media=True):
+def voice_item(*, text="", playtime_ms=None, aes_key="dGVzdC1rZXktMTZieXRlcw==", media=True):
     """造一条 `type=3`。字段名和真机探针打出来的那一份对齐:
 
     PROBE voice keys=['bits_per_sample', 'encode_type', 'media', 'playtime',
@@ -439,8 +439,8 @@ def voice_item(*, text="", playtime=None, aes_key="dGVzdC1rZXktMTZieXRlcw==", me
     body: dict = {"encode_type": 1, "sample_rate": 16000, "bits_per_sample": 16}
     if text:
         body["text"] = text
-    if playtime is not None:
-        body["playtime"] = playtime
+    if playtime_ms is not None:
+        body["playtime"] = playtime_ms
     if media:
         body["media"] = {"encrypt_query_param": "vq1", "full_url": "https://cdn/voice"}
         if aes_key:
@@ -472,7 +472,7 @@ async def test_a_voice_message_is_read_because_wechat_already_transcribed_it():
     转写就在 `voice_item.text` 里(真机确认),而取文字那一支只认 `type == TEXT`
     ——于是用户发的每一条语音,在协议层就等于没发。这是本步要治的那个洞。
     """
-    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime=3)))
+    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime_ms=3000)))
 
     messages, _ = await client.get_updates("")
 
@@ -489,7 +489,7 @@ async def test_the_transcript_marker_says_voice_and_how_long_and_transcribed():
     三样都要在:是**语音**、**多长**(17 秒糊掉的概率比 3 秒高,时长本身是判断依据)、
     是**转文字**的。
     """
-    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime=3)))
+    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime_ms=3000)))
 
     messages, _ = await client.get_updates("")
     text = messages[0].text
@@ -505,7 +505,9 @@ async def test_the_transcript_is_the_users_own_words_so_it_is_not_fenced():
     ——那是另一种错,比不标还糟。同理**不许写"以下可能有误,请谨慎"这类免责声明**:
     给事实,判断交给她。
     """
-    client, _seen = spy(lambda _r: one_message(voice_item(text="帮我看一下那个订阅", playtime=17)))
+    client, _seen = spy(
+        lambda _r: one_message(voice_item(text="帮我看一下那个订阅", playtime_ms=17000))
+    )
 
     messages, _ = await client.get_updates("")
     text = messages[0].text
@@ -521,7 +523,7 @@ async def test_the_transcript_is_the_users_own_words_so_it_is_not_fenced():
         # 语音在前、打的字在后
         (
             (
-                voice_item(text="先说的这句", playtime=2),
+                voice_item(text="先说的这句", playtime_ms=2000),
                 {"type": 1, "text_item": {"text": "后打的字"}},
             ),
             "(语音 2 秒 · 转文字)先说的这句后打的字",
@@ -530,7 +532,7 @@ async def test_the_transcript_is_the_users_own_words_so_it_is_not_fenced():
         (
             (
                 {"type": 1, "text_item": {"text": "先打的字"}},
-                voice_item(text="后说的这句", playtime=2),
+                voice_item(text="后说的这句", playtime_ms=2000),
             ),
             "先打的字(语音 2 秒 · 转文字)后说的这句",
         ),
@@ -555,7 +557,7 @@ async def test_the_audio_is_kept_even_when_the_transcript_is_there():
     几 KB 换"以后想重转还有原件",而这个"以后"有具体形状:哪天发现长语音糊得厉害,
     想拿别的 ASR 重跑一遍,总得有原件在。
     """
-    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime=3)))
+    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime_ms=3000)))
 
     messages, _ = await client.get_updates("")
 
@@ -568,13 +570,38 @@ async def test_a_voice_without_a_transcript_is_marked_as_having_none():
 
     分不出来的话,模型看到的和有转写时一模一样,于是它会对着一行占位符编内容。
     """
-    client, _seen = spy(lambda _r: one_message(voice_item(playtime=8)))
+    client, _seen = spy(lambda _r: one_message(voice_item(playtime_ms=8000)))
 
     messages, _ = await client.get_updates("")
 
     assert messages[0].text == "", "没有转写却凭空多出文字"
     assert [m.kind for m in messages[0].media] == ["voice"]
     assert messages[0].media[0].has_transcript is False
+
+
+async def test_playtime_is_milliseconds_not_seconds():
+    """★ `playtime` 的单位是**毫秒**,不是秒。
+
+    出处是官方 `src/api/types.ts`:「语音长度 (毫秒)」;而真机那条 17 秒的语音
+    报的是 `playtime=17000`。
+
+    **这条的由来**:交付时按秒算,于是真机会渲染成「(语音 17000 秒 · 转文字)」,
+    而 741 条测试全绿——因为 fixture 用的是 `playtime=3` / `playtime=17`,
+    **测试和实现共享了同一个错误假设**。所以这一条钉的不是换算的代码,
+    是"以后谁也别再按秒写":拿真机那个量级(17000)断言它渲染成 17 秒。
+
+    不足半秒按 1 秒算:0 秒读起来像"没录上",而它确实录上了。
+    """
+    client, _seen = spy(lambda _r: one_message(voice_item(text="十七秒那条", playtime_ms=17000)))
+    messages, _ = await client.get_updates("")
+    text = messages[0].text
+    assert "17 秒" in text, f"毫秒没换成秒:{text}"
+    assert "17000" not in text, f"把毫秒当秒了:{text}"
+
+    client, _seen = spy(lambda _r: one_message(voice_item(text="半秒都不到", playtime_ms=300)))
+    messages, _ = await client.get_updates("")
+    text = messages[0].text
+    assert "1 秒" in text and "0 秒" not in text, f"不足半秒该按 1 秒算:{text}"
 
 
 async def test_a_transcript_without_a_playtime_does_not_invent_a_duration():
@@ -595,7 +622,7 @@ async def test_a_voice_without_an_aes_key_keeps_the_text_and_logs_the_audio_half
     音频取不到不该把那句话一起弄丢。
     """
     client, _seen = spy(
-        lambda _r: one_message(voice_item(text="这句话要留住", playtime=5, aes_key=""))
+        lambda _r: one_message(voice_item(text="这句话要留住", playtime_ms=5000, aes_key=""))
     )
 
     with caplog.at_level("WARNING", logger="lararium.ilink"):
