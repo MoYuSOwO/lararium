@@ -6492,7 +6492,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   这是这一条最硬的理由,**不是省 token**。到达轮直接塞进去这件事只对图片成立,
   于是每加一种附件都要在 `loop.py` 里再开一个特例。
   **「报个 id,要看自己调」是通用形状**——PDF、语音、视频、以后任何东西都套得进来,
-  而 M6-6 的 `file_material` 已经在用这个形状了(拿 media id 当把手)。
+  而 M6-6 的 `add_file` 已经在用这个形状了(拿 media id 当把手)。
 
   顺带的好处:
 
@@ -6524,7 +6524,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   ```
   收到 3 个附件:
   - 图片 · 收银条.jpg · id ab12cd34ef56   要看就调 look_at_image("ab12cd34ef56")
-  - 文件 · 第3讲.pdf  · id 77aa99bb00cc   PDF 要归到某门课才读得了(file_material)
+  - 文件 · 第3讲.pdf  · id 77aa99bb00cc   PDF 要归到某门课才读得了(add_file)
   - 语音 · id …        · 微信没转出文字    这条我听不了,你打字说一下
   ```
 
@@ -6538,7 +6538,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   用户:「每一个需要的 bundle 里面,给一个 copy 的工具」。**对,但"需要的"是关键词**:
 
   ```
-  学习 bundle   要 —— file_material(course, media_id, name),M6-6 已经写了
+  学习 bundle   要 —— add_file(course, media_id, name),M6-6 已经写了
   做菜 bundle   可能要(拍一页菜谱 / 收到一份 PDF 菜谱)——**等真撞上再加**
   finance       不要
   memory        不要
@@ -6887,7 +6887,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   search_notes(query, course=None, page=1)    搜内容;不给 course 就全搜
   list_materials(course, page=1)              这门课有哪些课件(每份几页也要给)
   read_material(course, name, page)           **一页给两样:文字 + 那一页的图**
-  file_material(course, media_id, name)       **把微信发来的课件归到这门课下**
+  add_file(course, media_id, name)            **把微信发来的课件归到这门课下**
   rename_course(old, new)                     改名(打错了得能救)
   delete_course(course, reason, undo=False)   删 / 撤回——**移到回收站,不是删文件**
   ```
@@ -6946,14 +6946,47 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
      一份 PDF 落在 `data/media/` 里**压根摸不到**。
   2. **模型没有目录、没有路径**(这是 M6-5/M6-6 刻意定的),所以它"复制"不了。
 
-  ### 缺的那一环:`file_material(course, media_id, name)`
+  ### 名字统一叫 `add_file`,而且这是用户自己定的形状
+
+  > 「助理怎么把 file 从那边移到需要的 bundle 的某个地方呢?**或者 bundle 里面自带一个
+  > 工具?比如说课程的 add_file?然后统一用那边文件的那个 id?**」
+
+  **对,而且这就是下面这个东西**——复核方原来叫它 `file_material`,名字不如
+  `add_file`:**每个需要的 bundle 里都叫同一个名字**,而 media id 是统一把手。
+  以后做菜 bundle 要收一份 PDF 菜谱,它那边也叫 `add_file`,模型不用记两套。
+
+  ### 要不要一个通用的 `read_file(id)`:**倾向不做,但理由是第二个**
+
+  用户:「我在想,要读一个东西是不是就 readfile 比较好?」
+
+  **复核方上一版给的理由是错的**,写下来免得它被当成依据:
+  我写的是「一个 `read_file` 会把每种类型混成看情况的黑盒,而那正是 M5-5 栽过的地方」。
+  **重读那条教训,引用错了**:M5-5 栽的不是"一个工具管多种类型",
+  是**「认不出就按 jpeg 送」**——`look_at_image` 当时**一个种类判断都没有**。
+  一个会查类型、认不出就明说的 `read_file` **并不犯那个错**。
+
+  **真正的理由是:报告那一行已经替模型做了分派**(见 M6-2)。
+
+  ```
+  - 图片 · 收银条.jpg · id ab12cd34   要看就调 look_at_image("ab12cd34")
+  - 文件 · 第3讲.pdf  · id 77aa99bb   要读先 add_file 归到某门课
+  ```
+
+  它不用知道该调哪个,**它被告知了**。而 `read_file` 要多一个 `page` 参数
+  (对图片无意义)、返回值时而是图部件时而是文字——**省下的那个决定本来就不用它做**。
+
+  **这条不是硬的。** 真要单一入口,形状是:`read_file(id)` 查类型 → 图就给图、
+  PDF 就说"N 页,归档后可逐页读"、认不出就**说清楚它是什么**,
+  **任何情况下不许兜底成另一种类型**(那一条才是 M5-5 的教训)。
+
+  ### 缺的那一环:`add_file(course, media_id, name)`——**名字用用户的说法**
 
   而**把手已经现成了**:附件在信封正文里是一行 `(文件 · media/ab12cd…)`,
   而 `look_at_image` 已经证明**这串十六进制就是可用的 id**
   ——`_IMAGE_ID_RE` 把它锁成纯十六进制,「通配符进不来」。照它办:
 
   ```
-  file_material(course, media_id, name)
+  add_file(course, media_id, name)
     → 从 media 池按 id 取那份字节
     → 放到 data/courses/<课程>/materials/<name>
     → 然后**就地把整份转一遍**(渲染 + 模型转文字,见下面那节)
@@ -6972,7 +7005,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   ### "入库"是指**归到课程下面那一刻**,不是微信收到那一刻
 
   这一点要写清楚,否则会去转用户随手发的每一张照片。
-  **只有 `file_material` 成功之后才触发整份转换。**
+  **只有 `add_file` 成功之后才触发整份转换。**
 
   ### 她不知道归哪门课的时候:**问**
 
@@ -7171,7 +7204,7 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
   - **`delete_course`**:删完默认列表看不见、`include_deleted=True` 看得见且标「已删」、
     **文件一个字节没销毁**;`undo=True` 搬回来**逐字节一致**(笔记本和课件都要比);
     `reason` 不给 → 人话;`list_courses` **不许列出 `.trash`**;
-  - **`file_material`**:拿一个真的 media id 归档 → 文件出现在那门课下、
+  - **`add_file`**:拿一个真的 media id 归档 → 文件出现在那门课下、
     **media 池那份还在**、整份转换被触发;`name` 重名 → 拒绝;
     非法 `name`(`../x`、`.hidden`、空、超长)→ 拒绝;
     认不出的 `media_id` → 人话;**正则和 `look_at_image` 共用同一个常量**
