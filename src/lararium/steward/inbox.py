@@ -111,6 +111,14 @@ class Inbox:
         row = self._conn.execute("SELECT attempts FROM inbox WHERE id=?", (env_id,)).fetchone()
         return int(row["attempts"]) if row else 0
 
+    def has_unfinished(self) -> bool:
+        """有没有信封在排队或正在处理。后台转换 PDF 之前问它(M6-6c):**聊天那一轮还没完,
+        就先不开新的一页**——转换和聊天用同一个 key,不许把聊天挤慢。"""
+        row = self._conn.execute(
+            "SELECT 1 FROM inbox WHERE state IN ('pending', 'processing') LIMIT 1"
+        ).fetchone()
+        return row is not None
+
     def pending_count(self) -> int:
         return int(
             self._conn.execute("SELECT COUNT(*) FROM inbox WHERE state='pending'").fetchone()[0]
