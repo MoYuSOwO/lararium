@@ -820,6 +820,8 @@ RIFF_WEBP = b"RIFF\x24\x08\x00\x00WEBPVP8 "
 BMP = b"BM\x36\x00\x0c\x00\x00\x00\x00\x00"
 HEIC = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00"
 MP4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"
+PDF = b"%PDF-1.7\n%\xc7\xec\x8f\xa2\n1 0 obj"
+SILK = b"\x02#!SILK_V3\x00\x00"  # 微信在 `#!SILK_V3` 前面多加一个字节
 
 
 @pytest.mark.parametrize(
@@ -839,6 +841,9 @@ MP4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"
         # ftyp 不等于图片:MP4 和 HEIC 都在偏移 4 处是 ftyp,分野在后面那个 brand。
         (MP4, "application/octet-stream"),
         (b"\xff\xd8\xff\xe0 jpeg", "image/jpeg"),
+        # M6-1:PDF 原来掉进 octet-stream、落盘成 `<hash>.bin`——**存下来了却认不出、
+        # 用不了**,而这正是"声称不足"那个方向:漏一种格式就是一声不响地不进模型。
+        (PDF, "application/pdf"),
     ],
 )
 def test_the_magic_table_does_not_overclaim_or_underclaim(blob, expected):
@@ -857,6 +862,179 @@ async def test_a_wav_pretending_to_be_an_image_does_not_land_as_webp(tmp_path):
     await a.pump_inbound_once()
 
     assert [p.suffix for p in (tmp_path / "media").iterdir()] == [".bin"]
+
+
+async def test_a_pdf_lands_as_a_pdf_not_as_an_unknown_blob(tmp_path):
+    """★ M6-1 顺带补的前置缺口:一份 PDF 原来落成 `<hash>.bin`。
+
+    **两张表要一起动**(`_MAGIC` 的魔数 + `envelope.SUFFIXES` 的后缀)——只加魔数的话
+    `media_type` 对了、文件还是 `.bin`,而按后缀反查那一侧从此认不回来。
+    走完整条落盘路再看一次:单测 `_sniff` 只证明分类函数,证不了它真被用上了。
+    """
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    pdf = MediaRef(
+        kind="file", encrypted_query_param="q1", full_url="", aes_key_b64="", file_name="第3讲.pdf"
+    )
+    ilink = FakeILinkWithCdn(
+        batches=[([InboundMessage(1, "u1@im.wechat", "这个", "ctx", media=(pdf,))], "c1")],
+        blobs={"q1": PDF},
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert [p.suffix for p in (tmp_path / "media").iterdir()] == [".pdf"]
+    assert posted[0]["attachments"][0]["media_type"] == "application/pdf"
+
+
+# ── M6-1:语音的转写进正文,音频照样落盘 ─────────────────────────────────
+
+
+def voice(query="v1", *, has_transcript=True):
+    return MediaRef(
+        kind="voice",
+        encrypted_query_param=query,
+        full_url="",
+        aes_key_b64="",
+        has_transcript=has_transcript,
+    )
+
+
+async def test_a_voice_transcript_and_its_audio_both_reach_the_envelope(tmp_path):
+    """★ 验收口径那一条走完整条路:转写在正文里带着标注,**而且音频也落了盘**。
+
+    音频一律存,哪怕转写有内容——几 KB 换"以后想重转还有原件"。
+    """
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            (
+                [
+                    InboundMessage(
+                        1,
+                        "u1@im.wechat",
+                        "(语音 3 秒 · 转文字)麦当劳 45.5",
+                        "ctx",
+                        media=(voice(),),
+                    )
+                ],
+                "c1",
+            )
+        ],
+        blobs={"v1": SILK},
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    content = posted[0]["content"]
+    assert "麦当劳 45.5" in content
+    assert "语音" in content and "3 秒" in content and "转文字" in content
+    assert "<<<" not in content and ">>>" not in content, "转写被套了围栏"
+    digest = hashlib.sha256(SILK).hexdigest()
+    assert [p.name for p in (tmp_path / "media").iterdir()] == [f"{digest}.silk"], "音频没落盘"
+    assert posted[0]["attachments"][0]["kind"] == "voice"
+
+
+async def test_a_transcript_goes_to_the_model_not_to_the_command_endpoint(tmp_path):
+    """转写是**用户自己的话**,走普通消息端点——`source` 仍是 user,不是命令、不是系统触发。"""
+    paths: list[str] = []
+
+    def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            (
+                [
+                    InboundMessage(
+                        1, "u1@im.wechat", "(语音 3 秒 · 转文字)记一笔", "ctx", media=(voice(),)
+                    )
+                ],
+                "c1",
+            )
+        ],
+        blobs={"v1": SILK},
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert paths == ["/v1/messages"]
+
+
+async def test_a_voice_with_no_transcript_says_so_instead_of_a_bare_placeholder(tmp_path):
+    """★ **占位符要说实话。**
+
+    原来正文里只有一行 `(语音 · media/…)`:既没说"这条没有文字",也没说"音频我读不了"
+    ——于是模型会对着一行占位符编内容。**说不出来比编出来强。**
+    """
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            (
+                [
+                    InboundMessage(
+                        1, "u1@im.wechat", "", "ctx", media=(voice(has_transcript=False),)
+                    )
+                ],
+                "c1",
+            )
+        ],
+        blobs={"v1": SILK},
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    content = posted[0]["content"]
+    assert "没转出文字" in content, f"没有转写却什么都没说:{content!r}"
+    assert "听不了" in content, f"没说清音频读不了,模型会对着占位符编:{content!r}"
+    assert (tmp_path / "media").iterdir(), "没有转写时音频也必须落盘(以后好重转)"
+
+
+async def test_a_transcribed_voice_does_not_get_the_cannot_hear_line(tmp_path):
+    """反向:有转写的时候不许多那句"我听不了"——那会让她以为自己什么都没收到。"""
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    ilink = FakeILinkWithCdn(
+        batches=[
+            (
+                [
+                    InboundMessage(
+                        1, "u1@im.wechat", "(语音 3 秒 · 转文字)记一笔", "ctx", media=(voice(),)
+                    )
+                ],
+                "c1",
+            )
+        ],
+        blobs={"v1": SILK},
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert "听不了" not in posted[0]["content"]
 
 
 # ── M5-12 Step 1:退避,以及被入站消息叫醒 ──────────────────────────────

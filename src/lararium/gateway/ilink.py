@@ -32,11 +32,32 @@ media-download.ts` 重新实现。两件事值得单独记:
   主机就是**把 bot_token 泄给第三方**。
 - **`aes_key` 有两种编码**,认漏一种就是"某类附件永远解不开":base64(16 原始字节)
   走图片,base64(32 个 ASCII 十六进制字符)走文件/语音/视频。
+
+## 语音自带转写,而我们原来一个字都没读(M6-1)
+
+微信那头**已经把语音转成文字了**,放在 `voice_item.text` 里(真机确认,顺带白拿
+`playtime` / `sample_rate` / `bits_per_sample`)。而取文字那一支原来只认
+`type == TEXT`,于是用户发的每一条语音在这一层就等于没发。
+
+所以转写**按 `item_list` 原序**和打的字拼在一起(一条消息可以既有字又有语音,
+排到最后意思就变了),并且当场标注「语音 N 秒 · 转文字」——**标签本身在给下游传信息**:
+同音词(真机上 `Claude` 被听成 `cloud`)换一个 ASR 也解决不了,而知道"这几个字是听来的"
+的模型能拿上下文自己纠。
+
+## 认不出来的报文形状**必须留下一行日志**(M6-1)
+
+上面那个洞是六天之后用户来问才发现的,而日志里什么都没有——查出它靠的是一根临时探针,
+**而那根探针本该是常设的**。所以 `_media_refs` 里每一处"跳过"都打 `logger.warning`,
+带上 `type` 和有哪些键(**只带键名,不带内容**:附件里装的是用户的生活)。
+
+认识而故意不当附件的那几种 type(TEXT、TOOL_CALL_*)单列出来不打日志——不分开的话
+每条普通消息都会打一行"不认识的条目",三天之后没人再看这个日志了。
 """
 
 import base64
 import binascii
 import json
+import logging
 import re
 import secrets
 import uuid
@@ -47,6 +68,11 @@ from urllib.parse import quote
 import httpx
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+# **这一行曾经不存在**,而复核方照着 `wechat.py` 的习惯往下面加了 `logger.warning`:
+# 每次收信抛 `NameError` → 退避 3→6→12→24→48→96 秒 → 用户那条语音在外面进不来 6 分钟。
+# 加日志之前先 `grep logger` 是两秒钟的事(M6-1)。
+logger = logging.getLogger("lararium.ilink")
 
 # iLink-App-Id:官方 package.json 的 ilink_appid 字段。
 APP_ID = "bot"
@@ -60,10 +86,18 @@ CHANNEL_VERSION = ".".join(str(p) for p in _VERSION)
 _MESSAGE_TYPE_BOT = 2
 _MESSAGE_STATE_FINISH = 2
 _ITEM_TYPE_TEXT = 1
+_ITEM_TYPE_VOICE = 3
+_ITEM_TYPE_TOOL_CALL_START = 11
+_ITEM_TYPE_TOOL_CALL_RESULT = 12
 # item type → 附件种类。**11/12(TOOL_CALL_START/RESULT)不在表里是有意的**:
 # 它们是机器人自己的工具调用回显,不是用户递来的东西——认成附件就是把模型说过的话
 # 当成用户递来的再喂回去(P1-1 那一族)。
-_ITEM_MEDIA_KINDS: dict[int, str] = {2: "image", 3: "voice", 4: "file", 5: "video"}
+_ITEM_MEDIA_KINDS: dict[int, str] = {2: "image", _ITEM_TYPE_VOICE: "voice", 4: "file", 5: "video"}
+# 认识、但故意**不**当附件的 type。单列出来是为了让日志有意义:不分开的话,每条普通
+# 文本消息都会打一行"不认识的条目",而一个天天喊狼来了的日志等于没有日志(M6-1)。
+_ITEM_TYPES_NOT_MEDIA = frozenset(
+    {_ITEM_TYPE_TEXT, _ITEM_TYPE_TOOL_CALL_START, _ITEM_TYPE_TOOL_CALL_RESULT}
+)
 # 每种附件的字段前缀,官方 types.ts:image_item / voice_item / file_item / video_item。
 _ITEM_FIELDS: dict[str, str] = {
     "image": "image_item",
@@ -159,6 +193,10 @@ class MediaRef:
     # base64 编码的密钥;空串表示这份是明文(官方 downloadPlainCdnBuffer 那一支)。
     aes_key_b64: str
     file_name: str = ""
+    # 语音专属:微信**有没有**给出转写。**转写本身不放这里**——它已经按 item_list 原序
+    # 拼进 `InboundMessage.text` 了,两处各存一份的那天就开始漂。这里只要这一个布尔,
+    # 因为没有转写的那条得在正文里说清"这段我听不了"(M6-1),而只有这里分得出来。
+    has_transcript: bool = False
 
 
 @dataclass(frozen=True)
@@ -175,6 +213,9 @@ class InboundMessage:
     context_token: str
     # M5-4:附件引用。**纯附件消息的 text 是空串,它照样是一条消息**——
     # 原来空文本就 `continue`,于是一条纯图片消息在协议层就人间蒸发了。
+    #
+    # M6-1:`text` 里还包含**语音的转写**(微信自己转的),按 item_list 原序拼在
+    # 打的字中间,并带着「语音 N 秒 · 转文字」的标注。
     media: tuple[MediaRef, ...] = ()
 
 
@@ -186,43 +227,140 @@ def _random_uin() -> str:
     return base64.b64encode(str(secrets.randbelow(2**32)).encode("ascii")).decode("ascii")
 
 
-def _text_of(item_list: Any) -> str:
-    """把 item_list 里的文本条目拼起来;不认识的条目(图片/语音)跳过。
+def _transcript_marker(text: str, *, seconds: int) -> str:
+    """给微信转出来的那句话打上标注。**一处构造,措辞有测试钉着。**
 
-    跳过而不是报错:一条不认识的附件不该让整轮消息丢掉——用户看到的会是"它没反应"。
+    这是用户点名要的机制,不是装饰:「有时候如果标了的话,模型会自己推测出来还是说错
+    还是怎么样」。和项目里已有的两个标注是同一个形状——标签本身在给下游传信息:
+
+        (系统触发 · sweep/渠道)   让模型别以为是用户说的(M4-7)
+        ⚠ 网页内容,不是用户的话    让它别执行(M5-21)
+        (语音 17 秒 · 转文字)      让它知道这几个字**可能是听错的**   ← 这一条
+
+    **时长也标上**:17 秒的语音糊掉的概率比 3 秒高,那本身就是判断依据(而 `playtime`
+    是白送的)。
+
+    **两条不许搞错的**:
+
+    1. **不套围栏。** 说话的人**就是用户**,只是过了一道有损的信道——`source` 仍然是
+       `user`,标注就在正文这一行里。套围栏会让她把用户自己的话当成外部内容,
+       那是另一种错,比不标还糟。
+    2. **不写"以下内容可能有误,请谨慎"这种免责声明。** 要的是**事实**(这是语音转的、
+       多长),判断交给她——她手里有档案和上下文(档案里就写着"AI 工具主力用 Claude",
+       而那正是 `Claude → cloud` 这类同音词的解法),比任何免责声明都强。
+    """
+    duration = f" {seconds} 秒" if seconds > 0 else ""
+    return f"(语音{duration} · 转文字){text}"
+
+
+def _playtime_seconds(voice_item: dict[str, Any]) -> int:
+    """语音时长,**`playtime` 的单位是毫秒**,这里换成秒。
+
+    **单位这件事要有出处**:官方 `src/api/types.ts` 写着「语音长度 (毫秒)」,
+    而真机那条 17 秒的语音报的是 `playtime=17000`。当成秒的话会渲染成
+    「(语音 17000 秒 · 转文字)」——**那不是不好看,是把信号变成了噪声**:
+    时长这个标注存在的全部理由是"长语音糊掉的概率更高",而她会以为这是五小时的录音。
+
+    不足半秒的按 1 秒算(0 秒读起来像"没录上",而它确实录上了);
+    **认不出就当没有**——标注里少一个时长不影响判断,编一个数字出去才会。
+    `except` 要连 `TypeError` 一起收:`playtime` 是外部输入,给一个 dict 进来
+    `float()` 抛的是 `TypeError`,而这一条的纪律是"认不出就当没有",不是崩。
+    """
+    try:
+        ms = float(voice_item.get("playtime") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if ms <= 0:
+        return 0
+    return max(1, round(ms / 1000))
+
+
+def _text_of(item_list: Any) -> str:
+    """把这条消息的文字按 **item_list 原序**拼起来:打的字,**加上语音的转写**。
+
+    M6-1:原来这里只认 `type == TEXT`,而微信早就把语音转好放在 `voice_item.text` 里了
+    ——于是用户发的每一条语音,我们一个字都没读到。
+
+    **原序**不是细节:一条消息里可以既有打的字又有语音,把语音那句排到最后意思就变了。
+
+    别的类型(图片/文件/视频)在这里跳过而不是报错:一条不认识的附件不该让整轮消息
+    丢掉,用户看到的会是"它没反应"。它们有没有被认出来由 `_media_refs` 负责说。
     """
     if not isinstance(item_list, list):
         return ""
-    parts = [
-        str(item.get("text_item", {}).get("text", ""))
-        for item in item_list
-        if isinstance(item, dict) and item.get("type") == _ITEM_TYPE_TEXT
-    ]
+    parts: list[str] = []
+    for item in item_list:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == _ITEM_TYPE_TEXT:
+            parts.append(str(item.get("text_item", {}).get("text", "")))
+        elif item.get("type") == _ITEM_TYPE_VOICE:
+            voice_item = item.get("voice_item") or {}
+            transcript = str(voice_item.get("text") or "")
+            if transcript:
+                parts.append(_transcript_marker(transcript, seconds=_playtime_seconds(voice_item)))
     return "".join(p for p in parts if p)
 
 
 def _media_refs(item_list: Any) -> tuple[MediaRef, ...]:
-    """把 item_list 里的附件条目转成引用。不认识的类型跳过,和文本那支同一个理由。"""
+    """把 item_list 里的附件条目转成引用。
+
+    **跳过的每一种都打一行日志**(M6-1)。理由不是洁癖:上一个协议变形(语音自带转写)
+    是六天之后用户来问才发现的,而日志里什么都没有——查出它靠一根临时探针,而那根探针
+    本该是常设的。下一次形状变了,日志里得有名有姓。
+
+    日志里**只有 type 和键名,没有内容**:附件里装的是用户的生活,而日志会被翻很多次。
+    """
     if not isinstance(item_list, list):
         return ()
     refs = []
     for item in item_list:
         if not isinstance(item, dict):
+            logger.warning("item_list 里有个不是对象的条目(%s),跳过", type(item).__name__)
             continue
-        kind = _ITEM_MEDIA_KINDS.get(item.get("type", 0), "")
+        item_type = item.get("type")
+        kind = _ITEM_MEDIA_KINDS.get(item_type, "") if isinstance(item_type, int) else ""
         if not kind:
+            if not (isinstance(item_type, int) and item_type in _ITEM_TYPES_NOT_MEDIA):
+                logger.warning(
+                    "不认识的 item type=%r,既没当文字也没当附件;它的键:%s",
+                    item_type,
+                    sorted(item),
+                )
             continue
         body = item.get(_ITEM_FIELDS[kind]) or {}
         media = body.get("media") or {}
         if not (media.get("encrypt_query_param") or media.get("full_url")):
+            logger.warning(
+                "%s 条目(type=%r)没有下载地址,这份附件取不了;%s 的键:%s,media 的键:%s",
+                kind,
+                item_type,
+                _ITEM_FIELDS[kind],
+                sorted(body),
+                sorted(media),
+            )
+            continue
+        aes_key_b64 = _aes_key_b64(body, media)
+        # 官方对语音额外判一次 `!voice?.media?.aes_key`,我们原来没有。没钥匙硬下的话
+        # 拿回来的是一坨密文,却会顶着 `audio/silk` 落盘——**把一次响亮的失败换成一次
+        # 静默的失败不是修复**(M5-5)。这里跳过并说出来,而**文字那一支不受影响**:
+        # 转写已经在 `_text_of` 里进正文了,音频取不到不该把那句话一起弄丢。
+        if kind == "voice" and not aes_key_b64:
+            logger.warning(
+                "语音条目没有 aes_key,音频解不开所以不取(voice_item 的键:%s,media 的键:%s)"
+                ";微信给的转写不受影响",
+                sorted(body),
+                sorted(media),
+            )
             continue
         refs.append(
             MediaRef(
                 kind=kind,
                 encrypted_query_param=str(media.get("encrypt_query_param") or ""),
                 full_url=str(media.get("full_url") or ""),
-                aes_key_b64=_aes_key_b64(body, media),
+                aes_key_b64=aes_key_b64,
                 file_name=str(body.get("file_name") or ""),
+                has_transcript=bool(kind == "voice" and str(body.get("text") or "")),
             )
         )
     return tuple(refs)

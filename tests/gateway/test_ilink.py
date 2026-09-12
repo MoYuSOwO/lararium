@@ -424,3 +424,290 @@ async def test_an_oversized_download_is_refused_instead_of_eating_the_box():
 
     with pytest.raises(ILinkError):
         await client.download_media(ref)
+
+
+# ── M6-1 语音:微信给了转写,我们原来没读 ────────────────────────────────
+
+
+def voice_item(*, text="", playtime_ms=None, aes_key="dGVzdC1rZXktMTZieXRlcw==", media=True):
+    """造一条 `type=3`。字段名和真机探针打出来的那一份对齐:
+
+    PROBE voice keys=['bits_per_sample', 'encode_type', 'media', 'playtime',
+                      'sample_rate', 'text']
+          media_keys=['aes_key', 'encrypt_query_param', 'full_url']
+    """
+    body: dict = {"encode_type": 1, "sample_rate": 16000, "bits_per_sample": 16}
+    if text:
+        body["text"] = text
+    if playtime_ms is not None:
+        body["playtime"] = playtime_ms
+    if media:
+        body["media"] = {"encrypt_query_param": "vq1", "full_url": "https://cdn/voice"}
+        if aes_key:
+            body["media"]["aes_key"] = aes_key
+    return {"type": 3, "voice_item": body}
+
+
+def one_message(*items, message_id=1):
+    """一批只有一条消息的 getupdates 响应。"""
+    return ok(
+        {
+            "ret": 0,
+            "get_updates_buf": "c2",
+            "msgs": [
+                {
+                    "message_id": message_id,
+                    "from_user_id": "u1@im.wechat",
+                    "context_token": "ctx",
+                    "item_list": list(items),
+                }
+            ],
+        }
+    )
+
+
+async def test_a_voice_message_is_read_because_wechat_already_transcribed_it():
+    """★ **微信自己把语音转成了文字,而我们一个字都没读。**
+
+    转写就在 `voice_item.text` 里(真机确认),而取文字那一支只认 `type == TEXT`
+    ——于是用户发的每一条语音,在协议层就等于没发。这是本步要治的那个洞。
+    """
+    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime_ms=3000)))
+
+    messages, _ = await client.get_updates("")
+
+    assert len(messages) == 1
+    assert "麦当劳 45.5" in messages[0].text, "语音的转写没进正文——一个字都没读到"
+
+
+async def test_the_transcript_marker_says_voice_and_how_long_and_transcribed():
+    """★ **标注的措辞钉在这里**:用户点名要的机制,措辞漂了这条就没了。
+
+    > 「你就用微信那个吧,但是记得标注一下这条是语音转文字的。因为有时候如果标了的话,
+    > 模型会自己推测出来还是说错还是怎么样。」
+
+    三样都要在:是**语音**、**多长**(17 秒糊掉的概率比 3 秒高,时长本身是判断依据)、
+    是**转文字**的。
+    """
+    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime_ms=3000)))
+
+    messages, _ = await client.get_updates("")
+    text = messages[0].text
+
+    assert text == "(语音 3 秒 · 转文字)麦当劳 45.5"
+    assert "语音" in text and "3 秒" in text and "转文字" in text
+
+
+async def test_the_transcript_is_the_users_own_words_so_it_is_not_fenced():
+    """★ **不许套围栏。** 说话的人**就是用户**,只是过了一道有损的信道。
+
+    套围栏(`<<<` / `>>>`,L0 给不可信内容用的那对)会让她把用户自己的话当成外部内容
+    ——那是另一种错,比不标还糟。同理**不许写"以下可能有误,请谨慎"这类免责声明**:
+    给事实,判断交给她。
+    """
+    client, _seen = spy(
+        lambda _r: one_message(voice_item(text="帮我看一下那个订阅", playtime_ms=17000))
+    )
+
+    messages, _ = await client.get_updates("")
+    text = messages[0].text
+
+    assert "<<<" not in text and ">>>" not in text, "转写被套了围栏:用户自己的话变成了外部内容"
+    for weasel in ("可能有误", "请谨慎", "不准确", "仅供参考"):
+        assert weasel not in text, f"标注里混进了免责声明:{weasel}"
+
+
+@pytest.mark.parametrize(
+    ("items", "expected"),
+    [
+        # 语音在前、打的字在后
+        (
+            (
+                voice_item(text="先说的这句", playtime_ms=2000),
+                {"type": 1, "text_item": {"text": "后打的字"}},
+            ),
+            "(语音 2 秒 · 转文字)先说的这句后打的字",
+        ),
+        # 打的字在前、语音在后
+        (
+            (
+                {"type": 1, "text_item": {"text": "先打的字"}},
+                voice_item(text="后说的这句", playtime_ms=2000),
+            ),
+            "先打的字(语音 2 秒 · 转文字)后说的这句",
+        ),
+    ],
+)
+async def test_text_and_voice_keep_their_item_list_order(items, expected):
+    """★ **按 `item_list` 原序**,不是"文字在前语音在后"。
+
+    一条消息里可以既有打的字又有语音;把语音那句一律排到最后,意思就变了
+    ——「这个多少钱」+ 一段语音,和倒过来读起来不是一回事。
+    """
+    client, _seen = spy(lambda _r: one_message(*items))
+
+    messages, _ = await client.get_updates("")
+
+    assert messages[0].text == expected
+
+
+async def test_the_audio_is_kept_even_when_the_transcript_is_there():
+    """**音频一律存下来,哪怕 `text` 有内容。**
+
+    几 KB 换"以后想重转还有原件",而这个"以后"有具体形状:哪天发现长语音糊得厉害,
+    想拿别的 ASR 重跑一遍,总得有原件在。
+    """
+    client, _seen = spy(lambda _r: one_message(voice_item(text="麦当劳 45.5", playtime_ms=3000)))
+
+    messages, _ = await client.get_updates("")
+
+    assert [m.kind for m in messages[0].media] == ["voice"], "有转写就不取音频了"
+    assert messages[0].media[0].has_transcript is True
+
+
+async def test_a_voice_without_a_transcript_is_marked_as_having_none():
+    """没转出文字的语音:正文里那句"我听不了"由适配器那层写,而**分得出来只有这里**。
+
+    分不出来的话,模型看到的和有转写时一模一样,于是它会对着一行占位符编内容。
+    """
+    client, _seen = spy(lambda _r: one_message(voice_item(playtime_ms=8000)))
+
+    messages, _ = await client.get_updates("")
+
+    assert messages[0].text == "", "没有转写却凭空多出文字"
+    assert [m.kind for m in messages[0].media] == ["voice"]
+    assert messages[0].media[0].has_transcript is False
+
+
+async def test_playtime_is_milliseconds_not_seconds():
+    """★ `playtime` 的单位是**毫秒**,不是秒。
+
+    出处是官方 `src/api/types.ts`:「语音长度 (毫秒)」;而真机那条 17 秒的语音
+    报的是 `playtime=17000`。
+
+    **这条的由来**:交付时按秒算,于是真机会渲染成「(语音 17000 秒 · 转文字)」,
+    而 741 条测试全绿——因为 fixture 用的是 `playtime=3` / `playtime=17`,
+    **测试和实现共享了同一个错误假设**。所以这一条钉的不是换算的代码,
+    是"以后谁也别再按秒写":拿真机那个量级(17000)断言它渲染成 17 秒。
+
+    不足半秒按 1 秒算:0 秒读起来像"没录上",而它确实录上了。
+    """
+    client, _seen = spy(lambda _r: one_message(voice_item(text="十七秒那条", playtime_ms=17000)))
+    messages, _ = await client.get_updates("")
+    text = messages[0].text
+    assert "17 秒" in text, f"毫秒没换成秒:{text}"
+    assert "17000" not in text, f"把毫秒当秒了:{text}"
+
+    client, _seen = spy(lambda _r: one_message(voice_item(text="半秒都不到", playtime_ms=300)))
+    messages, _ = await client.get_updates("")
+    text = messages[0].text
+    assert "1 秒" in text and "0 秒" not in text, f"不足半秒该按 1 秒算:{text}"
+
+
+async def test_a_transcript_without_a_playtime_does_not_invent_a_duration():
+    """时长认不出就不标。**编一个数字出去**才是问题——少一个时长不影响她判断。"""
+    client, _seen = spy(lambda _r: one_message(voice_item(text="没有时长这个字段")))
+
+    messages, _ = await client.get_updates("")
+
+    assert messages[0].text == "(语音 · 转文字)没有时长这个字段"
+    assert "0 秒" not in messages[0].text
+
+
+async def test_a_voice_without_an_aes_key_keeps_the_text_and_logs_the_audio_half(caplog):
+    """★ 官方对语音额外判一次 `!voice?.media?.aes_key`,我们原来没有。
+
+    没钥匙硬下的话,拿回来的是一坨密文,却会顶着 `audio/silk` 落盘——**把一次响亮的
+    失败换成一次静默的失败不是修复**。而**文字那一半不受影响**:转写已经进正文了,
+    音频取不到不该把那句话一起弄丢。
+    """
+    client, _seen = spy(
+        lambda _r: one_message(voice_item(text="这句话要留住", playtime_ms=5000, aes_key=""))
+    )
+
+    with caplog.at_level("WARNING", logger="lararium.ilink"):
+        messages, _ = await client.get_updates("")
+
+    assert "这句话要留住" in messages[0].text, "音频取不了把转写也弄丢了"
+    assert messages[0].media == (), "没有 aes_key 还是去取了音频"
+    assert "aes_key" in caplog.text, "音频那一半被静默丢掉了"
+
+
+# ── M6-1 跳过的每一种都要留下一行日志 ─────────────────────────────────────
+
+
+async def test_an_unknown_item_type_is_logged_instead_of_vanishing(caplog):
+    """★ **这一条比前面几条都重要。**
+
+    语音那个洞是六天之后用户来问才发现的,而日志里什么都没有——查出它靠一根临时探针,
+    **而那根探针本该是常设的**。下一次协议变形,日志里得有名有姓。
+    """
+    client, _seen = spy(lambda _r: one_message({"type": 99, "something_item": {"blah": 1}}))
+
+    with caplog.at_level("WARNING", logger="lararium.ilink"):
+        await client.get_updates("")
+
+    assert "99" in caplog.text, "不认识的 type 被静默丢掉了"
+    assert "something_item" in caplog.text, "日志里没说它带了哪些键"
+
+
+async def test_a_media_item_with_no_download_location_is_logged(caplog):
+    """附件条目认出来了、却没有下载地址——这也是协议变形,不许静默。"""
+    client, _seen = spy(lambda _r: one_message({"type": 2, "image_item": {"aeskey": "ab" * 16}}))
+
+    with caplog.at_level("WARNING", logger="lararium.ilink"):
+        messages, _ = await client.get_updates("")
+
+    assert messages == []
+    assert "image" in caplog.text and "aeskey" in caplog.text
+
+
+async def test_a_non_object_item_is_logged(caplog):
+    """报文里混进一个不是对象的条目,同样要留一行——它只可能来自协议变形。"""
+    client, _seen = spy(
+        lambda _r: one_message("我不是一个对象", {"type": 1, "text_item": {"text": "记一笔"}})
+    )
+
+    with caplog.at_level("WARNING", logger="lararium.ilink"):
+        messages, _ = await client.get_updates("")
+
+    assert messages[0].text == "记一笔"
+    assert "str" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": 1, "text_item": {"text": "打的字"}},
+        {"type": 11, "tool_call_start_item": {"tool_name": "x"}},
+        {"type": 12, "text_item": {"text": "工具说的话"}},
+    ],
+)
+async def test_item_types_we_deliberately_skip_are_not_logged_as_deformations(caplog, item):
+    """★ 反向:**认识而故意不当附件的那几种不许打日志。**
+
+    不分开的话,每条普通文本消息都会打一行"不认识的条目"——而一个天天喊狼来了的日志
+    等于没有日志,下一次真的变形了也没人看得见。
+    """
+    client, _seen = spy(lambda _r: one_message(item))
+
+    with caplog.at_level("WARNING", logger="lararium.ilink"):
+        await client.get_updates("")
+
+    assert caplog.text == "", f"把认识的 type 报成了协议变形:{caplog.text}"
+
+
+def test_the_protocol_layer_has_a_logger():
+    """★ 这个模块原来**压根没有 `logger`**,而复核方照着 `wechat.py` 的习惯加了
+    `logger.warning(...)`:每次收信抛 `NameError`,退避 3→6→12→24→48→96 秒,
+    用户那条语音 6 分钟进不来。
+
+    (**而它没造成损失是 M5-12 那轮的设计救的**:失败不推进游标、消息留着等
+    ——修好之后那条语音自己补了进来。)
+    """
+    import logging
+
+    from lararium.gateway import ilink
+
+    assert isinstance(ilink.logger, logging.Logger)
+    assert ilink.logger.name.startswith("lararium")
