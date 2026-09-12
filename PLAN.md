@@ -6393,7 +6393,7 @@ M6-3a 退款并进收入      用户:很难说全退,那个指针指不准,派�
 M6-4  预算提醒         和 M6-3 同一个 bundle,接着做                                      ✅ 已验收
 M6-5  做菜 bundle      用户自己设计的                                                    ✅ 已验收
 M6-6a 学习·笔记那半    一门课一个笔记本;零新依赖,主要是从做菜里**提取**共用层          ✅ 已验收
-M6-6b 学习·课件看得见  add_file / list_materials + Steward 侧 read_pdf(id, page) 给页图     ⏳ 进行中
+M6-6b 学习·课件看得见  add_file / list_materials + Steward 侧 read_pdf(id, page) 给页图     ✅ 已验收
 M6-6c PDF 收到就转     收到即逐页转文字、按 (id, 页) 缓存;read_pdf 给文字 + 图;按 id 搜内容 ⬜ 等 6b
 M6-7  待办             装作业和考试;放在学习之后
 M6-8  归拢自动跑        后台作业
