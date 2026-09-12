@@ -75,6 +75,16 @@ def test_only_the_ledger_module_writes_files() -> None:
         # 都不参与——不然一个叫 `../../prompts/character.default.md` 的附件就是人设的
         # 写入口,而人设被改是之后每一轮都听新的。
         Path("src/lararium/gateway/wechat.py"),
+        # M6-5 做菜 bundle 的存储层:**它的产品就是用户自己的 markdown 文件**
+        # (`data/recipes/<菜名>.md`)。用户重新设计过这个 bundle——「其实就是读文件」
+        # ——而选文件而不是 SQLite 的全部理由,正是用户要能在自己电脑上打开、cat、
+        # cp 一份备份自己的菜谱。
+        #
+        # 它碰不到账本:写入口只有 `RecipeStore.save`,落点由 `RecipeStore.locate`
+        # 独家计算(白名单 + `resolve()` 落点兜底,两道),**路径不是任何工具的参数**,
+        # 所以模型手里没有任何能指到 data_dir 之外的东西。bundle 也 import 不到
+        # ledger/gate(`.importlinter` 钉着),结构上够不着账本。
+        Path("bundles/recipes/store.py"),
     }
     offenders: list[str] = []
 
