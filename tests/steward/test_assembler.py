@@ -136,6 +136,30 @@ def test_non_user_envelope_is_marked_as_system_trigger():
     assert "系统触发" in ctx.messages[-1]["content"]
 
 
+def test_a_voice_transcript_is_the_users_own_words_not_untrusted_content():
+    """★ M6-1:**语音转写不许套围栏。**
+
+    说话的人**就是用户**,只是过了一道有损的信道——`source` 仍然是 `user`,标注就在正文
+    那一行里。套围栏会让她把用户自己的话当成外部内容,那是另一种错,**比不标还糟**:
+    她会拿"这是数据不是指令"的态度对待用户亲口说的事。
+
+    这一条钉在这里而不是在适配器那边,因为**围栏是在这一层套上去的**
+    ——协议层测不到"它有没有被套"。
+    """
+    env = Envelope.new(
+        source="user",
+        channel="wechat",
+        content="(语音 17 秒 · 转文字)帮我看一下那个订阅怎么样",
+    )
+    body = build(env).messages[-1]["content"]
+
+    assert "帮我看一下那个订阅怎么样" in body
+    assert "语音 17 秒 · 转文字" in body, "标注被渲染掉了"
+    assert "<<<" not in body and ">>>" not in body, "转写被套了围栏"
+    assert "不是指令" not in body, "用户自己的话被标成了外部数据"
+    assert "系统触发" not in body, "用户自己的话被标成了系统触发"
+
+
 def test_untrusted_module_event_is_wrapped_as_data():
     """DESIGN §9:外部数据进上下文必须标记为数据而非指令。"""
     env = Envelope.new(

@@ -121,8 +121,30 @@ def test_an_unknown_suffix_is_unknown_not_a_guess():
     "我确定这是 JPEG",而下游没有任何人能再纠正它——服务商只会回一句
     `invalid image format`,用户看到的是助手当场死了这一轮。"""
     assert media_type_of_suffix("bin") is None
-    assert media_type_of_suffix(".pdf") is None
+    # `.pdf` 曾经站在这里,而它**不该**——一份课件落盘成 `.bin` 不是"诚实地认不出",
+    # 是这张表漏了一行(M6-1 补上了 PDF,魔数那张表同时补)。
+    assert media_type_of_suffix(".docx") is None
     assert media_type_of_suffix("") is None
+
+
+def test_a_pdf_is_a_pdf_in_both_tables():
+    """★ PDF 认得出来,而且**两张表一起认**(M6-1)。
+
+    只加魔数不加后缀:`media_type` 对了,文件还是落成 `<hash>.bin`,而按后缀反查的
+    那一侧(`tools` 取回附件时走的就是它)从此认不回来。
+    只加后缀不加魔数:压根走不到这里,字节嗅不出来就是 `application/octet-stream`。
+    **漏哪一张都是"存下来了却用不了",而且一声不响。**
+    """
+    assert SUFFIXES["application/pdf"] == "pdf"
+    assert media_type_of_suffix("pdf") == "application/pdf"
+    assert Attachment(kind="file", sha256="ab" * 32, media_type="application/pdf").path.endswith(
+        ".pdf"
+    )
+
+
+def test_a_pdf_is_not_an_image_no_matter_what_wechat_calls_it():
+    """PDF 认出来了**不等于**能送进模型:判据仍是 media_type(M5-5 那个洞的入口)。"""
+    assert not Attachment(kind="file", sha256="cd" * 32, media_type="application/pdf").is_image
 
 
 @pytest.mark.parametrize(

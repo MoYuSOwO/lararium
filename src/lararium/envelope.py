@@ -34,6 +34,11 @@ SUFFIXES: dict[str, str] = {
     "image/heif": "heif",
     "audio/silk": "silk",
     "video/mp4": "mp4",
+    # M6-1:PDF 原来嗅不出来也没有后缀,一份课件落盘成 `<hash>.bin`、类型是
+    # `application/octet-stream`——**存下来了,但认不出、用不了**。这张表和
+    # `wechat._MAGIC` 的魔数**必须一起动**:只加一张的话它照样落成 `.bin`,
+    # 而那是把一次响亮的失败换成一次静默的失败(M5-5)。
+    "application/pdf": "pdf",
 }
 _DEFAULT_SUFFIX = "bin"
 # 反查方向。**由正查表算出来,不另抄一份**——抄一份反过来写的那天两边就开始漂,

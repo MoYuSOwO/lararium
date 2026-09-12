@@ -102,6 +102,11 @@ BACKOFF_CEILING = 300.0
 #
 # 每一项是「若干个 (偏移, 字节) 全都对上」→ media_type。`ftyp` 在偏移 4 处对 MP4 和
 # HEIC 都成立,分野在偏移 8 的 brand——所以 brand 必须一起判,一个格式一行,不玩花的。
+#
+# **PDF 是 M6-1 补的**,而它是"声称不足"那个方向的第三个实例:一份 PDF 原来嗅不出来,
+# 落盘成 `<hash>.bin`、`media_type` 是 `application/octet-stream`,存下来了但**认不出、
+# 用不了**。两张表要一起动(这里的魔数 + `envelope.SUFFIXES` 的后缀),只加一张的话
+# 它照样落成 `.bin`——**而那正是"把一次响亮的失败换成一次静默的失败"**。
 _MAGIC: tuple[tuple[tuple[tuple[int, bytes], ...], str], ...] = (
     (((0, b"\xff\xd8\xff"),), "image/jpeg"),
     (((0, b"\x89PNG\r\n\x1a\n"),), "image/png"),
@@ -112,6 +117,7 @@ _MAGIC: tuple[tuple[tuple[tuple[int, bytes], ...], str], ...] = (
     (((4, b"ftyp"), (8, b"heix")), "image/heic"),
     (((4, b"ftyp"), (8, b"mif1")), "image/heif"),
     (((4, b"ftyp"), (8, b"msf1")), "image/heif"),
+    (((0, b"%PDF-"),), "application/pdf"),
 )
 # 魔数认不出来时按种类兜底。语音是 SILK(官方要转码成 wav,那不是这一步的事)。
 _FALLBACK_MEDIA_TYPES: dict[str, str] = {
@@ -119,6 +125,10 @@ _FALLBACK_MEDIA_TYPES: dict[str, str] = {
     "video": "video/mp4",
 }
 _DEFAULT_MEDIA_TYPE = "application/octet-stream"
+# 微信没给出转写的那条语音,正文里要多这一行(M6-1)。**占位符必须说实话**:
+# 原来正文里只有一行 `(语音 · media/…)`,它既没说"这条没有文字",也没说"音频我读不了"
+# ——于是模型会对着一行占位符编内容(真机上干过)。**说不出来比编出来强。**
+_VOICE_WITHOUT_TRANSCRIPT = "(上面这条语音微信没转出文字,而音频我也听不了——你打字说一下吧)"
 
 
 def _sniff(data: bytes, kind: str) -> str:
@@ -277,6 +287,10 @@ class WeChatAdapter:
 
         **附件先落盘,信封里放引用**——把字节塞进信封等于把它塞进每一次序列化和
         每一行日志,而 `content` 仍是字符串这条纪律不许绕(它是所有外部输入的入口)。
+
+        **语音的音频一律存下来,哪怕微信已经给了转写**(M6-1):几 KB 换"以后想重转
+        还有原件",而这个"以后"有具体形状——哪天发现长语音糊得厉害,想拿别的 ASR
+        重跑一遍,总得有原件在。
         """
         if not message.media:
             await self._route(message.text)
@@ -289,6 +303,10 @@ class WeChatAdapter:
                 continue
             attachments.append(saved)
             lines.append(saved.as_line())
+            # 转写在 `_text_of` 那边已经按原序进正文了;**没有转写的那条**得在这里说清楚
+            # ——只有这一层分得出"有文字"和"没文字",而模型两种都看不出来。
+            if ref.kind == "voice" and not ref.has_transcript:
+                lines.append(_VOICE_WITHOUT_TRANSCRIPT)
         content = "\n".join(part for part in [message.text, *lines] if part)
         await self._post_message(content, attachments)
         await self._say(self._media_receipt(attachments, len(message.media)))
