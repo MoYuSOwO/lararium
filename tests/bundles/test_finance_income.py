@@ -1,6 +1,6 @@
-"""M6-3 `record_income` / `list_income`:账本终于有了"钱回来了"这个口子。
+"""M6-3 `record_income` / `list_income`,以及 M6-3a **把退款并进收入**之后剩下的那一半。
 
-## 为什么要有它
+## 为什么有这个口子
 
 真机上那 600 元 ChatGPT 退款**记不进去**,在一个话头里挂了三天。用户的原话:
 
@@ -8,32 +8,31 @@
 > "要一个大于 0 的数字"。所以要么等你给我补个能记退款的口子,要么我按冲抵处理
 > ——去动那两笔 GPT 的账。**但那样底稿就不是原始记录了,我不建议,先挂着。**」
 
-她的处置全对,而**那道校验也是对的**:负数支出不是退款,是一笔坏数据。所以这次补的
-不是"放宽校验",是一张新表加两个工具;`record_expense` 收到负数时改成**指路**
-(`record_income`),而不是继续只说"要一个大于 0 的数字"。
+她的处置全对,而**那道校验也是对的**:负数支出不是退款,是一笔坏数据。所以补的不是
+"放宽校验",是一张新表加两个工具;`record_expense` 收到负数时改成**指路**(`record_income`)。
 
-## 退款和收入不是一件事,这个文件大半在钉这一条
+## M6-3a:退款不再是一个单独的东西
 
-    退款  冲抵某一笔支出 → 「这个月花了多少」要**减掉**它
-    收入  生活费/兼职/红包 → **根本不该出现在"花了多少"里**
+M6-3 给这张表加了 `kind`(refund | income)和 `of_expense_id`(冲抵哪一笔),
+「花了多少」减 refund、不减 income。用户验收完当天把这一半推翻了:
 
-混成一个的症状很具体:记一笔 3000 生活费,然后「这个月花了多少」变成 -3000。
-所以这里有一对对称的测试(`..._comes_off_what_you_spent` /
-`test_income_does_not_touch_what_you_spent`),**两条都断整份输出**,不断片段
-——少一行、多一行、数字对了口径错了,都红(T6 第五种)。
+> 「我觉得没必要退款啊,**很难说全退**,所以我觉得没啥用。退款就弄成收入就行。」
 
-## 为什么是新表,不是给 expenses 加符号位
+**他的理由比 M6-3 里写的任何一条都硬**:`of_expense_id`「冲抵某一笔支出」这个建模
+**假设退款是全额的**。真实退款经常是部分退、几笔合并退、退到代金券,那个指针大多数时候
+指不准;而「抵掉退款后实际花掉 Z」这个数**整个建在那个指针上**——前提不成立,派生出来
+的数就**比没有更坏**:一个读起来很确定的数字,底下是个猜的对应关系。
 
-论证写在 `bundles/finance/server.py` 的 `income` 表旁边。测试这一侧的成本证据是:
-本文件里「支出侧输出逐字节不变」那几条断言,在符号位方案下**一条都不成立**
-——收入行会带着一个没有意义的 `category` 挤进 `query_spending` 的 GROUP BY。
+于是这里只剩一个数、一个口径:**收入不算在「花了多少」里**。退款到账也记成收入。
+本文件被删掉的那些测试(退款怎么减、指针怎么校验、悬空引用怎么说出口)在交付报告里
+逐条交代过——它们钉的行为不是"红了",是**不存在了**。
 """
 
 import sqlite3
 from pathlib import Path
 
 import pytest
-from bundles.finance.server import _INCOME_SQL, INCOME_KINDS, build
+from bundles.finance.server import _INCOME_SQL, build
 
 SHANGHAI = "Asia/Shanghai"
 
@@ -64,7 +63,8 @@ LEGACY_ROWS = (
 )
 
 # **金样是改动前的代码在这份老库上跑出来的**(照 M5-26 的口径:不是照着新代码誊的)。
-# 建了 income 表之后,这三份输出一个字节都不许变。
+# 建了 income 表之后,这三份输出一个字节都不许变;M6-3a 把退款那一摊拆掉之后,
+# **它们还是这三份**——基线就是 M6-3 之前那个提交(50fde56)。
 LEGACY_LIST = "\n".join(
     (
         "最近 10 笔:",
@@ -106,13 +106,31 @@ LEGACY_BY_DAY = "\n".join(
 
 MONTH = {"since": "2026-09-01", "until": "2026-09-30"}
 
+# ── M6-3a 的"老库":M6-3 已经推上真机的那张 `income` 表(带 `kind` / `of_expense_id`)。
+# 真机那张是 0 行,但**有行的情况也要对**,所以这里塞的是最难看的三行:一条退款指着
+# **已删**的 #1(`record_income` 拒绝这么记,而从 `delete_expense` 那个方向进来照样能
+# 落成这样——M6-3 验收时抓到的正是这个)、一条退款指着活着的 #13、一条普通收入。
+M63_INCOME_DDL = (
+    "CREATE TABLE income (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    " amount_cents INTEGER NOT NULL, kind TEXT NOT NULL, occurred_at TEXT NOT NULL,"
+    " note TEXT, of_expense_id INTEGER, created_at TEXT NOT NULL,"
+    " deleted_at TEXT, deleted_reason TEXT);"
+    "CREATE INDEX idx_income_occurred_at ON income(occurred_at);"
+)
+# (id, 分, kind, occurred_at, 备注, of_expense_id, deleted_at)
+M63_INCOME_ROWS = (
+    (1, 60000, "refund", "2026-09-12T10:00:00", "ChatGPT 退的", 13, None),
+    (2, 300000, "income", "2026-09-15T20:00:00", "妈妈打的", None, None),
+    (3, 1500, "refund", "2026-09-13T11:00:00", "打车退的", 1, None),
+)
+
 
 def tool(runtime, name: str):
     return next(f for f in runtime.tools if f.__name__ == name)
 
 
 def income_rows(data_dir: Path) -> list[sqlite3.Row]:
-    """查全部收入/退款行,含已删的。"""
+    """查全部收入行,含已删的。"""
     conn = sqlite3.connect(data_dir / "finance" / "finance.sqlite")
     conn.row_factory = sqlite3.Row
     try:
@@ -130,6 +148,14 @@ def expense_rows(data_dir: Path) -> list[sqlite3.Row]:
         conn.close()
 
 
+def income_columns(data_dir: Path) -> list[str]:
+    conn = sqlite3.connect(data_dir / "finance" / "finance.sqlite")
+    try:
+        return [row[1] for row in conn.execute("PRAGMA table_info(income)")]
+    finally:
+        conn.close()
+
+
 def make_legacy_database(root: Path) -> None:
     (root / "finance").mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(root / "finance" / "finance.sqlite")
@@ -138,6 +164,20 @@ def make_legacy_database(root: Path) -> None:
         "INSERT INTO expenses (id, amount_cents, category, occurred_at, note, deleted_at,"
         " deleted_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [(*row, LEGACY_RETIRED if row[5] else None, row[3]) for row in LEGACY_ROWS],
+    )
+    conn.commit()
+    conn.close()
+
+
+def make_m63_database(root: Path) -> None:
+    """M6-3 形状的库:13 行支出 + 一张带 `kind` / `of_expense_id` 的 `income` 表。"""
+    make_legacy_database(root)
+    conn = sqlite3.connect(root / "finance" / "finance.sqlite")
+    conn.executescript(M63_INCOME_DDL)
+    conn.executemany(
+        "INSERT INTO income (id, amount_cents, kind, occurred_at, note, of_expense_id,"
+        " deleted_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [(*row, row[3]) for row in M63_INCOME_ROWS],
     )
     conn.commit()
     conn.close()
@@ -161,56 +201,49 @@ def gpt(runtime):
     return runtime
 
 
-# ─────────────────────────── ★ 四条核心口径 ───────────────────────────
+# ─────────────────────── ★ M6-3a 的硬口径:支出侧回到基线 ───────────────────────
 
 
-def test_a_refund_comes_off_what_you_spent_while_the_original_row_stays_untouched(gpt, tmp_path):
-    """★ 口径一:记一笔退款指向某笔支出 → 「花了多少」减掉了它,而**底稿一字不变**。
+def test_the_expense_side_reads_byte_for_byte_as_the_baseline_commit_printed(tmp_path):
+    """★ 支出侧三个视图回到 **M6-3 之前(50fde56)逐字节一样**。
 
-    两件事一起断,因为用户自己就是这么判的:她拒绝"去动那两笔 GPT 的账",理由是
-    「那样底稿就不是原始记录了」。所以退款必须在**账面之外**生效——
-    `list_recent` 逐字节不变,而合计那边把三个数都说出来。
+    库里躺着三条"退款"——其中一条还指着一笔已删的支出——而这三份输出里**一个字都不许
+    提到它们**:退款并进收入之后,「花了多少」只回答支出,不再被任何东西改写。
+    这也是 M6-3a 唯一一条"拆之前必然红"的测试:拆之前这里会多出一行
+    「同期收到退款 615.00 元(2 笔):支出 1555.03 元,抵掉退款后实际花掉 940.03 元。」
+
+    金样的出处(照 M5-26 / M6-3 立的口径:**金样必须是旧代码产出的,不是照着新代码誊的**):
+    用 `importlib.util.spec_from_file_location` 把 `git show 50fde56:bundles/finance/server.py`
+    当一个独立模块加载,在**同一份库**(带 income 表、带那三行)上跑同样三次调用,输出就是
+    上面那三个常量——它们从 M6-3 起一个字节没动,而基线代码压根不认识 income 表,
+    所以"库里有没有退款行"对它没有任何影响(这一条脚本也验了)。
+
+    为什么那段 importlib 不搬进本文件:它要么得 `subprocess` 去调 git(全局约束里
+    「无 shell」的反面,而且浅克隆下那个 commit 可能压根不在),要么得把 640 行旧代码抄进
+    仓库当 fixture(G2 换个姿势)。所以走 M5-26 那条路——**金样冻在这里,产出它的脚本
+    在交付报告里交代**。
     """
-    before = tool(gpt, "list_recent")()
-    rows_before = [dict(r) for r in expense_rows(tmp_path)]
+    make_m63_database(tmp_path)
 
-    said = tool(gpt, "record_income")(
-        amount=600,
-        kind="refund",
-        occurred_at="2026-09-12 10:00",
-        note="ChatGPT 退的",
-        of_expense_id=1,
-    )
+    runtime = build(tmp_path, timezone=SHANGHAI)
 
-    assert said == (
-        "记好了:退款 600.00 元(09-12 10:00),冲抵 #1(其他 500.00 元)"
-        " · 备注「ChatGPT 退的」。「花了多少」里会减掉它。"
-    ), said
-    assert tool(gpt, "list_recent")() == before, "退款动了底稿——原始记录不许被改"
-    assert [dict(r) for r in expense_rows(tmp_path)] == rows_before, "expenses 表被动了"
-    assert tool(gpt, "query_spending")(**MONTH, group_by="category") == "\n".join(
-        (
-            "2026-09-01 ~ 2026-09-30,共 2 笔,合计 634.16 元(按类目):",
-            "- 其他 634.16 元(2 笔)",
-            "同期收到退款 600.00 元(1 笔):支出 634.16 元,抵掉退款后实际花掉 34.16 元。",
-        )
-    )
+    assert tool(runtime, "list_recent")() == LEGACY_LIST
+    assert tool(runtime, "query_spending")(**MONTH, group_by="category") == LEGACY_BY_CATEGORY
+    assert tool(runtime, "query_spending")(**MONTH, group_by="day") == LEGACY_BY_DAY
 
 
 def test_income_does_not_touch_what_you_spent(gpt, tmp_path):
-    """★ 口径二:记一笔收入 → 「花了多少」**一个字不变**。
+    """★ 剩下的那一条口径:记一笔收入 → 「花了多少」**一个字不变**、底稿一个字不变。
 
-    这是 M6-3 最容易搞错的地方:把退款和收入混成一个,记一笔 3000 生活费之后
-    「这个月花了多少」就变成 -3000。所以这里断的是**整份输出相等**,而且金额取 3000
-    ——比支出总额大一个数量级,漏进去藏不住。
+    金额取 3000——比支出总额大一个数量级,漏进去藏不住。断的是**整份输出相等**,
+    不断片段:少一行、多一行、数字对了口径错了,都红(T6 第五种)。
     """
     before_total = tool(gpt, "query_spending")(**MONTH, group_by="category")
     before_day = tool(gpt, "query_spending")(**MONTH, group_by="day")
     before_list = tool(gpt, "list_recent")()
+    rows_before = [dict(r) for r in expense_rows(tmp_path)]
 
-    said = tool(gpt, "record_income")(
-        amount=3000, kind="income", occurred_at="2026-09-10 15:00", note="生活费"
-    )
+    said = tool(gpt, "record_income")(amount=3000, occurred_at="2026-09-10 15:00", note="生活费")
 
     assert said == (
         "记好了:收入 3000.00 元(09-10 15:00) · 备注「生活费」。收入不算在「花了多少」里。"
@@ -218,81 +251,36 @@ def test_income_does_not_touch_what_you_spent(gpt, tmp_path):
     assert tool(gpt, "query_spending")(**MONTH, group_by="category") == before_total
     assert tool(gpt, "query_spending")(**MONTH, group_by="day") == before_day
     assert tool(gpt, "list_recent")() == before_list
+    assert [dict(r) for r in expense_rows(tmp_path)] == rows_before, "expenses 表被动了"
     assert len(income_rows(tmp_path)) == 1, "收入没落进自己那张表"
 
 
-def test_pointing_a_refund_at_a_row_that_is_not_there_says_so_and_writes_nothing(gpt, tmp_path):
-    """★ 口径三:指向不存在的 `of_expense_id` → 人话,**不落行**。"""
-    said = tool(gpt, "record_income")(amount=600, kind="refund", of_expense_id=9999)
-
-    assert "9999" in said and "list_recent" in said, f"得告诉它去哪儿找 #id:{said}"
-    assert "of_expense_id" in said, f"得给一条出路(对不上就别传):{said}"
-    assert income_rows(tmp_path) == [], "校验没过却落了行"
+# ─────────────────────────── 那一个数怎么说出口 ───────────────────────────
 
 
-def test_pointing_a_refund_at_a_deleted_row_says_so_and_writes_nothing(gpt, tmp_path):
-    """★ 口径四:指向**已删**的支出 → 人话,不落行(M5-31 给 amend 答过同一个问题)。
+def test_list_income_says_the_total_with_the_caliber_spelled_out(gpt):
+    """★ `list_income` 只剩一个数:合计 + 笔数,**而口径那半句必须跟着**。
 
-    为什么不放过去:已删的那行不在任何合计里,退款"冲抵"它就是冲抵一个不存在的数,
-    而回话会说得像办成了——用户以为这个月少花了 600,账上并没有。
+    少了「收入不算在「花了多少」里」,「3000」这个数就没有单位——而月度复盘里
+    「花了多少」和「进了多少」是两个数、两套算法,说错一个整段复盘就是错的。
+    M6-3a 之后这半句是这个工具仅存的两个存在理由之一(另一个是那个全区间合计)。
     """
-    tool(gpt, "delete_expense")(expense_id=1, reason="记重了")
-
-    said = tool(gpt, "record_income")(amount=600, kind="refund", of_expense_id=1)
-
-    assert "#1" in said and "已经删" in said, said
-    assert "of_expense_id" in said, f"得给一条出路:{said}"
-    assert income_rows(tmp_path) == [], "指向已删行的退款落了库"
-
-
-# ─────────────────────────── 两个口径怎么说出口 ───────────────────────────
-
-
-def test_list_income_says_both_numbers_with_what_each_one_means(gpt):
-    """两个数都要能说出口径——「进了多少」是收入,而退款是从「花了多少」里减掉的。
-
-    她在真机 [262] 干过一次对的事:「其实是**五天**。账本 9 月 6 号才开张,9/1-9/5
-    是空的」。同样的实话精神:两个数摆出来,各自说清它是什么口径,别让模型自己猜。
-    """
-    tool(gpt, "record_income")(
-        amount=3000, kind="income", occurred_at="2026-09-10 15:00", note="生活费"
-    )
-    tool(gpt, "record_income")(
-        amount=600,
-        kind="refund",
-        occurred_at="2026-09-12 10:00",
-        note="ChatGPT 退的",
-        of_expense_id=1,
-    )
+    tool(gpt, "record_income")(amount=3000, occurred_at="2026-09-10 15:00", note="生活费")
+    tool(gpt, "record_income")(amount=600, occurred_at="2026-09-12 10:00", note="ChatGPT 退的")
 
     assert tool(gpt, "list_income")(**MONTH) == "\n".join(
         (
-            "2026-09-01 ~ 2026-09-30 收入 3000.00 元(1 笔),退款 600.00 元(1 笔)。"
-            "退款从「花了多少」里减掉,收入不算在里面。",
-            "- 2026-09-12 10:00 退款 600.00 元(冲抵 #1) · 备注「ChatGPT 退的」",
+            "2026-09-01 ~ 2026-09-30 收入 3600.00 元(2 笔)。收入不算在「花了多少」里。",
+            "- 2026-09-12 10:00 收入 600.00 元 · 备注「ChatGPT 退的」",
             "- 2026-09-10 15:00 收入 3000.00 元 · 备注「生活费」",
         )
     )
 
 
-@pytest.mark.parametrize(
-    ("kind", "expected"),
-    [
-        ("income", "收入 3000.00 元(1 笔)。收入不算在「花了多少」里。"),
-        ("refund", "退款 3000.00 元(1 笔)。退款从「花了多少」里减掉。"),
-    ],
-)
-def test_list_income_states_the_kind_it_actually_has(runtime, kind, expected):
-    """只有一种的时候只说那一种,而**口径那半句照说**:少了它,「3000」这个数就没有单位。"""
-    tool(runtime, "record_income")(amount=3000, kind=kind, occurred_at="2026-09-10 15:00")
-
-    assert tool(runtime, "list_income")().startswith(expected), tool(runtime, "list_income")()
-
-
 def test_list_income_on_an_empty_table_does_not_claim_the_ledger_is_empty(runtime):
     """ "这段没有" ≠ "一笔都没记过"(照 `list_recent` 的那条教训,别混成一句)。"""
-    assert tool(runtime, "list_income")() == "还没有记过收入或退款。"
-    assert tool(runtime, "list_income")(**MONTH) == "2026-09-01 ~ 2026-09-30 没有收入也没有退款。"
+    assert tool(runtime, "list_income")() == "还没有记过收入。"
+    assert tool(runtime, "list_income")(**MONTH) == "2026-09-01 ~ 2026-09-30 没有收入。"
 
 
 @pytest.mark.parametrize("bounds", [{"since": "上周"}, {"until": "九月底"}])
@@ -313,9 +301,7 @@ def test_list_income_totals_cover_the_whole_range_even_when_rows_are_capped(runt
     静默截断读起来和"就这些"一模一样,模型会拿残缺的合计下结论。
     """
     for day in range(1, 23):
-        tool(runtime, "record_income")(
-            amount=100, kind="income", occurred_at=f"2026-09-{day:02d} 10:00"
-        )
+        tool(runtime, "record_income")(amount=100, occurred_at=f"2026-09-{day:02d} 10:00")
 
     # limit=50 顺手把硬封顶一起断了:钳到 20,不是"limit 说多少给多少"。
     said = tool(runtime, "list_income")(limit=50, **MONTH)
@@ -325,160 +311,21 @@ def test_list_income_totals_cover_the_whole_range_even_when_rows_are_capped(runt
     assert "还有 2 笔更早的没列出来" in said, f"截断没说出口:{said}"
 
 
-def test_a_refund_bigger_than_the_spending_says_it_was_a_net_return(gpt):
-    """退款比支出还多:说"净收回",不说"实际花掉 -965.84 元"。
-
-    负数的"花了多少"是一句读不懂的话,而这个区间确实是钱变多了。
-    """
-    tool(gpt, "record_income")(
-        amount=1600, kind="refund", occurred_at="2026-09-12 10:00", of_expense_id=1
-    )
-
-    said = tool(gpt, "query_spending")(**MONTH, group_by="category")
-
-    assert said.endswith(
-        "同期收到退款 1600.00 元(1 笔):支出 634.16 元,抵掉退款后净收回 965.84 元。"
-    ), said
-
-
-def test_a_range_with_only_refunds_does_not_say_there_are_no_records(runtime):
-    """区间里没有支出、只有退款:不许回"没有记录"——那是在说这段时间什么都没发生。"""
-    tool(runtime, "record_income")(amount=600, kind="refund", occurred_at="2026-09-12 10:00")
-
-    assert tool(runtime, "query_spending")(**MONTH, group_by="category") == (
-        "2026-09-01 ~ 2026-09-30 没有支出,同期收到退款 600.00 元(1 笔)。"
-    )
-
-
-def test_a_refund_outside_the_range_is_not_netted(gpt):
-    """退款按**它自己的日期**落进区间,不跟着它指的那笔支出跑。
-
-    不然「9 月花了多少」会被 10 月才到账的退款改写,而那个数昨天还是另一个。
-    """
-    tool(gpt, "record_income")(
-        amount=600, kind="refund", occurred_at="2026-10-03 10:00", of_expense_id=1
-    )
-
-    assert tool(gpt, "query_spending")(**MONTH, group_by="category") == "\n".join(
-        (
-            "2026-09-01 ~ 2026-09-30,共 2 笔,合计 634.16 元(按类目):",
-            "- 其他 634.16 元(2 笔)",
-        )
-    ), "9 月的合计被 10 月的退款改写了"
-
-
-def test_an_expense_with_no_refunds_reads_exactly_as_it_did_before(gpt):
-    """没有退款时,`query_spending` 一个字节都不许多——这是本任务的硬口径。"""
-    for group_by in ("category", "day"):
-        said = tool(gpt, "query_spending")(**MONTH, group_by=group_by)
-        assert "退款" not in said and "实际花掉" not in said, said
-
-
-# ─────────────────────────── 那笔支出后来被删了 ───────────────────────────
-
-
-def test_deleting_the_expense_a_refund_points_at_leaves_the_refund_alone(gpt, tmp_path):
-    """删掉被冲抵的那笔支出,**不许偷偷动那条退款**。
-
-    退款是它自己的一条记录(收到钱这件事发生过),而 `delete_expense` 的职责是
-    "这笔支出不该在账上"。让它顺手改掉别的表,正是 M5-20 那个事故的形状
-    ——状态变更藏在一个名字不同的动作底下。两个数都还在、都看得见,用户自己判。
-    """
-    tool(gpt, "record_income")(
-        amount=600, kind="refund", occurred_at="2026-09-12 10:00", of_expense_id=1
-    )
-    before = [dict(r) for r in income_rows(tmp_path)]
-
-    tool(gpt, "delete_expense")(expense_id=1, reason="记重了")
-
-    assert [dict(r) for r in income_rows(tmp_path)] == before, "删支出改动了退款行"
-    assert "退款 600.00 元" in tool(gpt, "list_income")(), "退款不见了"
-
-
-def test_deleting_a_refunded_expense_says_the_refund_is_still_netting_off(gpt):
-    """★ 验收补:删掉被冲抵的那笔支出时,**回话必须把那笔退款说出口**。
-
-    上面那条定的是"不许偷偷动退款行",而它的 docstring 结尾写着「两个数都还在、
-    都看得见,**用户自己判**」——**而原来这句是空的**:回话只说「合计里不算它了」,
-    模型没有任何理由去提那 600,于是用户永远不知道。
-
-    破的是 `record_income` 自己立的那条不变量:**退款不许指着一条不在账上的支出**。
-    写退款那个方向有闸(`test_pointing_a_refund_at_a_deleted_row_...`),
-    从删支出这个方向进来是敞的——同一个假设写在两处、只守一处(M5-8 的原话)。
-    而它是**无声**破:退款照旧从「花了多少」里减,`list_income` 照旧印着
-    `(冲抵 #1)`,`#1` 在 `list_recent` 里已经找不到,模型只能自己编个解释。
-
-    不拦这次删除:底稿是用户的(M5-20 就是真机逼出来的)。只把事实说出口。
-    """
-    tool(gpt, "record_income")(
-        amount=600, kind="refund", occurred_at="2026-09-12 10:00", of_expense_id=1
-    )
-
-    said = tool(gpt, "delete_expense")(expense_id=1, reason="记重了")
-
-    assert said == (
-        "删了 #1:其他 500.00 元 · 原因「记重了」。合计里不算它了。"
-        "有 1 笔退款(合计 600.00 元)指着这笔,删掉它之后那笔退款还在账上、"
-        "还在从「花了多少」里减,而对应的支出没有了。"
-        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
-    ), said
-
-
-def test_deleting_an_expense_nothing_points_at_reads_exactly_as_it_did_before(gpt):
-    """而没有退款指着它时,这句话一个字都不许多(M5-20 那条回话逐字节不变)。
-
-    单独钉一条的理由:`test_finance_delete.py` 里那些断言是这句话的原始记录,
-    而**它们在这个文件里看不见**——有人日后把那个 `if hit["n"]` 去掉、让这句
-    无条件追加,红的会是另一个文件里一条看起来无关的测试。
-    """
-    said = tool(gpt, "delete_expense")(expense_id=1, reason="记重了")
-
-    assert said == (
-        "删了 #1:其他 500.00 元 · 原因「记重了」。合计里不算它了。"
-        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
-    ), said
-
-
 # ─────────────────────────── E2:工具边界不许抛 ───────────────────────────
 
 
-def test_income_cannot_point_at_an_expense(gpt, tmp_path):
-    """`of_expense_id` 只给退款用。收入不冲抵任何支出,传了就是把两件事混了。
-
-    不许悄悄接受:那会让模型以为自己记了一笔退款,而合计里一分都没减。
-    """
-    said = tool(gpt, "record_income")(amount=3000, kind="income", of_expense_id=1)
-
-    assert "refund" in said and "of_expense_id" in said, said
-    assert income_rows(tmp_path) == [], "混了口径却落了行"
-
-
-def test_an_unknown_kind_is_refused_with_both_meanings_spelled_out(runtime, tmp_path):
-    """看不懂的 kind 要把**两种的意思都写出来**,模型才能自己选对再重试(E2)。
-
-    只列合法值不够:`income` 和 `refund` 这两个词本身不解释"哪个会减掉花了多少"。
-    """
-    said = tool(runtime, "record_income")(amount=600, kind="退货")
-
-    assert "退货" in said
-    for legal in INCOME_KINDS:
-        assert legal in said, f"提示里必须列全合法值:{said}"
-    assert "减掉" in said and "不算" in said, f"两种口径都得说出来:{said}"
-    assert income_rows(tmp_path) == []
-
-
-def test_a_non_positive_amount_points_at_the_sign_instead_of_the_direction(runtime, tmp_path):
-    """收入和退款也都记**正数**,方向由 kind 决定。0 和负数一样挡掉、一样不落行。"""
+def test_a_non_positive_amount_is_refused_and_records_nothing(runtime, tmp_path):
+    """收入也记**正数**。0 和负数一样挡掉、一样不落行(照 `record_expense` 那条)。"""
     for bad in (0, -600):
-        said = tool(runtime, "record_income")(amount=bad, kind="refund")
-        assert "金额" in said and "kind" in said, said
+        said = tool(runtime, "record_income")(amount=bad)
+        assert "金额" in said and "这笔没记" in said, said
 
     assert income_rows(tmp_path) == []
 
 
 def test_an_unparseable_time_is_refused_and_records_nothing(runtime, tmp_path):
     """看不懂的时间不许悄悄退回"现在"(照 `record_expense` 的那条教训)。"""
-    said = tool(runtime, "record_income")(amount=600, kind="refund", occurred_at="上周三")
+    said = tool(runtime, "record_income")(amount=600, occurred_at="上周三")
 
     assert "上周三" in said and "YYYY-MM-DD" in said
     assert income_rows(tmp_path) == []
@@ -490,7 +337,7 @@ def test_absurdly_large_amount_returns_readable_hint_instead_of_escaping(runtime
     和 `record_expense` 同一个坑,所以同一道上界。E2 的意义正是边界上不推演可能性。
     """
     for bad in (1e17, 10**19):
-        said = tool(runtime, "record_income")(amount=bad, kind="income")
+        said = tool(runtime, "record_income")(amount=bad)
         assert "金额" in said
 
     assert income_rows(tmp_path) == []
@@ -500,7 +347,7 @@ def test_record_expense_points_at_record_income_when_the_amount_is_negative(runt
     """★ 真机那一刻:记 -600 被挡回来。**校验照旧挡,但这次得指路。**
 
     上一版只说"要一个大于 0 的数字",于是用户的下一步是去动那两笔 GPT 的原始记录
-    (她自己判断不该动,挂了三天)。负数支出几乎只有一个来头——想记退款或收入。
+    (她自己判断不该动,挂了三天)。负数支出几乎只有一个来头——想记的是钱回来了。
     0 和溢出不指路:那两个不是"方向搞反了",多一句话只是噪音。
     """
     said = tool(runtime, "record_expense")(amount=-600, category="其他")
@@ -513,10 +360,10 @@ def test_record_expense_points_at_record_income_when_the_amount_is_negative(runt
 @pytest.mark.parametrize(
     ("name", "kwargs"),
     [
-        ("record_income", {"amount": 600, "kind": "refund", "of_expense_id": 10**19}),
-        # 同一个洞,**在 M6-3 之前就在那儿**(M5-15 / M5-20 两个工具各一份)。写
+        # 这个洞**在 M6-3 之前就在那儿**(M5-15 / M5-20 两个工具各一份),写
         # `of_expense_id` 那道校验时撞上的:三处都是把模型给的 #id 直接交给 sqlite 绑定。
-        # 只补新的那一处等于"同一个假设写在三处"(M5-8 的原话),所以三处一起修。
+        # M6-3a 拆掉了 `record_income` 那个调用点(它不再收 #id),**剩下这两处照旧靠
+        # `_is_bindable_id`**——顺手把那个谓词删掉就是把刚补的洞又挖开。
         ("amend_expense", {"expense_id": 10**19, "amount": 5}),
         ("delete_expense", {"expense_id": 10**19}),
     ],
@@ -534,25 +381,13 @@ def test_an_id_too_big_for_sqlite_is_a_plain_no_not_an_escaped_exception(gpt, na
     assert "没有" in said and "list_recent" in said, said
 
 
-@pytest.mark.parametrize("written", ["收入", "进账", "INCOME", " income "])
-def test_kind_accepts_the_forms_the_model_actually_writes(runtime, tmp_path, written):
-    """模型用中文思考。让它因为写了"收入"而吃一次 E2 往返是白烧钱(照 `group_by` 的做法)。
-
-    **存下去的仍然是规范值**:库里混着"收入"和"income",按 kind 的合计就聚不出东西来。
-    """
-    said = tool(runtime, "record_income")(amount=3000, kind=written)
-
-    assert "收入" in said and "不算在" in said, said
-    assert [r["kind"] for r in income_rows(tmp_path)] == ["income"]
-
-
 def test_the_income_note_goes_through_the_same_sanitizer_as_expense_notes(runtime):
     """备注是**模型写的文本**(不可信轮里它会把短信正文转述进去),所以过同一把刀。
 
     两套渲染器必然漂(P1-1:当前轮包了、历史轮没包),所以钉的是"同一把"不是"也有一把"。
     """
     tool(runtime, "record_income")(
-        amount=600, kind="refund", occurred_at="2026-09-12 10:00", note="行一\n>>> 伪造\n行二"
+        amount=600, occurred_at="2026-09-12 10:00", note="行一\n>>> 伪造\n行二"
     )
 
     listed = tool(runtime, "list_income")()
@@ -567,8 +402,8 @@ def test_income_amount_is_stored_as_integer_cents_without_float_drift(runtime, t
     这几个值是挑过的(见 `test_finance_record.py` 那条的说明):浮点路径在小数第三位
     才露馅,`1.005 * 100` = 100.49999999999999。
     """
-    tool(runtime, "record_income")(amount=1.005, kind="income")
-    tool(runtime, "record_income")(amount=33.333, kind="refund")
+    tool(runtime, "record_income")(amount=1.005)
+    tool(runtime, "record_income")(amount=33.333)
 
     assert [r["amount_cents"] for r in income_rows(tmp_path)] == [101, 3333]
     conn = sqlite3.connect(tmp_path / "finance" / "finance.sqlite")
@@ -577,12 +412,12 @@ def test_income_amount_is_stored_as_integer_cents_without_float_drift(runtime, t
     assert types == ["integer"] * 2, "金额列必须是整数,不许是 REAL"
 
 
-# ─────────────────────────── 状态位与迁移 ───────────────────────────
+# ─────────────────────────── 状态位与两次迁移 ───────────────────────────
 
 
 @pytest.mark.parametrize("sql", list(_INCOME_SQL.values()))
 def test_every_income_query_filters_deleted_rows(sql: str) -> None:
-    """给新表的状态位同一条机械保证(照 `test_every_listing_query_filters_deleted_rows`)。
+    """给这张表的状态位同一条机械保证(照 `test_every_listing_query_filters_deleted_rows`)。
 
     `deleted_at` 是照 M5-20 的形状(**不为新表发明第二套**);现在还没有 `delete_income`
     去写它(「先只做这两个」),但**每条查询从第一天就带着这个条件**——等那个工具来了,
@@ -592,11 +427,7 @@ def test_every_income_query_filters_deleted_rows(sql: str) -> None:
 
 
 def test_the_database_that_is_already_on_the_server_grows_the_new_table(tmp_path):
-    """★ 老库开库:新表建出来,**现有数据一行不动**,两个视图逐字节一致。
-
-    金样是**改动前的代码**在这份库上跑出来的(M5-26 的口径)。不是断片段:多一行、
-    少一行、顺序变了、某个数变了,都红(T6 第五种)。
-    """
+    """★ M6-3 之前那份老库开库:新表建出来,**现有数据一行不动**,三个视图逐字节一致。"""
     make_legacy_database(tmp_path)
 
     runtime = build(tmp_path, timezone=SHANGHAI)
@@ -606,31 +437,76 @@ def test_the_database_that_is_already_on_the_server_grows_the_new_table(tmp_path
     assert tool(runtime, "query_spending")(**MONTH, group_by="day") == LEGACY_BY_DAY
     assert len(expense_rows(tmp_path)) == len(LEGACY_ROWS), "迁移动了行数"
     assert income_rows(tmp_path) == [], "新表建出来了,但里面不该有东西"
-    assert tool(runtime, "list_income")() == "还没有记过收入或退款。"
+    assert tool(runtime, "list_income")() == "还没有记过收入。"
+
+
+def test_the_two_retired_columns_turn_every_refund_row_into_plain_income(tmp_path):
+    """★ M6-3a 的退休手续:`kind` / `of_expense_id` 两列拿掉,**三行一条不少**。
+
+    `CREATE TABLE IF NOT EXISTS` 对已经建出来的表是空操作,所以必须有一步真的手续
+    (`_retire_the_refund_columns`)。真机那张表是 0 行,但**有行的情况也要对**:一条
+    refund 行拿掉这两列就是一条收入行——而那正是新口径要的意思,不是凑合。所以这里断的是
+    「都当收入列出来、金额和时间一个字节不差、`id` 没变、`deleted_at` 没被动」。
+
+    最后那句 `record_income` 不是顺手加的:不办这道手续时 `kind TEXT NOT NULL` 还在,
+    而新代码不写它——**每一笔新收入都撞 NOT NULL**,用户收到的是「这笔没记进去」。
+    那是"迁移整个不跑"在真机上的确切症状,所以它必须在断言里。
+    """
+    make_m63_database(tmp_path)
+
+    runtime = build(tmp_path, timezone=SHANGHAI)
+
+    assert income_columns(tmp_path) == [
+        "id",
+        "amount_cents",
+        "occurred_at",
+        "note",
+        "created_at",
+        "deleted_at",
+        "deleted_reason",
+    ]
+    assert tool(runtime, "list_income")() == "\n".join(
+        (
+            "收入 3615.00 元(3 笔)。收入不算在「花了多少」里。",
+            "- 2026-09-15 20:00 收入 3000.00 元 · 备注「妈妈打的」",
+            "- 2026-09-13 11:00 收入 15.00 元 · 备注「打车退的」",
+            "- 2026-09-12 10:00 收入 600.00 元 · 备注「ChatGPT 退的」",
+        )
+    )
+    rows = income_rows(tmp_path)
+    assert [r["id"] for r in rows] == [1, 2, 3], "id 变了——用户记着的号不许动"
+    assert [r["amount_cents"] for r in rows] == [60000, 300000, 1500]
+    assert [r["occurred_at"] for r in rows] == [row[3] for row in M63_INCOME_ROWS]
+    assert [r["note"] for r in rows] == [row[4] for row in M63_INCOME_ROWS]
+    assert [r["deleted_at"] for r in rows] == [None] * 3, "迁移动了状态位"
+    assert "记好了" in tool(runtime, "record_income")(amount=100, occurred_at="2026-09-20 10:00")
 
 
 def test_opening_the_migrated_database_again_is_a_no_op(tmp_path):
-    """开第二次库不许把已经记下的收入冲掉(`CREATE TABLE IF NOT EXISTS` 的那半条)。"""
-    make_legacy_database(tmp_path)
+    """开第二次库不许再退休一次(那两列已经没了,再 DROP 一次是 OperationalError),
+    更不许把已经记下的收入冲掉。**幂等靠的是那次 `PRAGMA table_info` 探测**,
+    不是"反正只跑一次"。"""
+    make_m63_database(tmp_path)
     first = build(tmp_path, timezone=SHANGHAI)
-    tool(first, "record_income")(amount=600, kind="refund", occurred_at="2026-09-12 10:00")
+    tool(first, "record_income")(amount=600, occurred_at="2026-09-20 10:00")
 
     second = build(tmp_path, timezone=SHANGHAI)
 
-    assert len(income_rows(tmp_path)) == 1, "重新开库把收入表清掉了"
+    assert len(income_rows(tmp_path)) == len(M63_INCOME_ROWS) + 1, "重新开库把收入冲掉了"
     assert tool(second, "list_recent")() == LEGACY_LIST
+    assert "kind" not in income_columns(tmp_path)
 
 
 def test_the_two_sides_live_in_two_tables(runtime, tmp_path):
-    """新表,不是给 `expenses` 加符号位:收入和退款一行都不许落进 `expenses`。
+    """新表,不是给 `expenses` 加符号位:收入一行都不许落进 `expenses`。
 
     论证在 `server.py` 的表定义旁边。这条是它的机械保证——哪天有人"顺手统一"成
     一张表,`query_spending` 的 GROUP BY 就会分出一个带着无意义类目的收入组,
     而这条测试先红。
     """
-    tool(runtime, "record_income")(amount=3000, kind="income")
-    tool(runtime, "record_income")(amount=600, kind="refund")
+    tool(runtime, "record_income")(amount=3000)
+    tool(runtime, "record_income")(amount=600)
 
-    assert expense_rows(tmp_path) == [], "收入/退款落进了支出表"
+    assert expense_rows(tmp_path) == [], "收入落进了支出表"
     assert len(income_rows(tmp_path)) == 2
     assert tool(runtime, "list_recent")() == "还没有记过账。"
