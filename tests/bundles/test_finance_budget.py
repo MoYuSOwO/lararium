@@ -47,6 +47,9 @@ THIS_MM = f"{TODAY:%m}"
 _LAST_MONTH_END = TODAY.replace(day=1) - timedelta(days=1)
 LAST_MONTH = f"{_LAST_MONTH_END:%Y-%m}"
 LAST_MM = f"{_LAST_MONTH_END:%m}"
+# 上个月**最后一天**的号(28/29/30/31,跟着真时钟走)。验收补:月界的上界取的是次月
+# 1 号、开区间,而**月末那一天带着时刻**是唯一能把这件事测出来的日子。
+LAST_MONTH_DD = f"{_LAST_MONTH_END:%d}"
 
 MONTH = {"since": "2026-09-01", "until": "2026-09-30"}
 NOTHING_SET = "还没有设预算(不设就没有提醒)。"
@@ -329,6 +332,35 @@ def test_the_month_comes_from_the_expense_not_from_today(runtime):
         )
     )
     assert this_month == f"记好了:餐饮 45.00 元({THIS_MM}-04 12:00)。", "上个月那 600 被算进了本月"
+
+
+def test_an_expense_on_the_last_day_of_the_month_still_counts(runtime):
+    """★ 验收补:**月末那一天的账要算进这个月的已花。**
+
+    月界的上界取的是**次月 1 号、开区间**(`occurred_at < upper`),而库里存的是
+    `YYYY-MM-DDTHH:MM:SS`。要是谁把上界写成"本月最后一天"(闭区间的那个直觉),
+    月末那一天带着时刻的流水就被吃掉——`_month_bounds` 的 docstring 一直在讲这件事,
+    **而没有一条测试钉它**:验收时把上界减一天,全套 191 条一条都没红。
+
+    症状是这个功能最坏的那一种:`query_spending` 印「合计 140.00 元」,而预算这边
+    一声不吭——**两个数不一致,而只有一个会说话**。「已花只有一份 SQL」那条保证管的是
+    聚合,管不到月界,因为月界是另外算的。
+
+    用上个月的最后一天(号数跟着真时钟走,28/29/30/31 都覆盖得到):当月的最后一天
+    在跑测试的那天可能还没到,那样这笔账就成了未来的账。
+    """
+    record = tool(runtime, "record_expense")
+    tool(runtime, "set_budget")("餐饮", 100)
+
+    record(90, "餐饮", occurred_at=f"{LAST_MONTH}-01 12:00")
+    said = record(50, "餐饮", occurred_at=f"{LAST_MONTH}-{LAST_MONTH_DD} 22:00")
+
+    assert said == "\n".join(
+        (
+            f"记好了:餐饮 50.00 元({LAST_MM}-{LAST_MONTH_DD} 22:00)。",
+            f"{LAST_MONTH} 餐饮已花 140.00 元,额度 100.00 元,超了 40.00 元。",
+        )
+    ), said
 
 
 # ───────────────── 「已花」只有一份算法 ─────────────────
