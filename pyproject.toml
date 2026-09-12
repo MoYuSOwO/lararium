@@ -121,6 +121,12 @@ module = [
     "lararium.steward.loop",
     "bundles.memory.ledger",
     "bundles.memory.gate",
+    # M6-5:做菜 bundle 的存储层。判据和 memory 的 ledger/gate 一样——**形状是我们自己
+    # 定的**(Located / Hit / Replaced、两道名字校验、replace 的匹配纪律),不是第三方
+    # 定的;FastMCP 那一侧留在 `bundles/recipes/server.py`,它才是宽松档该待的地方。
+    # 它本来就全量标注,进严格档零成本;而 M6-6 要把这个模块整体搬走,类型是那次搬家
+    # 的安全网。
+    "bundles.recipes.store",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

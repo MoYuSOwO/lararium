@@ -30,6 +30,7 @@ type = independence
 modules =
     bundles.memory
     bundles.finance
+    bundles.recipes
 
 [importlinter:contract:cli-is-pure-client]
 name = 前端一律是纯 HTTP 客户端,不得 import bundles/steward(CLI 与 IM 适配器同级)

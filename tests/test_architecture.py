@@ -29,21 +29,29 @@ def _writeoffense(path: Path, node: ast.AST, detail: str) -> str:
 
 
 def _open_mode_arg(call: ast.Call) -> str | None:
-    """从 open(...) 调用里取 mode 参数:位置第二参,或 mode= 关键字参。"""
-    if call.keywords:
-        for kw in call.keywords:
-            if (
-                kw.arg == "mode"
-                and isinstance(kw.value, ast.Constant)
-                and isinstance(kw.value.value, str)
-            ):
-                return kw.value.value
+    """从 open(...) 调用里取 mode:`mode=` 关键字参,或位置参。
+
+    **位置参的下标取决于是哪个 open**:内建 `open(file, mode)` 是第二个,
+    `Path.open(mode)` 是**第一个**。M6-5 验收时先只把 `X.open(...)` 加进判据、
+    没改这里,于是 `p.open("w")` 判红判对了但**理由是错的**(mode 读成 None,
+    走的是"没写 mode 就算写"那一支),而 `p.open("r")` 这种纯读**跟着一起误伤**。
+    读不出 mode 仍然返回 None,由调用方按"没写明就当写"处理(宁可误报)。
+    """
+    for kw in call.keywords:
+        if (
+            kw.arg == "mode"
+            and isinstance(kw.value, ast.Constant)
+            and isinstance(kw.value.value, str)
+        ):
+            return kw.value.value
+    # 内建 open 的 receiver 是 ast.Name,Path.open 的是 ast.Attribute
+    index = 1 if isinstance(call.func, ast.Name) else 0
     if (
-        len(call.args) >= 2
-        and isinstance(call.args[1], ast.Constant)
-        and isinstance(call.args[1].value, str)
+        len(call.args) > index
+        and isinstance(call.args[index], ast.Constant)
+        and isinstance(call.args[index].value, str)
     ):
-        return call.args[1].value
+        return call.args[index].value
     return None
 
 
@@ -75,6 +83,16 @@ def test_only_the_ledger_module_writes_files() -> None:
         # 都不参与——不然一个叫 `../../prompts/character.default.md` 的附件就是人设的
         # 写入口,而人设被改是之后每一轮都听新的。
         Path("src/lararium/gateway/wechat.py"),
+        # M6-5 做菜 bundle 的存储层:**它的产品就是用户自己的 markdown 文件**
+        # (`data/recipes/<菜名>.md`)。用户重新设计过这个 bundle——「其实就是读文件」
+        # ——而选文件而不是 SQLite 的全部理由,正是用户要能在自己电脑上打开、cat、
+        # cp 一份备份自己的菜谱。
+        #
+        # 它碰不到账本:写入口只有 `RecipeStore.save`,落点由 `RecipeStore.locate`
+        # 独家计算(白名单 + `resolve()` 落点兜底,两道),**路径不是任何工具的参数**,
+        # 所以模型手里没有任何能指到 data_dir 之外的东西。bundle 也 import 不到
+        # ledger/gate(`.importlinter` 钉着),结构上够不着账本。
+        Path("bundles/recipes/store.py"),
     }
     offenders: list[str] = []
 
@@ -85,14 +103,23 @@ def test_only_the_ledger_module_writes_files() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
-                # open(...) 带写模式
-                if isinstance(func, ast.Name) and func.id == "open":
+                # open(...) 带写模式。**内建 `open(...)` 和 `X.open(...)` 都算**:
+                # M6-5 验收时实测,原来只认 `ast.Name`,于是 `p.open("w")`(Path.open)
+                # 整条路径穿过去——`p.open("w").writelines([...])`、
+                # `shutil.copyfileobj(src, p.open("wb"))`、
+                # 连 `with p.open("w") as f: f.write(...)` 都判绿。
+                # 下面那条注释原本写着「文件对象的 .write 已被上面的 open(...,"w") 兜住」,
+                # **而那句只对内建 open 成立**——这条闸守的是宪法第一条,漏的是它自己
+                # 写在 docstring 里承诺挡住的那一类。
+                if (isinstance(func, ast.Name) and func.id == "open") or (
+                    isinstance(func, ast.Attribute) and func.attr == "open"
+                ):
                     mode = _open_mode_arg(node)
                     if mode is None or any(c in mode for c in "wax"):
                         offenders.append(_writeoffense(path, node, f"open(mode={mode!r}) 写文件"))
                 # Path 便捷写方法 X.write_text(...) .write_bytes(...)(receiver 无关,
-                # write/writelines 则不要:文件对象的 .write 已被上面的 open(...,"w") 兜住,
-                # 而 Ledger.write() 是合法门控路径,泛泛地禁会误伤)
+                # write/writelines 则不要:文件对象的 .write 由上面那条兜住(内建 open
+                # 与 X.open 都认),而 Ledger.write() 是合法门控路径,泛泛地禁会误伤)
                 elif isinstance(func, ast.Attribute) and func.attr in (
                     "write_text",
                     "write_bytes",

@@ -17,6 +17,7 @@ from typing import Any, Literal
 import uvicorn
 from bundles.finance.server import build as build_finance
 from bundles.memory.server import build_memory_components, memory_tool_functions
+from bundles.recipes.server import build as build_recipes
 from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -62,6 +63,10 @@ def _assemble_bundle_tools(data_dir: Path, gate: Any, timezone: str) -> list[Cal
     """
     tools: list[Callable] = list(memory_tool_functions(gate))
     tools.extend(build_finance(data_dir, timezone=timezone).tools)  # 每加一个领域,加一行
+    # M6-5 做菜:**追加在末尾**,finance 那一段一格没动。新 bundle = 目录行 + 8 个工具
+    # schema,前缀重建一次(A1,启动时 prefix_log 会记);插到中间则是**每轮**毁一次缓存。
+    # 它不收 timezone:那一层没有任何时间戳(见 bundles/recipes/server.py 的 build)。
+    tools.extend(build_recipes(data_dir).tools)
     return tools
 
 

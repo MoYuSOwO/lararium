@@ -1,0 +1,8 @@
+name: recipes
+description: 做菜:一道菜一份做法,存着、改着、按内容搜
+skills: []      # 没有方法篇:怎么写一份做法不需要一套方法论,写就是了(G5)
+# 顺序即冻结顺序(§5 示例);以后加工具**只追加在末尾**
+tools: [list_recipes, read_recipe, write_recipe, append_to_recipe, replace_in_recipe,
+        search_recipes, rename_recipe, delete_recipe]
+triggers: []
+events: []

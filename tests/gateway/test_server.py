@@ -67,11 +67,16 @@ def server(tmp_path, monkeypatch):
     return app, steward
 
 
-def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
+def test_bundle_tool_order_memory_first_then_finance_then_recipes(tmp_path):
     """组装根的显式小表:M4-1 起 memory 工具在前、finance 追加在后。
 
     工具 schema 是前缀第0层,顺序一旦定了不许再动——这条把组合顺序钉死,
     免得哪天有人把 finance 插到 memory 前面(或反过来)还自以为是排序优化。
+
+    **M6-5 改了这条测试,如实说明**:做菜 bundle 的 8 个工具追加在 finance 之后,
+    上面 12 个一格没动。加一个 bundle = 目录行 + 8 个工具 schema = 前缀重建一次,
+    这个代价认(启动时 prefix_log 记一条);**插到中间才是每轮毁一次缓存**,
+    而这条测试正是为了让那种改动改不过去。
     """
     from lararium.gateway.server import _assemble_bundle_tools
 
@@ -90,6 +95,14 @@ def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
         "set_budget",  # finance[7] —— M6-4 预算,同样只追加在末尾
         "list_budgets",  # finance[8]
         "remove_budget",  # finance[9]
+        "list_recipes",  # recipes[0] —— M6-5 做菜,整段追加在 finance 之后
+        "read_recipe",  # recipes[1]
+        "write_recipe",  # recipes[2]
+        "append_to_recipe",  # recipes[3]
+        "replace_in_recipe",  # recipes[4]
+        "search_recipes",  # recipes[5]
+        "rename_recipe",  # recipes[6]
+        "delete_recipe",  # recipes[7]
     ]
 
 
