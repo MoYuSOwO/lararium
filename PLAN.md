@@ -6532,9 +6532,29 @@ M6-9  隔一阵问一嘴      唯一会烦人的那条,排最后
 
   别在这一条里顺手塞一个 whisper。那时候要先答:
 
-  - **跑在哪**:真机 2 GB 可用、Lararium 占 800 MB。whisper-small 约 500 MB、
-    base 约 200 MB,而 PP-OCR 那次实测一个全新 python 进程峰值就 773 MB
-    ——**独立进程、用完就退**是唯一可行的形状(M6-6 那一节已经算过同一笔账);
+  - **★ 用哪个模型:SenseVoice-small,不是 Whisper。** 复核方原来写的是 whisper,
+    **错在质量,不只是错在体积**。查下来的中文 CER(2026-09-13):
+
+    ```
+    FireRedASR-AED (1.1B)    AISHELL-1 0.55%  WenetSpeech 4.88%  会议 4.76%
+    SenseVoice-small (234M)  中文 7.81%
+    Paraformer               中文 10.18%
+    Whisper-large-v3         中文 20.02%      会议场景 18.87%   ← 差一倍到三倍
+    ```
+
+    **Whisper 在中文上被中文优化的模型全面压过**,而且体积还更大。按真机筛:
+    FireRedASR 1.1B 装不下;**SenseVoice-small 234M,int8 峰值 0.32 GB、
+    fp16 0.54 GB,10 秒音频 70 ms(比 Whisper-Large 快 15 倍),有 ONNX 导出
+    (`funasr_onnx`)不用拖 PyTorch** ——这是唯一同时满足"装得下 + 中文准"的那个。
+
+  - **跑在哪**:真机 2 GB 可用、Lararium 占 800 MB。**独立进程、用完就退**
+    ——PP-OCR 那次实测一个全新 python 进程峰值 773 MB,而那是 30 MB 的模型;
+    SenseVoice 模型本身就 200 MB+,常驻更不合适(M6-6 那一节算过同一笔账)。
+
+  - **★ 而上面这些数字全是搜来的,一个都没打过。** PP-OCR 那次的教训摆在这儿:
+    搜来的说 v5 好,我装的默认是 v4,结论整个反了。**所以动手第一步是
+    在真机上装一次、拿用户那几条真语音打一遍、打印它实际加载的是哪个文件**
+    ——而不是照这张表抄。
   - **要不要先转码**:微信给的是 SILK,官方实现里有一段 `silk-transcode`
     把它转 WAV,**转不了就存原始 SILK**。转码那一步是不是又一个依赖,要先看清;
   - **模型那条路走不走得通**:`deepseek-flash` 只吃 webp/png/jpeg/gif
