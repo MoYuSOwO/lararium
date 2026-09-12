@@ -87,6 +87,9 @@ def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
         "delete_expense",  # finance[4] —— M5-20 同样只追加在末尾
         "record_income",  # finance[5] —— M6-3 收入/退款,同样只追加在末尾
         "list_income",  # finance[6]
+        "set_budget",  # finance[7] —— M6-4 预算,同样只追加在末尾
+        "list_budgets",  # finance[8]
+        "remove_budget",  # finance[9]
     ]
 
 

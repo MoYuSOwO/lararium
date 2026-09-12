@@ -2,7 +2,9 @@ name: finance
 description: 记账与消费分析          # 前缀目录行
 skills:
   - {name: monthly-review, desc: 怎么看一个月的账}   # M4-4;目录行随之变一次(D3 重建点)
-# 顺序即冻结顺序(§5 示例);M6-3 的 record_income / list_income 只追加在末尾
-tools: [record_expense, query_spending, list_recent, amend_expense, delete_expense, record_income, list_income]
+# 顺序即冻结顺序(§5 示例);M6-3 的 record_income / list_income、M6-4 的三个预算工具
+# 都**只追加在末尾**
+tools: [record_expense, query_spending, list_recent, amend_expense, delete_expense,
+        record_income, list_income, set_budget, list_budgets, remove_budget]
 triggers: []
 events: []
