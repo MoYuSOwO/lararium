@@ -85,6 +85,8 @@ def test_bundle_tool_order_memory_first_finance_appended(tmp_path):
         "list_recent",  # finance[2]
         "amend_expense",  # finance[3] —— M5-15 追加在末尾,前面一位没动
         "delete_expense",  # finance[4] —— M5-20 同样只追加在末尾
+        "record_income",  # finance[5] —— M6-3 收入/退款,同样只追加在末尾
+        "list_income",  # finance[6]
     ]
 
 

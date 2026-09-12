@@ -284,6 +284,34 @@ def test_reading_before_writing_takes_the_write_lock_up_front(statements, tmp_pa
     assert said[0] == "BEGIN IMMEDIATE", f"delete 的读-改-写没有一上来就拿写锁:{said}"
 
 
+def test_recording_a_refund_reads_and_writes_inside_one_transaction(statements, tmp_path):
+    """M6-3:退款的 `of_expense_id` 校验也是「读了再改」,同一条规矩。
+
+    读到那笔支出还在账上、判过、然后插入——判和插之间敞着的话,一次 `delete_expense`
+    正好落在中间,库里就留下一条**指向一条已经不在账上的支出**的退款,而回话说得像
+    办成了:用户以为这个月少花了 600,账上并没有。
+
+    **这条为什么钉 SQL 序列,而不是拿探针编排一次并发**:我先写的是后者,而它
+    **修好之前和修好之后都绿**——两种顺序的最终库态一模一样(退款行在、它指的那笔
+    支出已删),差别只在"插入的那一刻那行还活着吗",事后没有任何可观测面。一条分不出
+    bug 和修复的测试正是 T6 第 5 种(断言锚点太弱),按 G6 就不该存在。所以钉的是
+    发出去的那几句:`BEGIN IMMEDIATE` 打头(理由同上面那条,给独立容器形态的另一条
+    连接),而 SELECT 和 INSERT 都夹在 BEGIN 和 COMMIT 之间——把读挪出事务,这里立刻红。
+    """
+    runtime, said = statements
+    rid = seed_one(runtime, tmp_path)
+
+    said.clear()
+    tool(runtime, "record_income")(
+        amount=600, kind="refund", occurred_at="2026-09-12 10:00", of_expense_id=rid
+    )
+
+    assert said[0] == "BEGIN IMMEDIATE", f"退款的读-改-写没有一上来就拿写锁:{said}"
+    assert [s.split()[0] for s in said] == ["BEGIN", "SELECT", "INSERT", "COMMIT"], (
+        f"读和写不在同一个事务里:{said}"
+    )
+
+
 def test_two_deletes_on_the_same_row_do_not_both_report_success(probed, tmp_path):
     """delete 也是「读了再改」:两个并发的删除里只有一个能报「删了」。
 
