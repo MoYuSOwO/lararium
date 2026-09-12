@@ -395,6 +395,50 @@ def test_deleting_the_expense_a_refund_points_at_leaves_the_refund_alone(gpt, tm
     assert "退款 600.00 元" in tool(gpt, "list_income")(), "退款不见了"
 
 
+def test_deleting_a_refunded_expense_says_the_refund_is_still_netting_off(gpt):
+    """★ 验收补:删掉被冲抵的那笔支出时,**回话必须把那笔退款说出口**。
+
+    上面那条定的是"不许偷偷动退款行",而它的 docstring 结尾写着「两个数都还在、
+    都看得见,**用户自己判**」——**而原来这句是空的**:回话只说「合计里不算它了」,
+    模型没有任何理由去提那 600,于是用户永远不知道。
+
+    破的是 `record_income` 自己立的那条不变量:**退款不许指着一条不在账上的支出**。
+    写退款那个方向有闸(`test_pointing_a_refund_at_a_deleted_row_...`),
+    从删支出这个方向进来是敞的——同一个假设写在两处、只守一处(M5-8 的原话)。
+    而它是**无声**破:退款照旧从「花了多少」里减,`list_income` 照旧印着
+    `(冲抵 #1)`,`#1` 在 `list_recent` 里已经找不到,模型只能自己编个解释。
+
+    不拦这次删除:底稿是用户的(M5-20 就是真机逼出来的)。只把事实说出口。
+    """
+    tool(gpt, "record_income")(
+        amount=600, kind="refund", occurred_at="2026-09-12 10:00", of_expense_id=1
+    )
+
+    said = tool(gpt, "delete_expense")(expense_id=1, reason="记重了")
+
+    assert said == (
+        "删了 #1:其他 500.00 元 · 原因「记重了」。合计里不算它了。"
+        "有 1 笔退款(合计 600.00 元)指着这笔,删掉它之后那笔退款还在账上、"
+        "还在从「花了多少」里减,而对应的支出没有了。"
+        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+    ), said
+
+
+def test_deleting_an_expense_nothing_points_at_reads_exactly_as_it_did_before(gpt):
+    """而没有退款指着它时,这句话一个字都不许多(M5-20 那条回话逐字节不变)。
+
+    单独钉一条的理由:`test_finance_delete.py` 里那些断言是这句话的原始记录,
+    而**它们在这个文件里看不见**——有人日后把那个 `if hit["n"]` 去掉、让这句
+    无条件追加,红的会是另一个文件里一条看起来无关的测试。
+    """
+    said = tool(gpt, "delete_expense")(expense_id=1, reason="记重了")
+
+    assert said == (
+        "删了 #1:其他 500.00 元 · 原因「记重了」。合计里不算它了。"
+        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+    ), said
+
+
 # ─────────────────────────── E2:工具边界不许抛 ───────────────────────────
 
 

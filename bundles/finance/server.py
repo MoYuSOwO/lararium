@@ -142,6 +142,12 @@ _INCOME_SQL = {
         " WHERE occurred_at >= ? AND occurred_at < ? AND deleted_at IS NULL"
         " GROUP BY kind ORDER BY kind"
     ),
+    # 验收补:哪些还活着的退款指着某一笔支出。**只有 delete_expense 读它**,理由见
+    # 那里——`record_income` 挡住了"退款指向已删的支出",但反过来那一半原来是敞的。
+    "against": (
+        "SELECT SUM(amount_cents) AS cents, COUNT(*) AS n FROM income"
+        " WHERE of_expense_id = ? AND deleted_at IS NULL"
+    ),
 }
 
 # kind 的规范值与同义词。**它既存下去又决定聚合口径**,所以进库前必须归一成规范值:
@@ -762,9 +768,29 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                         reason,
                         expense_id,
                     )
+                    # 验收补:**这笔支出身上挂着的退款不会跟着删。** `record_income` 拒绝
+                    # 让退款指向一条已删的支出(那条不在任何合计里,"冲抵"它就是冲抵一个
+                    # 不存在的数),但那道闸只守了写退款这一个方向——从这边把支出删掉,
+                    # 同一个不变量一样破,而且是**无声**破:退款照旧从「花了多少」里减,
+                    # `list_income` 照旧印着 `(冲抵 #1)`,而 `#1` 在 `list_recent` 里已经
+                    # 找不到了,模型只能自己编一个解释。M5-8 的原话:同一个假设写在两处,
+                    # 只守一处等于没守。
+                    #
+                    # **不拦这次删除**:底稿是用户的,他自己判断该不该删(M5-20 就是真机逼
+                    # 出来的)。只把事实说出口——多少钱、还在减——剩下的交给他;而上面那句
+                    # undo 恰好也是这件事的解法,所以这一句放在它前面。
+                    hit = conn.execute(_INCOME_SQL["against"], (expense_id,)).fetchone()
+                    dangling = (
+                        f"有 {hit['n']} 笔退款(合计 {_yuan(hit['cents'])} 元)指着这笔,"
+                        f"删掉它之后那笔退款还在账上、还在从「花了多少」里减,"
+                        f"而对应的支出没有了。"
+                        if hit["n"]
+                        else ""
+                    )
                     done = (
                         f"删了 #{expense_id}:{what}{_render_reason(reason)}。"
-                        f"合计里不算它了。删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+                        f"合计里不算它了。{dangling}"
+                        f"删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
                     )
 
                 conn.execute(sql, args)
