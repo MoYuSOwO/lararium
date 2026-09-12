@@ -7,13 +7,20 @@ M4-2 起只换函数体、不动签名与 docstring——docstring 就是 schema
 M4-2 落地 `record_expense`,M4-3 落地 `query_spending`,M4-4 落地 `list_recent`。
 M5-15 / M5-20 追加 `amend_expense` / `delete_expense`(两个都是真机逼出来的,不是设计
 出来的);M6-3 追加 `record_income` / `list_income`——账本终于不只有"花出去"一个口子。
+M6-3a 把 M6-3 的一半拆掉:**退款并进收入**,`kind` / `of_expense_id` 两列退休。
+用户的判断比 M6-3 里写的任何一条都硬:「很难说全退」——真实退款经常是部分退、几笔合并退、
+退到代金券,「冲抵某一笔支出」这个指针大多数时候指不准;而"抵掉退款后实际花掉 Z"整个
+建在那个指针上,**前提不成立,派生出来的数就比没有更坏**:一个读起来很确定的数字,
+底下是个猜的对应关系。
 
-**S2:这个文件 995 行,远超那条 300 行的审查线,理由登记在此。** 它是两组"支出 / 钱回来
-了"共 7 个工具的函数体,而它们必须共享同一条连接、同一套渲染器(`_render_note` 两个出口
-渲染不一致就是 P1-1 那个事故)、同一份金额与时间解析。拆文件的唯一自然切线是按表分成
-两个模块,而那样 `query_spending` 要跨模块读退款合计——把一条 SQL 查询变成一次跨模块
-调用,换来的只是行数好看。真正该拆的那天是"某一侧长出自己的状态机"(比如退款要门控),
-那时切线才是真的。注释占比高是刻意的:这个文件每一处防的都是一次真机事故。
+**S2:这个文件 927 行(M6-3 那版 995 行),远超那条 300 行的审查线,理由登记在此。**
+缩了 68 行而这段登记照旧要留——300 那条线还远远甩在后面。支出那五个工具和
+「钱回来了」那两个必须共享同一条连接、同一套渲染器(`_render_note` 两个出口渲染不一致
+就是 P1-1 那个事故)、同一份金额与时间解析。按表拆成两个模块省下的是行数,换来的是
+**两份渲染器和两份解析器**。原先这里还写着第二条理由「拆了之后 `query_spending` 要跨模块
+读退款合计」——**M6-3a 之后它作废了**(那条查询没了),而留下的这条本来就是更硬的那条。
+真正该拆的那天是"某一侧长出自己的状态机"(比如收入要过门控)。注释占比高是刻意的:
+这个文件每一处防的都是一次真机事故。
 """
 
 import re
@@ -32,10 +39,6 @@ from lararium.db import add_missing_columns, open_connection, transaction
 # 固定类目,不是自由文本:模型每次发明一个新词(「吃饭」「餐饮」「外卖」各记一笔),
 # M4-3 的 GROUP BY 就聚不出东西来。顺序即 E2 提示里列出的顺序,保持稳定。
 CATEGORIES = ("餐饮", "交通", "日用", "娱乐", "医疗", "人情", "其他")
-
-# M6-3「钱回来了」的两个方向。**这两个不是一件事**,而混成一个的症状很具体:
-# 记一笔 3000 生活费,然后「这个月花了多少」变成 -3000。顺序即 E2 提示里列出的顺序。
-INCOME_KINDS = ("refund", "income")
 
 # 金额上界 = SQLite INTEGER 能存的最大值(int64)。超过它 sqlite3 在**绑定参数时**抛
 # OverflowError,而那不是 sqlite3.Error 的子类——异常会直接逃出工具边界(M4-2 补)。
@@ -125,43 +128,23 @@ _ORDER_BY = {
     "最大额": "largest",
 }
 
-# M6-3 收入/退款那张表的两条查询。`deleted_at IS NULL` 从第一天就带上,理由和支出侧
-# 一样(逐条写死、由 `test_every_income_query_filters_deleted_rows` 保证一条不漏)。
+# 收入那张表的两条查询。`deleted_at IS NULL` 从第一天就带上,理由和支出侧一样
+# (逐条写死、由 `test_every_income_query_filters_deleted_rows` 保证一条不漏)。
 #
-# **合计只有这一条 SQL**:`query_spending` 要的是「同期退款多少」,`list_income` 要的是
-# 「收入多少、退款多少」,两个读者问的是同一件事的不同切片。写成两条的话,"哪些行算进来"
-# 这个事实就有两份,而它们迟早不一致(M4-4、M5-21 都是这条)。
+# M6-3a 之后**只剩一个读者**(`list_income`):退款并进收入之后,「花了多少」只回答支出,
+# `query_spending` 不再读这张表。两条 SQL 的 WHERE 逐字相同——一条要聚合、一条要流水,
+# 这是无法合并的两件事,所以钉的是"两条都带那个条件"(上面那条参数化测试)。
 _INCOME_SQL = {
     "list": (
-        "SELECT occurred_at, kind, amount_cents, note, of_expense_id FROM income"
+        "SELECT occurred_at, amount_cents, note FROM income"
         " WHERE occurred_at >= ? AND occurred_at < ? AND deleted_at IS NULL"
         " ORDER BY occurred_at DESC, id DESC LIMIT ?"
     ),
-    "by_kind": (
-        "SELECT kind, SUM(amount_cents) AS cents, COUNT(*) AS n FROM income"
-        " WHERE occurred_at >= ? AND occurred_at < ? AND deleted_at IS NULL"
-        " GROUP BY kind ORDER BY kind"
-    ),
-    # 验收补:哪些还活着的退款指着某一笔支出。**只有 delete_expense 读它**,理由见
-    # 那里——`record_income` 挡住了"退款指向已删的支出",但反过来那一半原来是敞的。
-    "against": (
+    "total": (
         "SELECT SUM(amount_cents) AS cents, COUNT(*) AS n FROM income"
-        " WHERE of_expense_id = ? AND deleted_at IS NULL"
+        " WHERE occurred_at >= ? AND occurred_at < ? AND deleted_at IS NULL"
     ),
 }
-
-# kind 的规范值与同义词。**它既存下去又决定聚合口径**,所以进库前必须归一成规范值:
-# 库里混着「收入」和 income,按 kind 的合计就聚不出东西来。收同义词的理由同 `_GROUP_BY`
-# ——模型用中文思考,让它因为写了"退款"而吃一次 E2 往返是白烧钱。
-_KIND = {
-    "refund": "refund",
-    "退款": "refund",
-    "退回": "refund",
-    "income": "income",
-    "收入": "income",
-    "进账": "income",
-}
-_KIND_LABEL = {"refund": "退款", "income": "收入"}
 
 _GROUP_BY = {
     "category": "category",
@@ -177,7 +160,7 @@ _GROUP_BY = {
     "按日": "day",
 }
 
-# ── M6-3:为什么收入/退款是**新一张表**,不是给 `expenses` 加一个符号位
+# ── M6-3:为什么收入是**新一张表**,不是给 `expenses` 加一个符号位
 #
 # 1. **符号位撑不住 `category` 那一列。** 它是固定 7 项、NOT NULL,存在的唯一理由就是
 #    `_GROUP_SQL` 的 GROUP BY(M4-3 是照着这个小集合设计的)。一笔 3000 的生活费没有
@@ -186,26 +169,26 @@ _GROUP_BY = {
 #    读不懂的数。**这不是迁移成本,是正确性成本**,而在符号位方案里它无路可走。
 # 2. **「这行算不算在账上」会重新变成两处要问的事。** M5-26 刚把 `voided_by` 那个第二
 #    状态位拆掉,理由正是那一问要同时问两处、而第二处没有读者。符号位方案里每条查询的
-#    `deleted_at IS NULL` 后面都得再跟一个 `AND kind = 'expense'`,而本文件的 SQL 全是
+#    `deleted_at IS NULL` 后面都得再跟一个"这行是支出吗",而本文件的 SQL 全是
 #    逐条写死的字面量(拼接会被 S608 盯上,而它是对的):`_GROUP_SQL` 两条 +
 #    `_RECENT_WHERE` 一处(两条列表查询共用)+ `amend` 与 `delete` 各一处 SELECT =
-#    **5 处都要多一个条件**。漏一处的症状是"收入被算成支出"或"退款行能被 amend 当支出
+#    **5 处都要多一个条件**。漏一处的症状是"收入被算成支出"或"收入行能被 amend 当支出
 #    改",静默、且错在钱上。刚还完的债不该立刻再欠一笔。
 # 3. **底稿不许被动。** 用户自己拒绝过"去动那两笔 GPT 的账",理由是「那样底稿就不是原始
 #    记录了」。`list_recent` 是全系统唯一返回原始流水的工具;分表之后它**物理上看不见**
-#    退款行,「逐字节不变」不依赖任何一个过滤条件成立。
-# 4. **两个问题分开问,两条查询都简单。** 「花了多少」= 支出合计 - 同期退款;「进了多少」
-#    = 同期收入。各自一条一行 WHERE 的查询。符号位方案要在一条 SQL 里用 CASE 把"退款减、
-#    收入不减"写进表达式——那条规则就藏在 SQL 里,没有名字,也没人能对它下断言。
+#    收入行,「逐字节不变」不依赖任何一个过滤条件成立。
+# 4. **两个问题分开问,两条查询都简单。** 「花了多少」= 支出合计;「进了多少」= 同期收入。
+#    各自一条一行 WHERE 的查询。符号位方案要在一条 SQL 里用 CASE 把"哪一类算进哪个数"
+#    写进表达式——那条规则就藏在 SQL 里,没有名字,也没人能对它下断言。
 #
 # 代价老实说:列的形状和 `expenses` 有重叠(金额/时间/备注/创建时间/状态位),渲染也另
 # 走一份。但 G7 的判据是"这几种东西在'要拿它干什么'这件事上真的一样吗"——支出回答
-# "钱花在哪儿",这张表回答"钱从哪儿回来的",**连聚合口径都相反**。重叠的是形状不是事实,
-# 统一形状省不下任何一处"同一个事实维护两遍"。
+# "钱花在哪儿",这张表回答"钱从哪儿回来的",**两个数压根不进同一个合计**。重叠的是形状
+# 不是事实,统一形状省不下任何一处"同一个事实维护两遍"。
 #
-# `kind` 为什么不再拆成两张表:退款和收入在**存**这件事上完全一样(正数金额、时间、备注、
-# 可选指向、状态位),差别只在一个读者(`query_spending` 减不减它)。这才是 G7 说的
-# "东西真的一样的时候,统一省的是两处维护同一个事实"。
+# M6-3a 把 `kind` 也拆了,而那是**同一条判据的另一半**:退款和收入在存这件事上完全一样,
+# M6-3 保留的那个差别(减不减「花了多少」)本身就不该存在——东西真的一样的时候,连那个
+# `kind` 都是多的。一张表、一个口径、一句话说得清:收入不算在「花了多少」里。
 #
 # 架构测试 test_only_the_ledger_module_writes_files 只放行 ledger.py 写文件;
 # bundle 的库是 SQLite,写入走 sqlite3 连接,不落那条 AST 的禁写面。
@@ -231,21 +214,18 @@ CREATE TABLE IF NOT EXISTS expenses (
 -- 扫描。没有索引时两者都要全表扫,而这张表只会越长越长(M4-4 补)。
 CREATE INDEX IF NOT EXISTS idx_expenses_occurred_at ON expenses(occurred_at);
 
--- M6-3「钱回来了」。kind 只有两个值,而它决定的是**聚合口径**:
---   refund   冲抵某一笔支出  → 从「这个月花了多少」里**减掉**
---   income   生活费/兼职/红包 → **根本不进**「花了多少」
--- of_expense_id 可空:那 600 元退的正是那笔 GPT,能指回去才说得清;而退款经常对不上
--- 具体某一笔(几笔合并退),指不上就别硬指。**没有 FOREIGN KEY**:这条连接没开
--- `PRAGMA foreign_keys`(`open_connection` 不开),写上去是个不生效的装饰——
--- 指向合不合法在 `record_income` 里查,而且和插入在同一个事务里查(M5-31)。
--- deleted_at / deleted_reason 照 M5-20 的形状,**不为新表发明第二套**。
+-- 「钱回来了」:生活费、兼职、红包,**以及退款到账**。一个口径,一句话说得清——
+-- 收入不算在「花了多少」里。M6-3 这张表原先还有两列:`kind`(refund | income)决定
+-- 减不减「花了多少」,`of_expense_id` 指着被冲抵的那笔支出。**M6-3a 两列一起退休**:
+-- 「冲抵某一笔支出」假设退款是全额的,而真实退款经常部分退、几笔合并退、退到代金券,
+-- 那个指针大多数时候指不准;建在它上面的"抵掉退款后实际花掉 Z"因此比没有更坏。
+-- 老库怎么退休这两列见 `_retire_the_refund_columns`。
+-- deleted_at / deleted_reason 照 M5-20 的形状,**不为这张表发明第二套**。
 CREATE TABLE IF NOT EXISTS income (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     amount_cents   INTEGER NOT NULL,
-    kind           TEXT    NOT NULL,   -- refund | income,规范值,进库前已归一
     occurred_at    TEXT    NOT NULL,
     note           TEXT,
-    of_expense_id  INTEGER,            -- 仅 refund 有;指 expenses.id
     created_at     TEXT    NOT NULL,
     deleted_at     TEXT,
     deleted_reason TEXT
@@ -296,6 +276,44 @@ def _retire_the_voided_column(conn: sqlite3.Connection, tz: ZoneInfo) -> None:
         conn.execute("ALTER TABLE expenses DROP COLUMN voided_by")
 
 
+# M6-3a 要退休的两列。**逐条写死不拼列名**:拼进 DDL 会被 S608 盯上(而它是对的),
+# 而这里本来就只有两列,写死连"可能"都没有(同 `_ADDED_COLUMNS` 的理由)。
+_RETIRED_INCOME_COLUMNS = (
+    ("kind", "ALTER TABLE income DROP COLUMN kind"),
+    ("of_expense_id", "ALTER TABLE income DROP COLUMN of_expense_id"),
+)
+
+
+def _retire_the_refund_columns(conn: sqlite3.Connection) -> None:
+    """老库的退休手续:`income` 表上 `kind` / `of_expense_id` 两列拿掉(M6-3a)。
+
+    `CREATE TABLE IF NOT EXISTS` 对**已经建出来的**表是空操作,而这张表 M6-3 当天就推上
+    真机了(0 行)。不办这道手续的症状不是"多两列没人看":`kind TEXT NOT NULL` 还在,
+    而新的 `record_income` 不写它——于是**每一笔收入都撞 NOT NULL**,用户收到的是一句
+    「这笔没记进去(库写入失败……)」,那台机器从此记不了收入。
+
+    **有行也是对的,不重建表、不搬数据**:一条 refund 行拿掉这两列就是一条收入行,
+    而那正是新口径要的意思(退款并进收入),不是凑合。金额、时间、备注、`id`、`deleted_at`
+    一个字节都不动。
+
+    **这次没有顺序要求**——这一句是想清楚之后的结论,不是没想。`voided_by` 那次顺序是死的,
+    因为**列一拿掉,靠它把行藏起来的那个过滤条件就跟着没了**,所以必须先把那些行标成已删:
+    那是一次"先改数据、再改结构"。这次一行数据都不改,两个 DROP 也互不相干,断在中间
+    (一列掉了、一列还在)对任何一次读写都没影响——新代码两列都不读,而 `of_expense_id`
+    本来可空。**位置**倒是有要求:必须排在 `executescript` 之后(表得先在,不然探测不到、
+    静默跳过),且排在任何一次工具调用之前(否则就是上面那句 NOT NULL)。两条 DDL 仍然
+    包在一个事务里:不是因为中间态会出事,而是让下一次开库只有两种状态要想,不是三种。
+    跑完这两列就没了,再开库时探测不到,自然是空操作。
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(income)")}
+    retiring = [ddl for column, ddl in _RETIRED_INCOME_COLUMNS if column in columns]
+    if not retiring:
+        return
+    with transaction(conn):
+        for ddl in retiring:
+            conn.execute(ddl)
+
+
 def _connect(root: Path, tz: ZoneInfo) -> sqlite3.Connection:
     """finance 独占自己的库(§5 数据产权):只碰 data_dir/finance/finance.sqlite。"""
     root.mkdir(parents=True, exist_ok=True)
@@ -306,6 +324,9 @@ def _connect(root: Path, tz: ZoneInfo) -> sqlite3.Connection:
     add_missing_columns(conn, _ADDED_COLUMNS)
     # 补列在前、退休在后:老库可能两样都缺,而退休那一步要往 deleted_at 里写。
     _retire_the_voided_column(conn, tz)
+    # M6-3a:income 表那两列的退休手续。和上面那步互不相干(两张表、两次迁移),
+    # 但同样必须排在 executescript 之后——表得先在,不然探测不到、静默跳过。
+    _retire_the_refund_columns(conn)
     return conn
 
 
@@ -397,18 +418,6 @@ def _yuan(cents: int) -> str:
     return f"{Decimal(cents) / 100:.2f}"
 
 
-def _income_totals(conn: sqlite3.Connection, lower: str, upper: str) -> dict[str, tuple[int, int]]:
-    """一段区间内按 kind 的 (分, 笔数)。**只读**(F4),两个读者共用(见 `_INCOME_SQL`)。
-
-    区间是半开的 `[lower, upper)`,和 `query_spending` / `list_recent` 同一个口径
-    ——上界取次日零点,否则带时刻的行会被闭区间吃掉(M4-3 的那条)。
-    """
-    return {
-        row["kind"]: (row["cents"], row["n"])
-        for row in conn.execute(_INCOME_SQL["by_kind"], (lower, upper))
-    }
-
-
 def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
     """工具顺序即冻结顺序(前缀第0层),由 manifest.yaml 与测试钉死。
     工具边界不许抛异常(E2)——出错给模型一句人话,让它能自己纠正而不是整轮炸掉。
@@ -429,8 +438,12 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
             # M6-3:**校验照旧挡住负数,但这次指路。** 真机上用户想记那 600 元退款,试了
             # -600、只收到"要一个大于 0 的数字",于是她的下一步是考虑去动那两笔 GPT 的
             # 原始记录(她自己判断不该动,把它挂在话头里挂了三天)。负数支出几乎只有一个
-            # 来头——想记的是退款或收入。0 和溢出不指路:那两个不是"方向搞反了"。
-            hint = "退款或收入用 record_income 记(记正数),别记成负数的支出。"
+            # 来头——想记的是钱回来了。0 和溢出不指路:那两个不是"方向搞反了"。
+            #
+            # M6-3a 改了这半句的措辞:原话是「退款或收入用 record_income 记」,而"退款"
+            # 已经不是一个单独的东西了(它就记成收入)。**这是回话不是 docstring,
+            # 不进前缀**——改它不触发一次前缀重建。
+            hint = "钱回来了(收到的退款也算)用 record_income 记成收入,别记成负数的支出。"
             tail = f"这笔没记。{hint}" if cents is not None and cents < 0 else "这笔没记。"
             return f"金额不对({amount}):要一个大于 0 的数字,单位是元(比如 28.5)。{tail}"
         if category not in CATEGORIES:
@@ -483,9 +496,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         group_by 取 category(按类目,金额从高到低)或 day(按天,时间正序);返回总额 +
         每组一行结论;聚合在 SQL 里算完再返回,**绝不返回单笔流水**。
         区间太长时按天会砍掉最早那段、合并成一行「更早 N 天合计」放在最前面,
-        而**总额那一行始终是全区间的**。
-        区间里有退款(record_income 记的)时末尾多一行,把支出、退款、实际花掉三个数
-        一起说清楚——**别再自己减一遍**;收入不在这里,它不算在"花了多少"里。"""
+        而**总额那一行始终是全区间的**。"""
         start, end = _parse_day(since), _parse_day(until)
         if start is None or end is None:
             bad = since if start is None else until
@@ -502,23 +513,10 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         upper = (end + timedelta(days=1)).isoformat()
         try:
             groups = list(conn.execute(_GROUP_SQL[mode], (start.isoformat(), upper)))
-            # M6-3:退款按**它自己的日期**落进区间,和它指的那笔支出在哪个月无关。
-            # 反过来的话,「9 月花了多少」会被 10 月才到账的退款改写——那个数昨天还是
-            # 另一个,而没有任何人会知道为什么。收入一律不取:它不进这个口径。
-            refund_cents, refund_n = _income_totals(conn, start.isoformat(), upper).get(
-                "refund", (0, 0)
-            )
         except sqlite3.Error as exc:  # E2:查不了也要让模型知道,而不是整轮炸掉
             return f"查不了(库读取失败:{exc})。"
 
         if not groups:
-            # 没有支出**但收到过退款**时不许说"没有记录"——那是在说这段时间什么都没发生,
-            # 而钱确实动了。没有退款时这一句逐字节不变(M6-3 的硬口径)。
-            if refund_n:
-                return (
-                    f"{since} ~ {until} 没有支出,"
-                    f"同期收到退款 {_yuan(refund_cents)} 元({refund_n} 笔)。"
-                )
             return f"{since} ~ {until} 没有记录。"
 
         total = sum(r["cents"] for r in groups)
@@ -545,23 +543,6 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                     f"- 更早 {len(dropped)} 天合计 {_yuan(_cents(dropped))} 元(未逐条列出)"
                 )
             lines += [_group_line(r) for r in shown]
-        # M6-3 的口径全在这一行里:**三个数一起说**——支出多少、退回来多少、实际花掉多少。
-        # 没有退款时一行都不多(支出侧的输出逐字节不变,这是本任务的硬口径)。
-        #
-        # 为什么不把「合计」那一行改成净额:上面每一组都是支出,合计就是它们的和;改成净额
-        # 之后它和下面的分组行对不上,而**"对不上"这件事模型看不出来**,它只会照着念。
-        if refund_n:
-            net = total - refund_cents
-            settled = (
-                f"抵掉退款后实际花掉 {_yuan(net)} 元"
-                if net >= 0
-                # 负数的"花了多少"是一句读不懂的话,而这个区间确实是钱变多了。
-                else f"抵掉退款后净收回 {_yuan(-net)} 元"
-            )
-            lines.append(
-                f"同期收到退款 {_yuan(refund_cents)} 元({refund_n} 笔):"
-                f"支出 {_yuan(total)} 元,{settled}。"
-            )
         return "\n".join(lines)
 
     def list_recent(
@@ -768,29 +749,13 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                         reason,
                         expense_id,
                     )
-                    # 验收补:**这笔支出身上挂着的退款不会跟着删。** `record_income` 拒绝
-                    # 让退款指向一条已删的支出(那条不在任何合计里,"冲抵"它就是冲抵一个
-                    # 不存在的数),但那道闸只守了写退款这一个方向——从这边把支出删掉,
-                    # 同一个不变量一样破,而且是**无声**破:退款照旧从「花了多少」里减,
-                    # `list_income` 照旧印着 `(冲抵 #1)`,而 `#1` 在 `list_recent` 里已经
-                    # 找不到了,模型只能自己编一个解释。M5-8 的原话:同一个假设写在两处,
-                    # 只守一处等于没守。
-                    #
-                    # **不拦这次删除**:底稿是用户的,他自己判断该不该删(M5-20 就是真机逼
-                    # 出来的)。只把事实说出口——多少钱、还在减——剩下的交给他;而上面那句
-                    # undo 恰好也是这件事的解法,所以这一句放在它前面。
-                    hit = conn.execute(_INCOME_SQL["against"], (expense_id,)).fetchone()
-                    dangling = (
-                        f"有 {hit['n']} 笔退款(合计 {_yuan(hit['cents'])} 元)指着这笔,"
-                        f"删掉它之后那笔退款还在账上、还在从「花了多少」里减,"
-                        f"而对应的支出没有了。"
-                        if hit["n"]
-                        else ""
-                    )
+                    # M6-3 验收时这里追加过一句「有 N 笔退款指着这笔、它还在从「花了多少」
+                    # 里减」。**M6-3a 把它删掉了**:那句话报告的事实不存在了——没有指针就
+                    # 没有悬空的引用,收入也不从「花了多少」里减。留着它就是 G6 说的
+                    # "修一个不该存在的东西",而这一句回到 M5-20 的原文、逐字节不变。
                     done = (
                         f"删了 #{expense_id}:{what}{_render_reason(reason)}。"
-                        f"合计里不算它了。{dangling}"
-                        f"删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+                        f"合计里不算它了。删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
                     )
 
                 conn.execute(sql, args)
@@ -801,43 +766,18 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
 
     def record_income(
         amount: float,
-        kind: str,
         occurred_at: str | None = None,
         note: str | None = None,
-        of_expense_id: int | None = None,
     ) -> str:
-        """记一笔**钱回来了**:退款或收入。金额记正数(单位元),方向由 kind 决定——
-
-        kind=refund(退款):冲抵某一笔支出,比如订阅退款、买错了退货。它会从
-        「这个月花了多少」里**减掉**;对得上哪一笔就把 of_expense_id 填成那笔的 #id
-        (list_recent 每行开头那个),几笔合起来退、对不上具体某一笔就别填。
-        kind=income(收入):生活费、奖学金、兼职、红包。它**不进**「花了多少」
-        ——记一笔生活费不该让这个月的支出变少。
-
-        occurred_at 缺省用当前时间,「上周三」这类相对时间要先调 current_time 换算成
-        YYYY-MM-DD 再传。**负数支出不是退款**:要记退款就用这个工具,
-        别去改原始那笔支出——那样底稿就不是原始记录了。"""
+        """记一笔收入:生活费、奖学金、兼职、红包,**收到的退款也记这里**。
+        金额记正数(单位元)。**收入不算在「花了多少」里**——记一笔生活费不该让这个月的
+        支出变少;一笔退款同样不去冲抵原来那笔支出(那笔钱当初确实花了,底稿不动),
+        它就是一笔钱回来了。occurred_at 缺省用当前时间,「上周三」这类相对时间要先调
+        current_time 换算成 YYYY-MM-DD 再传。**别拿一笔负数支出当收入记**,记在这儿。"""
         cents = _to_cents(amount)
         if cents is None or cents <= 0 or cents > _MAX_CENTS:
             return (
-                f"金额不对({amount}):要一个大于 0 的数字,单位是元(比如 600)。"
-                f"退款和收入都记正数,方向由 kind 决定。这笔没记。"
-            )
-        mode = _KIND.get(kind.strip().lower() if isinstance(kind, str) else "")
-        if mode is None:
-            # 只列合法值不够:`refund` / `income` 这两个词本身不解释"哪个会减掉花了多少",
-            # 而那正是这里唯一要分清的事(E2:让模型自己选对再重试)。
-            return (
-                f"看不懂 kind「{kind}」:只能是 refund(退款,冲抵某笔支出,会从"
-                f"「花了多少」里减掉)或 income(收入,生活费/兼职/红包,不算在"
-                f"「花了多少」里)。这笔没记。"
-            )
-        if mode == "income" and of_expense_id is not None:
-            # 不许悄悄接受:收入永远不减支出,而模型会以为自己记了一笔退款,
-            # 于是回话说"这个月少花了 600",合计里一分都没减。
-            return (
-                "收入不冲抵任何支出,of_expense_id 只给 refund 用。这笔没记"
-                "——是退款就把 kind 改成 refund,是收入就别传 of_expense_id。"
+                f"金额不对({amount}):要一个大于 0 的数字,单位是元(比如 600)。收入记正数,这笔没记。"
             )
 
         if occurred_at is None:
@@ -852,65 +792,36 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                 )
             when = parsed
 
-        target = ""
         try:
-            # M5-31:**先读后判再写,整块一个事务。** 「那笔支出在不在、是不是已删」是读完
-            # 才判的;判和写之间敞着的话,一次 delete_expense 正好落在中间,退款就指向了
-            # 一条已经不在账上的支出,而回话说得像办成了。
-            # 没传 of_expense_id 的那一支其实是纯插入(没有"读了再改"),但**不给它开特例**:
-            # 条件式加锁正是下一个人把 SELECT 挪出事务的那个口子,而代价只是一次拿锁。
-            # `immediate=True` 的理由同 amend:同进程那把可重入锁已经串好了,这一笔是给
-            # 独立容器形态(`create_server`,连接不止一条)留的——先读快照再写会撞
-            # BUSY_SNAPSHOT,那时候用户收到的是一句"库写入失败"。
-            with transaction(conn, immediate=True):
-                if of_expense_id is not None:
-                    row = (
-                        conn.execute(
-                            "SELECT id, amount_cents, category, deleted_at FROM expenses"
-                            " WHERE id = ?",
-                            (of_expense_id,),
-                        ).fetchone()
-                        if _is_bindable_id(of_expense_id)
-                        else None
-                    )
-                    if row is None:
-                        return (
-                            f"没有 #{of_expense_id} 这笔支出,这笔退款没记。"
-                            f"先用 list_recent 看一眼有哪些,#id 在每行开头;"
-                            f"要是对不上具体哪一笔,就别传 of_expense_id。"
-                        )
-                    if row["deleted_at"] is not None:
-                        # 已删的那行不在任何合计里,"冲抵"它就是冲抵一个不存在的数,
-                        # 而回话会说得像办成了——用户以为这个月少花了 600,账上并没有。
-                        return (
-                            f"#{of_expense_id} 那笔支出已经删了、不在账上,退款指不过去,"
-                            f"这笔没记。要是它对不上具体哪一笔,"
-                            f"就别传 of_expense_id 再记一次。"
-                        )
-                    target = (
-                        f",冲抵 #{of_expense_id}({row['category']} {_yuan(row['amount_cents'])} 元)"
-                    )
-                conn.execute(
-                    "INSERT INTO income (amount_cents, kind, occurred_at, note,"
-                    " of_expense_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (
-                        cents,
-                        mode,
-                        when.isoformat(timespec="seconds"),
-                        note,
-                        of_expense_id,
-                        datetime.now(tz).replace(tzinfo=None).isoformat(timespec="seconds"),
-                    ),
-                )
+            # **一条裸 INSERT,没有事务**(M6-3a)。M6-3 这里包着 `transaction(immediate=True)`,
+            # 而它存在的理由是 `of_expense_id` 那条"读了再判再写":先 SELECT 那笔支出、判它
+            # 在不在账上、再插入。那个临界区随指针一起没了,现在没有任何一个写进去的值来自
+            # 上一次读——`isolation_level=None` 下单条 INSERT 本来就是它自己的事务。
+            # 而 M5-31 那两处不能跟着去掉:`amend` 写的四个字段全部来自那次 SELECT、
+            # `delete` 判过 `deleted_at` 才动手,两条独立语句之间的窗口就是丢更新和
+            # "两边都报删了"的所在;`immediate=True` 还防着独立容器形态下先读快照再写撞
+            # BUSY_SNAPSHOT——而纯插入压根不先读快照。
+            # 留着它不是"多一道保险",是**说了一句不成立的话**:下一个人读到 `transaction`
+            # 会去找那个临界区在哪。顺带,隔壁 `record_expense` 的插入本来就是裸的
+            # ——同一件事两种写法,迟早有人问哪个才对(P1-1 的形状)。
+            conn.execute(
+                "INSERT INTO income (amount_cents, occurred_at, note, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    cents,
+                    when.isoformat(timespec="seconds"),
+                    note,
+                    datetime.now(tz).replace(tzinfo=None).isoformat(timespec="seconds"),
+                ),
+            )
         except sqlite3.Error as exc:  # E2:写不进去也要让模型知道这步没成
             return f"这笔没记进去(库写入失败:{exc})。"
 
-        # 回话里**把口径带上**:模型接下来要用这个数说话,而"减不减进花了多少"是这两种
-        # 东西唯一的区别。备注走和 list_income 同一个渲染器(P1-1:两套必然漂)。
-        rule = "「花了多少」里会减掉它。" if mode == "refund" else "收入不算在「花了多少」里。"
+        # 回话里**把口径带上**:模型接下来要用这个数说话,而"不减进花了多少"是这个数
+        # 唯一容易被搞错的地方。备注走和 list_income 同一个渲染器(P1-1:两套必然漂)。
         return (
-            f"记好了:{_KIND_LABEL[mode]} {_yuan(cents)} 元"
-            f"({when.strftime('%m-%d %H:%M')}){target}{_render_note(note)}。{rule}"
+            f"记好了:收入 {_yuan(cents)} 元({when.strftime('%m-%d %H:%M')})"
+            f"{_render_note(note)}。收入不算在「花了多少」里。"
         )
 
     def list_income(
@@ -918,10 +829,11 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         since: str | None = None,
         until: str | None = None,
     ) -> str:
-        """列出收入与退款(支出用 list_recent,两边是两本账)。since/until 格式
-        YYYY-MM-DD、两端都含,缺省为全时段;硬封顶 20 条,limit 为负数或超大值都钳制
-        到上限。第一行给的是**全区间**的两个合计,各自带着口径:退款会从「花了多少」
-        里减掉,收入不算在里面——**这两个数别加在一起**,它们回答的不是同一个问题。"""
+        """列出收入(支出用 list_recent,两边是两本账)。since/until 格式 YYYY-MM-DD、
+        两端都含,缺省为全时段;硬封顶 20 条,limit 为负数或超大值都钳制到上限。
+        第一行给的是**全区间**的收入合计和笔数,后面才是流水。
+        **收入不算在「花了多少」里**:这个数和 query_spending 那个数不许加减到一起,
+        它们回答的不是同一个问题。"""
         # 负数在 SQLite 的 LIMIT 里是"不限制",不钳制就是全表倒进上下文(M3-1 教训)。
         # 上限和 list_recent 共用一个:两个工具都返回原始记录,顶穿 L0 的方式一模一样。
         n = MAX_RECENT_ROWS if limit < 1 else min(limit, MAX_RECENT_ROWS)
@@ -940,7 +852,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
             upper = (end + timedelta(days=1)).isoformat()
 
         try:
-            totals = _income_totals(conn, lower, upper)
+            total = conn.execute(_INCOME_SQL["total"], (lower, upper)).fetchone()
             rows = list(conn.execute(_INCOME_SQL["list"], (lower, upper, n)))
         except sqlite3.Error as exc:  # E2:查不了也要让模型知道,而不是整轮炸掉
             return f"查不了(库读取失败:{exc})。"
@@ -950,38 +862,23 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         if not rows:
             # "这段没有" ≠ "一笔都没记过"(照 list_recent 的那条:混成一句会让模型
             # 以为这本账是空的)。
-            return f"{scope}没有收入也没有退款。" if scoped else "还没有记过收入或退款。"
+            return f"{scope}没有收入。" if scoped else "还没有记过收入。"
 
-        income_cents, income_n = totals.get("income", (0, 0))
-        refund_cents, refund_n = totals.get("refund", (0, 0))
-        # 顺序写死(收入在前),不跟着 SQL 的排序抖:同一份数据每次读起来要一样。
-        parts = []
-        if income_n:
-            parts.append(f"收入 {_yuan(income_cents)} 元({income_n} 笔)")
-        if refund_n:
-            parts.append(f"退款 {_yuan(refund_cents)} 元({refund_n} 笔)")
-        # **两个数各自带口径**。少了这半句,「3000」这个数就没有单位——而月度复盘里
+        # 一行都没有时 SUM 回的是 NULL,不是 0——但那一支上面已经返回了,这里只防
+        # "以后有人把两条查询的区间改得不一样"(那时 NULL 会一路变成 TypeError)。
+        cents, count = total["cents"] or 0, total["n"]
+        # **口径那半句必须在**:少了它,「3000」这个数就没有单位——而月度复盘里
         # 「花了多少」和「进了多少」是两个数、两套算法,说错一个整段复盘就是错的。
-        if income_n and refund_n:
-            rule = "退款从「花了多少」里减掉,收入不算在里面。"
-        elif refund_n:
-            rule = "退款从「花了多少」里减掉。"
-        else:
-            rule = "收入不算在「花了多少」里。"
-
-        lines = [f"{scope}{','.join(parts)}。{rule}"]
+        # M6-3a 之后这半句是 `list_income` 仅存的两个存在理由之一(另一个是那个合计)。
+        lines = [f"{scope}收入 {_yuan(cents)} 元({count} 笔)。收入不算在「花了多少」里。"]
         for r in rows:
             when = r["occurred_at"].replace("T", " ")[:16]
-            against = "" if r["of_expense_id"] is None else f"(冲抵 #{r['of_expense_id']})"
-            # kind 取不到标签就原样显示:KeyError 会逃出工具边界,而这里没有任何东西
-            # 值得为它炸掉一整轮(E2)。
-            label = _KIND_LABEL.get(r["kind"], r["kind"])
-            lines.append(
-                f"- {when} {label} {_yuan(r['amount_cents'])} 元{against}{_render_note(r['note'])}"
-            )
+            # 每行都带上「收入」两个字:一条流水会以 tool_result 的身份被 search_history
+            # 捞回去,而"3000.00 元"单独摆着和一笔支出长得一模一样。两个字买一个不含糊。
+            lines.append(f"- {when} 收入 {_yuan(r['amount_cents'])} 元{_render_note(r['note'])}")
         # 合计那一行是**全区间**的,和列了几行无关;所以截断必须说出口——静默截断读起来
         # 和"就这些"一模一样,模型会拿残缺的流水去解释一个全区间的合计。
-        hidden = income_n + refund_n - len(rows)
+        hidden = count - len(rows)
         if hidden:
             lines.append(f"(还有 {hidden} 笔更早的没列出来,上面的合计是全区间的)")
         return "\n".join(lines)

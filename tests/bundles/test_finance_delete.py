@@ -80,6 +80,28 @@ def test_a_deleted_row_leaves_every_view_and_the_total(runtime, tmp_path, one):
     assert "28.00 元" in out, f"回话得说清楚删的是哪笔:{out}"
 
 
+def test_the_reply_reads_exactly_as_it_did_before_m6_3(runtime, one):
+    """这句回话的**逐字节原始记录**。上面那几条钉的都是片段("28.00 元" 在不在),
+    而整句话一个字节没人钉——M6-3 就是这么往里加东西的。
+
+    M6-3 验收时在「合计里不算它了」后面追加过一句「有 N 笔退款指着这笔、它还在从
+    「花了多少」里减」,理由是那会儿 `record_income` 的 `of_expense_id` 能让一条退款
+    悬空。**M6-3a 把那半句删了**:没有指针就没有悬空,它报告的那个事实不存在了
+    (G6:先问它该不该在)。于是这句话回到 M5-20 的原文,而这条测试是它的原始记录
+    ——M6-3a 的硬口径正是"delete_expense 的输出回到 50fde56 逐字节一致"。
+
+    它原来长在 `test_finance_income.py` 里(当时是"没有退款指着它"这个**条件分支**的
+    对照组)。分支没了,它就该搬到它钉的那个工具旁边:改 `delete_expense` 回话的人
+    会看这个文件,不会去翻收入那个文件。
+    """
+    said = tool(runtime, "delete_expense")(expense_id=one, reason="记重了")
+
+    assert said == (
+        "删了 #1:交通 28.00 元 · 原因「记重了」。合计里不算它了。"
+        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+    ), said
+
+
 def test_a_deleted_row_is_still_there_when_you_ask_for_it(runtime, tmp_path, one):
     """★ 验收口径一的另一半:`include_deleted=True` 还看得见,并且标着「已删除」。
 

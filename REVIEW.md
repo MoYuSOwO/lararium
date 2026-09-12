@@ -13965,3 +13965,203 @@ lint-imports 4 kept / 0 broken。前缀影响不变(改的是回话,不是 docst
    再问「这个月花了多少」,看她**有没有自己又减一遍**(docstring 那句防的就是这个);
 3. 那 600 元的话头挂了三天,记进去之后该关掉——**而 `close_thread` 至今 0 次调用**
    (M5-33 留的那个基线),这正好是它的第一个真实样本。
+
+## M6-3a:退款并进收入(M6-3 的一半拆掉) —— 待验收
+
+**一句话**:`kind` / `of_expense_id` 两列退休、`query_spending` 那一摊退款逻辑连根拔掉、
+`delete_expense` 那句悬空提示删掉;`income` 表只剩一个数一个口径(**收入不算在「花了多少」
+里**),退款到账也记成收入。支出侧**与 M6-3 之前那个提交(50fde56)逐字节一致**,
+而"一致"是拿那个提交的代码跑出来对的,不是看着像。
+
+### 一、金样怎么产出的(硬口径第 1 条)
+
+照 M5-26 / M6-3 的口径:**金样必须是旧代码产出的**。两个脚本(都在 scratchpad,不进仓库):
+
+1. `git show 50fde56:bundles/finance/server.py` → 640 行的独立文件,
+   `importlib.util.spec_from_file_location("finance_baseline_50fde56", …)` 当模块加载;
+2. 造两份库——一份 M6-3 之前的形状(13 行支出、3 行已删、**没有 income 表**),一份 M6-3
+   已经推上真机的形状(**多一张带 `kind` / `of_expense_id` 的 income 表,里面三行**:
+   一条退款指着**已删**的 #1、一条退款指着活着的 #13、一条普通收入);
+3. 基线代码在两份库上跑 `list_recent` / `query_spending`(按类目、按天)——**三份输出两份库
+   完全相同**(它压根不认识那张表),而且**和冻在 `test_finance_income.py` 里的
+   `LEGACY_LIST` / `LEGACY_BY_CATEGORY` / `LEGACY_BY_DAY` 三份全等**;
+4. 拆完之后用**改动后的代码**开同一形状的库,三份视图和基线**逐字节一致**(脚本打印
+   "三份视图与 50fde56 逐字节一致 ✔")。
+
+第二个脚本把支出侧**每一句回话**都和基线比了一遍(记一笔正常的 / 0 / 溢出 / 非法类目 /
+看不懂的时间 / amend 成功 / amend 找不到 / delete / 再删一次 / undo / delete 找不到 /
+list_recent / 空区间):**14 句里 13 句逐字节一致,唯一不一致的是负数那句**——那正是硬口径
+第 3 条要求改的措辞(见下面第五节)。顺带照出一件事:两句「超大 #id」压根没法比,
+**基线在那里直接抛 `OverflowError`**(M5-15 / M5-20 就在的那个洞,M6-3 才补上)——
+这也是为什么 `_is_bindable_id` 必须留着。
+
+### 二、删掉的测试,逐条交代(这次最要紧的一段)
+
+一共删掉 **13 条**(另有 2 条改名 + 1 条移位,单列在后面)。判据只有一条:
+**它钉的那个行为已经不存在了**,不是"它红了"。
+
+| 删掉的 | 它钉的是什么 | 为什么它测的东西不存在了 |
+|---|---|---|
+| `test_a_refund_comes_off_what_you_spent_while_the_original_row_stays_untouched` | 退款从「花了多少」里减掉、而底稿不动 | "减掉"这件事整个没了。那条断言的另一半(记收入不动底稿)由 `test_income_does_not_touch_what_you_spent` 接着钉,我给它补上了 `expenses` 整表比对 |
+| `test_pointing_a_refund_at_a_row_that_is_not_there_says_so_and_writes_nothing` | `of_expense_id` 指向不存在的 #id → 人话、不落行 | 参数没了,这个调用压根构造不出来 |
+| `test_pointing_a_refund_at_a_deleted_row_says_so_and_writes_nothing` | 指向**已删**支出 → 拒 | 同上;而且这条闸的整个不变量(退款不许指着不在账上的支出)随指针一起消失 |
+| `test_income_cannot_point_at_an_expense` | 收入不许带 `of_expense_id` | 同上 |
+| `test_an_unknown_kind_is_refused_with_both_meanings_spelled_out` | 看不懂的 kind 要把两种口径都写出来 | 只有一种东西了,没有 kind 可看不懂 |
+| `test_kind_accepts_the_forms_the_model_actually_writes` | kind 收「收入」「进账」「INCOME」 | 同上,`_KIND` 同义词表整个删了 |
+| `test_list_income_says_both_numbers_with_what_each_one_means` | 两个合计各自带口径、且不许加在一起 | 只剩一个数。换成 `test_list_income_says_the_total_with_the_caliber_spelled_out`(断整份输出),口径那半句照钉 |
+| `test_list_income_states_the_kind_it_actually_has` | 只有一种时只说那一种 | 永远只有一种了,这条参数化没有第二个案例 |
+| `test_a_refund_bigger_than_the_spending_says_it_was_a_net_return` | 退款多于支出时说"净收回" | 那个分支删了(没有净额可算) |
+| `test_a_range_with_only_refunds_does_not_say_there_are_no_records` | 只有退款没有支出时不许回"没有记录" | 那个分支删了——现在这种区间**就是**没有支出记录,回"没有记录"是对的(它回到了 50fde56 的行为) |
+| `test_a_refund_outside_the_range_is_not_netted` | 退款按自己的日期落区间 | 没有任何东西被 netted;"收入永远不进 query_spending"由金样那条**更强地**钉住(整份输出相等,而且库里就有跨月的收入行) |
+| `test_an_expense_with_no_refunds_reads_exactly_as_it_did_before` | 没有退款时 `query_spending` 不多字 | 被金样那条严格包含:它断的是片段("退款"不在输出里),金样断的是**三份输出整体相等** |
+| `test_deleting_the_expense_a_refund_points_at_leaves_the_refund_alone` | 删支出不许偷偷动退款行 | 两张表之间**再没有任何关联**(没有指针、没有跨表查询),`delete_expense` 碰不到 income 表的任何代码路径。留着它就是给一个不存在的机制写守卫 |
+| `test_deleting_a_refunded_expense_says_the_refund_is_still_netting_off` | 删被冲抵的支出时把那笔退款说出口 | 任务书点名要删的那条。它报告的事实("那笔退款还在从「花了多少」里减")不存在了 |
+| `test_recording_a_refund_reads_and_writes_inside_one_transaction`(在 `test_finance_concurrency.py`) | `record_income` 的读-判-写在一个事务里、`BEGIN IMMEDIATE` 打头 | 那个"读"就是 `of_expense_id` 的校验。临界区没了,事务也去掉了(论证见第三节),这条钉的 SQL 序列不再存在 |
+
+**改名 / 重写的 2 条**:`test_a_non_positive_amount_points_at_the_sign_instead_of_the_direction`
+→ `..._is_refused_and_records_nothing`(原断言里有「提示必须提到 kind」,而那半句回话没了;
+现在断"提到金额 + 说了这笔没记 + 不落行");`test_an_id_too_big_for_sqlite_...` 的参数
+**从 3 个减到 2 个**——`record_income` 那个调用点没了,`amend_expense` / `delete_expense`
+两条**原样留着**(任务书第 2 条:那两处靠 `_is_bindable_id`,顺手删掉就是把刚补的洞挖开)。
+
+**移位的 1 条,这是第 3 条要我按 G6 判的那个**:
+`test_deleting_an_expense_nothing_points_at_reads_exactly_as_it_did_before` —— **留下,但搬家**,
+搬进 `tests/bundles/test_finance_delete.py` 改名 `test_the_reply_reads_exactly_as_it_did_before_m6_3`。
+G6 三问:**谁会读到它**?改 `delete_expense` 回话的人。**什么时候**?他往那句话里加东西时。
+**读到之后能做什么**?知道这句话是有原始记录的,要改得先说服人。它原来存在的理由
+(「有人把 `if hit["n"]` 去掉、让那句无条件追加,红的会是另一个文件里一条看起来无关的测试」)
+**随那个 `if` 一起作废了**,但我查了一遍:**整份测试里只有它一条钉着 `delete_expense` 回话的
+全文**,`test_finance_delete.py` 里那几条断的都是片段(`"28.00 元" in out`)——而 M6-3 往这句话里
+加东西时,没有任何一条测试因此变红。这就是它该留下的理由,也是它该换个位置的理由:
+分支的对照组没了,它现在是那句话的原始记录,该长在那个工具旁边。
+`test_finance_delete.py` 的**既有断言一条没动**(只是新增了一个函数)。
+
+### 三、`record_income` 那个事务:去掉,理由
+
+**去掉。** 它在 M6-3 里存在的唯一理由是 `of_expense_id` 那条「读了再判再写」:先 SELECT
+那笔支出、判它在不在账上、再插入;判和插之间敞着的话,一次 `delete_expense` 正好落在中间,
+库里就留下一条指着已删支出的退款,而回话说得像办成了。**那个临界区随指针一起没了**——
+现在没有任何一个写进去的值来自上一次读,`isolation_level=None` 下单条 INSERT 本来就是
+它自己的事务。
+
+**为什么 M5-31 那两处不能跟着去掉**(这是任务书要的那半句):`amend_expense` 写进去的
+四个字段**全部来自那次 SELECT**,`delete_expense` 判过 `deleted_at` 才动手——两条独立语句
+之间的窗口就是「丢更新」和「两边都跟用户说删了」的所在,那是真的读-改-写。而
+`immediate=True` 还防着独立容器形态(`create_server`,连接不止一条)下"先读快照再写"撞
+BUSY_SNAPSHOT,**纯插入压根不先读快照**,这一层对它也不适用。
+
+**留着的代价不是一次拿锁,是说了一句不成立的话**:下一个人读到 `transaction(immediate=True)`
+会去找那个临界区在哪,然后找不到。顺带,隔壁 `record_expense` 的插入本来就是裸的——
+同一件事两种写法,迟早有人问哪个才对(P1-1 的形状)。理由写在代码那一处。
+
+### 四、迁移:`kind` / `of_expense_id` 怎么退休、怎么验的
+
+`_retire_the_refund_columns(conn)`,照 `_retire_the_voided_column` 同一个形状:
+`PRAGMA table_info(income)` 探测 → 一个事务里两条 `ALTER TABLE income DROP COLUMN` →
+跑完探测不到,自然幂等。排在 `executescript` 之后、任何工具调用之前。
+
+**`ALTER TABLE … DROP COLUMN` 在这两列上真的能跑——自己跑的,没推演**:SQLite 3.53.1,
+两条 DROP 都 ok,`idx_income_occurred_at`(只在 `occurred_at` 上)完好,三行数据的
+id / 金额 / 时间 / 备注 / `deleted_at` 一个字节没动;第二次 DROP 报
+`OperationalError: no such column: "kind"`——**所以那次探测是幂等的全部依靠**,不是装饰。
+
+**顺序有没有要求:没有,而这是想清楚之后的结论**(写进 docstring 了)。`voided_by` 那次
+顺序是死的,因为**列一拿掉,靠它把行藏起来的那个过滤条件就跟着没了**,必须先把那些行标成
+已删——那是一次"先改数据、再改结构"。这次一行数据都不改,两个 DROP 互不相干,
+断在中间(一列掉了、一列还在)对任何读写都没影响:新代码两列都不读,`of_expense_id` 本来
+可空。**位置**倒是有要求,写进 docstring 了:必须在 `executescript` 之后(表得先在,不然
+探测不到、静默跳过),且在任何工具调用之前——否则 `kind TEXT NOT NULL` 还在,而新的
+`record_income` 不写它,**每一笔收入都撞 NOT NULL**,用户收到的是一句「这笔没记进去」。
+两条 DDL 仍然包在一个事务里:不是因为中间态会出事,而是让下一次开库只有两种状态要想。
+
+**有行的那种库怎么验的**:`test_the_two_retired_columns_turn_every_refund_row_into_plain_income`
+——M6-3 形状的库(income 表带两列,**既有 refund 行也有 income 行,其中一条 refund 指着
+已删的 #1**),拆完之后 `list_income` 把三行**都当收入列出来**(断整份输出)、`id` 还是
+1/2/3、金额与 `occurred_at` 与备注逐个比原值、`deleted_at` 三个 None,列清单等于退休后的
+7 列;最后**再记一笔新收入**并断"记好了"——那一句钉的正是 NOT NULL 那个症状。
+幂等另钉一条(开两次库、中间记一笔,行数 3+1、`list_recent` 仍等于金样、`kind` 已不在列里)。
+
+### 五、回话与文档的改动
+
+- `record_expense` 负数那句指路:「退款或收入用 record_income 记(记正数)」→
+  **「钱回来了(收到的退款也算)用 record_income 记成收入,别记成负数的支出。」**
+  (硬口径第 3 条。**这是回话不是 docstring,不进前缀**;0 和溢出照旧不指路。)
+- `bundles/finance/skills/monthly-review.md` 第 4 节整节重写:原来写的是「花了多少 = 支出 −
+  退款」「query_spending 已经把三个数一起给你了」「别自己再减一遍」——**那三句现在全是错的**。
+  改成「花了多少 = 支出」「进了多少 = 收入」,句式模板跟着改;顺手把"退款为什么也不减"的
+  理由写进去(「很难说全退」)。方法论里没有具体金额,`test_monthly_review_skill_is_readable_through_the_registry`
+  照旧绿。**skill 正文不是前缀**(按需 `read_skill` 读的第二层),manifest 的目录行一个字没动。
+
+### 六、前缀影响(A1)
+
+**前缀第 0 层重建一次**,`prefix_log` 会记。变的是:
+
+- `record_income` **签名少两个参数**(`kind` / `of_expense_id`)+ docstring 重写;
+- `list_income` docstring 重写(原话「第一行给的是全区间的两个合计……**这两个数别加在一起**」
+  现在只有一个数);
+- `query_spending` docstring **删掉 M6-3 加的那两行**——它回到 50fde56 的那份,逐字节一样。
+
+**没变的**:工具**数量和顺序**(7 个,`record_income` / `list_income` 仍在末尾)、
+`manifest.yaml` 一个字节没动、`record_expense` / `list_recent` / `amend_expense` /
+`delete_expense` 的 docstring 一个字节没动。两处冻结顺序的测试
+(`test_tool_order_is_frozen_and_matches_manifest`、
+`test_bundle_tool_order_memory_first_finance_appended`)**一个字没动**——
+一处要说明:它们的行内注释里还写着「M6-3 收入/退款」,而"退款"这个词在那儿已经不准确了;
+任务书说这两处一个字不动,所以我没动。要改的话是纯注释,一行,听你的。
+
+仓库里没有硬编码的前缀金样(那几条钉的都是"跨轮不变"),所以没有金样要更新。
+
+### 七、变异 11 条,11 条被咬住
+
+脚本自带三条自检:**锚点必须命中且只命中一次**(不然 assert 掉)、**判红只看 returncode**、
+跑完比 sha256 确认还原干净;开跑前先断"变异之前门禁是绿的",否则后面的结论全不成立。
+第 8 条第一版我种的是"把合计读出来但不用"——**rc=0,没咬住**,而那是变异写错了不是测试漏了
+(输出压根没变),改成真的把那行说出口之后立刻被咬住。
+
+```
+咬住  迁移整个不跑(老库那两列留着)
+咬住  迁移不幂等(探测去掉,第二次开库直接炸)
+咬住  迁移改成无条件重建表(第二次开库把行冲掉)
+咬住  迁移把 refund 行丢掉,而不是当收入留下
+咬住  list_income 不说口径(合计变成一个没有单位的数)
+咬住  record_income 的金额上界拿掉(OverflowError 又逃出工具边界)
+咬住  amend_expense 的溢出护栏被顺手删掉(M5-15 那个洞又开了)
+咬住  list_income 截断不说出口(残缺流水配一个全区间的合计)
+咬住  query_spending 又把收入说进「花了多少」(M6-3a 拆掉的那一摊回来了)
+咬住  record_expense 记负数时不再指路(用户又要去动底稿)
+咬住  收入行不进自己那张表,落进 expenses(顺手统一成一张表)
+```
+
+### 八、纪律那一步:先写金样对比、确认它红
+
+`test_the_expense_side_reads_byte_for_byte_as_the_baseline_commit_printed` 是先写的,
+拆之前跑 → **1 failed**,红在按类目那一份上,多出来的正是
+「同期收到退款 615.00 元(2 笔):支出 1555.03 元,抵掉退款后实际花掉 940.03 元。」
+拆完之后绿。
+
+### 九、S2 登记
+
+`bundles/finance/server.py` **927 行(M6-3 那版 995 行,缩了 68)**。登记照旧要留——
+300 那条线还远远甩在后面。理由改了一处:原文第二条「拆了之后 `query_spending` 要跨模块
+读退款合计」**作废了**(那条查询没了),我把它写明作废、留下第一条(共享同一条连接、
+同一套渲染器、同一份金额与时间解析——拆了就是两份渲染器,而 P1-1 正是两套渲染器)。
+真正该拆的那天改成"某一侧长出自己的状态机(比如收入要过门控)"。
+
+### 十、门禁
+
+**775 passed + 15 skipped**(M6-3 那次 793 + 15:删 19 条、加 2 条,
+`test_every_income_query_filters_deleted_rows` 的参数化从 3 减到 2)。
+ruff / ruff format 全绿,mypy 36 files,lint-imports 4 kept / 0 broken。
+
+### 十一、真机要验的
+
+1. **别手改库**——推代码、开一次库让那两列自己退休(真机那张表 0 行,所以退休之后
+   `PRAGMA table_info(income)` 应当是 7 列、`sqlite_master` 里的 `CREATE TABLE income`
+   不再有 `kind`);核 `list_recent` 与 `query_spending`(10 笔、1555.03 元,一个字节不该差);
+2. 微信里说一句「那 600 的 ChatGPT 退款记一下」,看模型**还找不找得到 `record_income`**
+   ——它现在只有"收入"这一个词了,而用户说的是"退款",docstring 里那句「收到的退款也记这里」
+   就是为这一刻写的。记完确认回话是「收入 600.00 元……收入不算在「花了多少」里」;
+3. 再问「这个月花了多少」,确认它**不再自己减那 600**(M6-3 的 docstring 教过它"有退款时
+   末尾会多一行",那句话没了,它有可能还按旧习惯减一遍);
+4. 那 600 元的话头挂了三天,记进去之后该关掉——`close_thread` 至今 0 次调用(M5-33 的基线),
+   这仍然是它的第一个真实样本。
