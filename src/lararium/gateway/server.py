@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
+from bundles.courses.server import build as build_courses
 from bundles.finance.server import build as build_finance
 from bundles.memory.server import build_memory_components, memory_tool_functions
 from bundles.recipes.server import build as build_recipes
@@ -67,6 +68,10 @@ def _assemble_bundle_tools(data_dir: Path, gate: Any, timezone: str) -> list[Cal
     # schema,前缀重建一次(A1,启动时 prefix_log 会记);插到中间则是**每轮**毁一次缓存。
     # 它不收 timezone:那一层没有任何时间戳(见 bundles/recipes/server.py 的 build)。
     tools.extend(build_recipes(data_dir).tools)
+    # M6-6a 学习(笔记那半):同样**追加在末尾**,上面 20 个一格没动。新 bundle = 目录行 +
+    # 7 个工具 schema,前缀重建一次(A1)。它收 timezone:回收站目录名里有时间戳。
+    # M6-6b 的 add_file / list_materials 会追加在这 7 个之后(manifest 里已注明)。
+    tools.extend(build_courses(data_dir, timezone=timezone).tools)
     return tools
 
 

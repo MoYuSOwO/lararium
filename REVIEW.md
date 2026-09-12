@@ -14950,3 +14950,278 @@ mypy 39 files,lint-imports 4 kept / 0 broken。
   「标准之后尝试,觉得可以就留着作为经验,不可以就提改进」);
 - 故意打错一个菜名,看她有没有读到「之前没有这道,给你新建了」那句并且自己 rename;
 - 问一句「我之前哪道菜写了要少放酱油」,看她调 `search_recipes` 还是逐份 `read_recipe`。
+
+## M6-6a:学习 bundle·笔记那半 —— 待验收
+
+一句话:共用层 `src/lararium/docstore.py` 从 `bundles/recipes/store.py` 里**搬**出来,
+做菜 bundle 对着基线 3e633fc 的代码跑 129 次调用、**0 处字节不同**;学习 bundle
+`bundles/courses/`(7 个工具)建在它上面。课件那半(`add_file` / `list_materials` /
+`read_pdf`)一个字没碰。
+
+### ★ 论证一:共用层放哪、边界在哪
+
+**放 `src/lararium/docstore.py`。** bundle → lararium 是允许的(finance import `lararium.db`
+是先例),bundle → bundle 被 `bundles-are-independent` 禁。名字过 S1:它不是杂物袋,
+是一个有名字的概念——「用户手写的 markdown 文档库」那一层,只认"一个 root + 一个用户给的
+名字 + 一段文本",没有 bundle 名、没有领域词、没有时间戳、没有全局状态。
+
+**边界的判据只有一条:两个真实用例都在用的才进来,只有一边用的留在那一边(G5)。**
+这条切出来的结果:
+
+- **进共用层**:名字判定 `name_fault` + `normalize_name` + `MAX_NAME_CHARS`;落点兜底 `under`;
+  `replace_once`;扫文件搜索 `scan` / `Hit`;`page_of`;`excerpt` / `one_line` / `clip` 与界符;
+  逐字节读写 `read_document` / `save_document`(`newline=""` 读写两边都在这一个文件里,
+  CRLF 那条教训只有一处)、`relocate`、`UnreadableDocument`、`TRASH_DIR`。
+- **人话留在各自那边。判定共用,句子不共用。** 做菜那句「菜谱是平的一层,名字就是名字,
+  不分类、不带层级」在学习这边是假的(一门课是个目录)。所以共用层回的是
+  `NameFault(kind, found)`(F1:跨模块的是有名字的数据),两边各自的 `name_error` 把它说成
+  自己的话。把两套句子塞进一个 `noun=` 模板是 G7 那种假统一。
+- **布局留在各自那边**:`RecipeStore`(扁平 `<菜名>.md`,回收站同名就拒)与 `CourseStore`
+  (`<课程>/notes.md`,整个目录进 `.trash/<课程>-<时间戳>/`)。
+- **分页 `paginate` / `page_index` 在 `bundles/courses/store.py`**:只有笔记本分页,
+  `read_recipe` 不分页。
+- **`_speak_errors` 两份,各 20 行,刻意没共用**:它翻的是给这个 bundle 说的那句话,和
+  `name_error` 同一个判据;漂移面是一句话,不是一条安全性质。**这一处请验收时判。**
+
+共用层这一轮**新多出来的只有两样,都是第二个用例逼出来的**:`find_all(text, query, limit)`
+(一本长笔记要"这个词在哪几处";`scan` 现在拿它 `limit=1`,于是"怎么算命中"——casefold、
+不重叠——只有一份实现),和 `Hit.at`(第一处内容命中的下标,学习那边换算页码;做菜不读它)。
+
+`bundles/recipes/store.py` 368 → 232 行:留下 `RecipeStore`、`Located`、后缀常量、做菜那
+十一句 `name_error`;共用层的名字从这里经 `__all__` 转出去,**定义只有一份**。
+`UnreadableRecipe = UnreadableDocument` 是个别名——`server.py` 和老测试按这个名字捕获,
+改掉它换不来任何东西。`bundles/recipes/server.py` 一个字节没动。
+
+**`.importlinter`**:任务书说「它还没列 recipes/courses」——**recipes 已经在了**(M6-5 加的),
+只缺 courses,这一轮加上。不加,courses import recipes 不会被拦。
+
+**`materials/` 的"容得下"怎么落的**:没给 `CourseSpot` 加 `materials` 字段——这一轮没人读它,
+加了就是预付。容得下靠的是**落点的单位是整个课程目录**:改名和删除搬目录,课件天然跟着走。
+拿一个手工放进 `materials/` 的假 PDF 钉了三处(改名跟着走、删除跟着进回收站、undo 逐字节回来);
+`list_courses` 把"只有课件没有笔记"的目录也当一门课(M6-6b 的 `add_file` 会先建目录)。
+
+### ★ 论证二:`delete_course` 的 `reason`
+
+签名 `delete_course(course, reason="", undo=False)`。区别在**谁来拒、拒在哪一刻**:
+
+- **必填位置参数**:拒绝发生在**工具函数之外**(参数绑定),模型拿到的是缺参错误,而且
+  **不分删还是撤回**——撤回也被逼着编一个理由。撤回是恢复路径,最不该有摩擦。
+- **默认空串 + 工具自己拒**:拒绝发生在**工具里面**,而且**只在删的那一支**。拒得出一句人话
+  (「这学期修完了」和「记错课程名了」不是一回事),模型能照着补;撤回那一支根本不看 reason。
+
+「删必须给理由」一点没放松:删的那一支不给就不删(`test_delete_needs_a_reason`)。
+`test_undo_does_not_need_a_reason` 走的就是那句 `delete_course("大学物理", undo=True)`;
+而且 `test_courses_tools.py` 里**所有** undo 调用都不传 reason——做菜那三条把绕法固化进测试
+的形状,这边一条都没有。
+
+### ★ 论证三:`search_notes` 跨课的排序和标注
+
+**给不给 course 是两个问题,答案形状不一样**(G7:入口统一,处理不统一)。
+
+- **不给 course,问的是"哪门课"**:走共用层 `scan`,**每行以课程名开头**,标名字/内容命中,
+  内容命中带页码。**顺序写死在 `scan` 里**:名字命中在前,同一类里按课程名码位排,不跟
+  `iterdir` 走(那个在不同机器上不一样,「第 1/3 页」会指着不同的东西)。
+- **给 course,问的是"这本里在哪几处"**:一处一行,各带页码,课程名只在抬头。
+  只给第一处的话一本二十页的笔记等于搜不到。一本最多列 50 处,超了说出口。
+
+**页码是让搜索接得上 `read_note` 的那一步**:「找一段的正常姿势是搜」,而搜到了不知道去读
+哪一页,就又回到从头翻。
+
+跨课也匹配课程名(同 `search_recipes`)——**偏离 PLAN**,PLAN 工具表写的是「搜内容」。
+理由:复用 `scan` 就是这个行为,「搜"线代"找得到线代这门课」不会让人意外;改成只搜内容得给
+`scan` 加开关。验收可以否。`course=""` / 全空格当"没给"(全搜),不回「课程名是空的」。
+
+### 真实的工具输出
+
+```
+list_courses()                 → 还没有哪门课的笔记。第一次记就 append_to_note("线性代数", "……")
+                                 ——没有的课会顺手建出来,而回话里会说一声。
+append_to_note("线性待数", …)  → 「线性待数」这门课之前没有,给你新建了,第一段记进去了(70 字)。
+                                 要是课程名打错了,rename_course 能改过来。
+再 append 一段                 → 记在「线性待数」的笔记后面了:「## 第二章 特征值 特征值 λ 满足
+                                 det(A-λI)=0」。原来那些一个字没动。
+rename_course("线性待数","线性代数") → 「线性待数」改名成「线性代数」了。整个课程目录一起搬的,
+                                 内容一个字节没动。
+read_note("线性代数")          → '# 线性代数\n\n## 第一章 行列式\n| 阶 | 展开 |\n|---|---|\n| 2 | ad-bc |\n
+                                 <<< 老师说考 >>> 🍅\r\n## 第二章 特征值\n特征值 λ 满足 det(A-λI)=0\n'
+                                 ←── 和两次写进去的拼起来 == True(CRLF、|、<<< >>>、emoji 都在)
+replace_in_note  一次          → 改好了「线性代数」的笔记。自己核对一下:
+                                 改前:…| 阶 | 展开 | |---|---| | 2 | ad-bc | <<< 老师说考 >>> 🍅 ## 第二章…
+                                 改后:…| 阶 | 展开 | |---|---| | 2 | ad − bc | <<< 老师说考 >>> 🍅 ## 第二章…
+replace_in_note  零次          → 「线性代数」的笔记里没找到这段,一个字没动:「若尔当标准型」。可能这处
+                                 已经改过了,也可能记错了原文——先 search_notes 搜一下再来。
+replace_in_note("离散数学",    → 这段在「离散数学」的笔记里出现了 3 次,一个字没动——不知道你指的是
+  "归纳法", …)  三次             哪一处。把 old 给长一点(多带前后一两行)让它只剩一处。
+                                 [读回来 '1. 归纳法\n2. 归纳法\n3. 归纳法\n' —— 没改第一处]
+search_notes("行列式")         → 「行列式」命中 2 门课,第 1/1 页(只给片段,要读整段用 read_note):
+                                 - 线性代数(内容命中,第 1 页) 「# 线性代数 ## 第一章 行列式 | 阶 | …」
+                                 - 高等数学(内容命中,第 1 页) 「# 高等数学 泰勒展开 行列式在多元积分…」
+search_notes("数学")           → 「数学」命中 2 门课,第 1/1 页(只给片段,要读整段用 read_note):
+                                 - 离散数学(名字命中)
+                                 - 高等数学(名字+内容命中,第 1 页) 「# 高等数学 泰勒展开 …」
+search_notes("特征值","线性代数") → 「特征值」在「线性代数」的笔记里命中 4 处,第 1/1 页(只给片段,…):
+  [本子已 4 页]                  - 第 1 页 「…🍅 ## 第二章 特征值 特征值 λ 满足 det(A-λI)=0 第 000 行…」
+                                 - 第 1 页 「…## 第二章 特征值 特征值 λ 满足 det(A-λI)=0 第 000 行:推…」
+                                 - 第 2 页 「…第 149 行:推导过程 特征值再出现一次 第 000 行:推导过程…」
+                                 - 第 4 页 「…第 148 行:推导过程 第 149 行:推导过程 特征值第三次」
+read_note("线性代数", 3)       → 「线性代数」的笔记,第 3/4 页(整本 4020 字)。找某一段用 search_notes
+                                 更快,它会说在第几页:\n第 025 行:推导过程\n…
+read_note("线性代数", 999)     → 「线性代数」的笔记,第 4/4 页(整本 4020 字)。……   [钳到最后一页]
+search_notes("薛定谔")         → 没有哪门课的笔记提到「薛定谔」。换个说法再试(搜的是课程名和笔记原文),
+                                 或者 list_courses 看全部(一共 4 门)。
+rename_course(新名字已占)      → 已经有「大学物理」这门课了,没改——改名会把两门课的笔记合到一起,
+                                 而那是静默的破坏。两边都 read_note 看一眼,自己决定留哪份。
+delete_course("大学物理")      → 删「大学物理」得说清为什么(reason),所以没删。「这学期修完了」和
+                                 「记错课程名了」不是一回事,三个月后回头看得出差别。
+delete_course(…, "这学期不修了") → 删了「大学物理」,原因「这学期不修了」。整个课程目录搬到一边存着、
+                                 一个字节没销毁,删错的话再调一次、带 undo=True 就能原样拿回来。
+list_courses()                 → 有 3 门课,第 1/1 页:\n- 离散数学\n- 线性代数\n- 高等数学
+list_courses(include_deleted=True) → 有 3 门课、回收站里 1 门,第 1/1 页:
+                                 - 离散数学 / - 线性代数 / - 高等数学 / - 大学物理(已删:「这学期不修了」)
+  [盘上] .trash/大学物理-20260913T053648/notes.md、.trash/大学物理-20260913T053648.reason
+delete_course("大学物理", undo=True) → 「大学物理」拿回来了,一个字节没变。
+再 undo 一次                   → 「大学物理」没删过,不用恢复。list_courses 看看现在有哪些。
+```
+
+非法名字(每个吃课程名的工具都拒,且整棵目录快照前后相等):
+
+```
+""                 → 课程名是空的。给一门课的名字,比如 read_note("线性代数")。
+"../../etc/passwd" → 课程名里不能有「/」,这门课没建/没读。一门课一个名字,笔记在这门课自己的
+                     地方,不用你指路径。
+".."               → 课程名里不能有「..」,……
+".trash"           → 课程名不能以「.」开头,这门课没建/没读。换个正常的课程名。
+"课"×41            → 这个课程名太长了(41 字,最多 40 字),没这么建。取个短名字当课程名,全称写进笔记正文里。
+"线代\x00"         → 这个课程名里有控制字符,没这么建。重打一遍课程名。
+外链(符号链接指外面) → 「外链」这个名字落不到课程目录里面,这门课没建/没读。换个正常的课程名。
+```
+
+### 提取之后做菜逐字节不变,怎么证的
+
+三条独立口径:
+
+1. **基线金样比对:129 次调用,0 处不同。** `git show 3e633fc:bundles/recipes/{store,server}.py`
+   落成两个独立文件,`importlib.util.spec_from_file_location` 加载。**加载 server 那一刻把
+   `sys.modules["bundles.recipes.store"]` 临时指到基线 store**——不这样,它那句绝对 import
+   拿到的是新的那份,就成了新代码自己跟自己比;脚本里 `assert server_mod.RecipeStore is
+   store_mod.RecipeStore` 自检这一条。输入:十二种非法名字 × 七个吃菜名的参数位、replace
+   三种 + 空 old、delete 无理由/成/再删、include_deleted、undo(不带理由)/没删过、搜索八种(含空库、翻页越界、不搜回收站、撞上非 UTF-8)、
+   改名四种、删除理由里用换行伪造列表项、非 UTF-8 文件。
+   输出:`基线 3e633fc:129 次调用;逐字节不同的:0`。脚本不进仓库,理由同 M6-3a / M6-4
+   (要么 subprocess 调 git,要么把 735 行旧代码抄进来)。
+2. **冻结的金样 `tests/bundles/test_recipes_baseline.py`(16 条)**:十二句非法名字
+   (`name_error` 是这一轮**真的重写了**的一处:判定挪走、句子留下)、兜底那句、replace 三种、
+   delete / include_deleted / undo、三种搜索结果。**这些常量是拿基线代码验过的**:一个 pytest
+   插件把 `bundles.recipes.{store,server}` 换成基线那两份,
+   `pytest tests/bundles/test_recipes_baseline.py -p baseline_plugin` → 16 passed;对新代码 16 passed。
+3. **`test_recipes_store.py` / `test_recipes_tools.py` 一个字节没动**(`git diff --quiet` 为真),
+   全绿。`test_recipes_store.py` 现在测的**就是共用层**(经由转出),它不改一条还全绿本身是证据
+   ——所以**没把它挪到 `tests/test_docstore.py`**。M6-5 报告里「搬过去之后那些断言应该一条不改地
+   跟着走」,我读成断言跟着走、文件不必挪;挪了这第三条证据就没了。`tests/test_docstore.py`
+   只补老测试看不见的:`find_all`,和 `name_fault` 的判定本身。
+
+### 变异:八条,全红
+
+脚本自检:基线先绿;锚点恰好命中一次;"落地"= 盘上字节恰好是"原文那一处换掉"的结果;判红只看
+returncode;每条跑完 sha256 确认还原,收尾再跑一次基线。跑的是
+`tests/bundles tests/test_docstore.py tests/test_architecture.py`。
+
+1. `replace` 多次命中**改第一处**(`count != 1` → `count == 0`)→ 4 条红,**两个 bundle 都有**
+2. **名字白名单拿掉**(`name_fault` 恒回 None)→ 75 条红。落点兜底还挡:`../../etc/passwd` →
+   「落不到课程目录里面」,外链 → 挡住且外面一个文件没写。挡不住的是 `a/b`、`.trash`(落点在
+   目录里面)——白名单独有的那一块。
+3. **落点兜底拿掉**(`under` 恒回 resolved)→ 7 条红(两边的符号链接那几条 + `.trash` 被做成
+   链接那条)。白名单还挡:`../../etc/passwd`、`a/b`、`.trash` 全拒。挡不住的是外链——
+   回「记在后面了」,外面多出一个 `notes.md`。兜底独有的那一块。
+4. `delete` 变成**真删**(`relocate` → `rmtree`)→ 12 条红
+5. `rename` 到已存在的课时**合并**(`copytree(dirs_exist_ok=True)` + 删源)→ 1 条红
+6. `append` 到新课时**不说「新建了」** → 1 条红
+7. `list_courses` **列出 `.trash`**(去掉前导 `.` 过滤)→ 3 条红
+8. 跨课搜索**不标课程名** → 2 条红
+
+**第 8 条第一次只有 1 条红,而且不是专门为它写的那条。**
+`test_searching_across_courses_puts_the_course_name_on_every_line` 的笔记以「# 线性代数」开头,
+去掉行首课程名之后片段里照样有课程名,照绿——T6 第五种,锚点太弱。改成正文里不写课程名、
+断言锚在行首的全量列表之后,2 条红。
+
+**脚本自己也被自检拦过一次**:第一版"落地"的判据是「替换文本在文件里只出现一次」,而第 7 条的
+替换文本 `if p.is_dir()` 在 `deleted()` 里本来就有一份——判据歧义,脚本在第 7 条停下(文件由
+`finally` 还原,sha256 核过)。改成逐字节比之后八条跑完。
+
+### 被迫改动的老测试
+
+- `tests/gateway/test_server.py::test_bundle_tool_order_*`:名字加 `_then_courses`,原来 20 个
+  逐条保留,7 个追加在末尾,docstring 写明为什么改。
+- `tests/test_architecture.py` 写文件白名单:**`bundles/recipes/store.py` 换成
+  `src/lararium/docstore.py`**。实测闸只拦下 `src/lararium/docstore.py:306 open(mode='w')`
+  一处——任务书预计 courses 要进白名单,实际不用:`courses/store.py` 和 `recipes/store.py` 的
+  AST 里都已经没有写调用,每个字节都经由共用层写出去。recipes 那条**删掉**不是留着(留着是一张
+  以后在那个文件里随手写文件也不被拦的空白支票)。**对照组**:往 `courses/store.py` 临时加一个
+  `with p.open("w")`,闸报 `bundles/courses/store.py:267 open(mode='w') 写文件`、1 failed;
+  还原后 sha256 一致。
+- `test_recipes_store.py` / `test_recipes_tools.py`:零改动。
+
+### 前缀影响(A1)
+
+脚本对照(基线 = memory + finance + **基线 3e633fc 的 recipes**;现在 = 组装根实拼的那份):
+
+- **前 20 个工具 schema 与基线逐字节相同**;末尾追加 7 个(`list_courses` … `delete_course`)。
+- 目录行多一行 `- courses —— 学习:一门课一个笔记本,记着、改着、按内容搜`。`Registry` 按名字
+  排序,所以它在**第一行**不是末尾——前缀本来就重建一次,位置不改变代价。
+- `bundles/finance`、`src/lararium/steward` 一个字节没动(`git diff --quiet`)。
+- 组装根 `_assemble_bundle_tools`:一行 import + 一行
+  `tools.extend(build_courses(data_dir, timezone=timezone).tools)`,追加在 recipes 之后。
+  courses 收 timezone(回收站目录名里有时间戳),recipes 照旧不收。
+
+### S2
+
+- `src/lararium/docstore.py` **321 行**:一个概念。能下刀的缝是"名字/落点"与"读写/搜索",而两道
+  名字校验是成对设计的,两边的 store 又同时要读写和落点——拆开是两个每个 store 都得同时 import
+  的碎片。注释占比高,大部分从 M6-5 原样搬来,每一段防的是一次具体事故。
+- `bundles/courses/server.py` **434 行**:形状同 `recipes/server.py`(M6-5 验收接受 367 行 / 8 个
+  工具)。多出来的是两个搜索分支 `_search_one` / `_search_all`(约 70 行)——它们产出的是人话,
+  属于工具层,搬进 store 就是让存储层说话。
+- `bundles/recipes/store.py` 368 → 232;`bundles/courses/store.py` 263。
+- mypy 严格档加了 `lararium.docstore` 与 `bundles.courses.store`(判据同 `bundles.recipes.store`)。
+
+### 门禁
+
+```
+ruff check      All checks passed!
+ruff format     100 files already formatted
+mypy            Success: no issues found in 43 source files
+lint-imports    Contracts: 4 kept, 0 broken
+pytest          1060 passed, 15 skipped   (基线 926 + 134:courses 103、docstore 15、recipes 金样 16)
+```
+
+### 偏离计划 / 计划里过期的,逐条说
+
+1. `.importlinter` 早已列了 recipes,只缺 courses(任务书说两个都没列)。
+2. 进写文件白名单的是共用层,不是 courses;recipes 那条删了(见上)。
+3. 回收站目录名的时间戳是 `20260913T142233`,**没有连字符**:课程名可以有(「C-语言」),名字靠
+   最后一个连字符解回来,有测试钉。同一秒里删同一门课两次(删→重建→删)加 `_2`,不盖上一份。
+   `undo` 拿**最近**删的那份。
+4. 删除理由在被搬走的目录**旁边**(`.trash/<课程>-<时间戳>.reason`),不在里面——在里面的话
+   undo 回来多一个文件,逐字节一致就破了。
+5. **`.trash` 自己也过落点兜底**(`CourseStore.trash_root`)。G8 问下来的第三条路:`.trash` 被
+   做成指到外面的链接时,"搬进回收站"就是把一整门课搬出课程目录,而 `locate` 那两道只看课程
+   目录。有测试,变异 3 让它红。
+6. `read_note` **一页装得下时什么都不加**,原样返回(硬口径二直接成立);分了页才加一行抬头。
+   分页切在行尾,一行比一页长时硬切;拼回来逐字节等于原文(测试钉)。一页 1200 字。
+7. `append_to_note` 的空 text 拒绝,**也不新建**。
+8. 跨课搜索也匹配课程名(见论证三)。
+9. **模型看得见的话里一个「课件」都不提**。第一版写了「笔记和课件都跟过来了」,真实输出一看:
+   清单里没有课件工具,那是在描述一个它摸不到的东西。M6-6b 加工具时一起改,同一次前缀重建。
+10. `_speak_errors` 没进共用层(见论证一)。
+11. `CLAUDE.md` 的「目录」段本来就没列 recipes,这次也没列 courses / `docstore.py`——纯文档,
+    不在任务范围,没动。
+
+### 要真机验的
+
+- 故意把课程名说错一个字让她记一笔,看她**有没有把「这门课之前没有,给你新建了」转述给用户**
+  ——这是打错名字的唯一防线。
+- 记够两三页之后问「我笔记里特征值那段怎么写的」,看她 `search_notes(query, course)` 再按页码
+  `read_note`,还是从第 1 页往后翻。
+- 不说课名问「我哪门课记过傅里叶」,看她用不给 course 的 `search_notes`,还是逐门 `read_note`。
+- 说「线代那段写错了,改一下」,`replace_in_note` 撞上多次命中时,看她会不会自己加长 old 重试。
+- 说「这门课不上了,删了吧」再说「算了拿回来」,看撤回那一句**有没有编理由**。

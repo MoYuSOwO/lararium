@@ -67,7 +67,7 @@ def server(tmp_path, monkeypatch):
     return app, steward
 
 
-def test_bundle_tool_order_memory_first_then_finance_then_recipes(tmp_path):
+def test_bundle_tool_order_memory_first_then_finance_then_recipes_then_courses(tmp_path):
     """组装根的显式小表:M4-1 起 memory 工具在前、finance 追加在后。
 
     工具 schema 是前缀第0层,顺序一旦定了不许再动——这条把组合顺序钉死,
@@ -77,6 +77,9 @@ def test_bundle_tool_order_memory_first_then_finance_then_recipes(tmp_path):
     上面 12 个一格没动。加一个 bundle = 目录行 + 8 个工具 schema = 前缀重建一次,
     这个代价认(启动时 prefix_log 记一条);**插到中间才是每轮毁一次缓存**,
     而这条测试正是为了让那种改动改不过去。
+
+    **M6-6a 又改了这条测试,同样如实说明**:学习 bundle 的 7 个工具追加在 recipes 之后,
+    上面 20 个一格没动(名字逐条保留,只在末尾加);测试名跟着加一段 `_then_courses`。
     """
     from lararium.gateway.server import _assemble_bundle_tools
 
@@ -103,6 +106,13 @@ def test_bundle_tool_order_memory_first_then_finance_then_recipes(tmp_path):
         "search_recipes",  # recipes[5]
         "rename_recipe",  # recipes[6]
         "delete_recipe",  # recipes[7]
+        "list_courses",  # courses[0] —— M6-6a 学习(笔记那半),整段追加在 recipes 之后
+        "read_note",  # courses[1]
+        "append_to_note",  # courses[2]
+        "replace_in_note",  # courses[3]
+        "search_notes",  # courses[4]
+        "rename_course",  # courses[5]
+        "delete_course",  # courses[6]
     ]
 
 

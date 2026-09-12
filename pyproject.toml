@@ -127,6 +127,12 @@ module = [
     # 它本来就全量标注,进严格档零成本;而 M6-6 要把这个模块整体搬走,类型是那次搬家
     # 的安全网。
     "bundles.recipes.store",
+    # M6-6a:上面那句「整体搬走」落地了——共用的那一份在 `lararium.docstore`
+    # (NameFault / Replaced / Hit、两道名字校验、replace 的匹配纪律、扫文件搜索),
+    # 两个 bundle 的正确性都压在它的形状上,判据同上。学习 bundle 的存储层同理;
+    # 它的 FastMCP 那一侧(`bundles/courses/server.py`)留宽松档。
+    "lararium.docstore",
+    "bundles.courses.store",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
