@@ -445,6 +445,30 @@ def test_delete_moves_the_file_into_the_trash(tools, root):
     assert trashed.read_text(encoding="utf-8") == RECIPE
 
 
+def test_undo_does_not_need_a_reason(tools):
+    """★ 验收补:**撤回不用编一个理由。**
+
+    `reason` 原本是必填的位置参数,于是最自然的那一句
+    `delete_recipe("红烧肉", undo=True)` 在工具边界上直接炸(缺参数)——
+    而撤回是**恢复路径**,最不该有摩擦的就是它。
+
+    套件里看不见这件事,是因为三条 undo 测试**都编了一个理由传进去**
+    (「删错了」「拿回来」)——**测试把绕法固化了**。而 docstring 里那句
+    「撤回的时候 reason 就写一句为什么要拿回来」正是同一个问题的散文版。
+
+    「删必须给理由」这条**没有放松**,只是从 schema 的必填改成**工具自己拒**
+    (下面那条 `..._without_a_reason_...` 钉着),而这样拒得出一句人话、
+    模型能照着补——照 M5-20 / `delete_expense` 那套。
+    """
+    tools["write_recipe"]("红烧肉", "冰糖炒色\n")
+    tools["delete_recipe"]("红烧肉", "不做了")
+
+    out = tools["delete_recipe"]("红烧肉", undo=True)
+
+    assert "拿回来了" in out, out
+    assert tools["read_recipe"]("红烧肉") == "冰糖炒色\n"
+
+
 def test_undo_brings_it_back_byte_for_byte(tools):
     tools["write_recipe"]("红烧肉", RECIPE)
     tools["delete_recipe"]("红烧肉", "做不好吃")

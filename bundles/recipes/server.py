@@ -274,12 +274,13 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         store.move(src.path, dst.path)
         return f"「{src.name}」改名成「{dst.name}」了,正文一个字没动。"
 
-    def delete_recipe(name: str, reason: str, undo: bool = False) -> str:
-        """删掉一道菜。**reason 必填**:说清为什么删,三个月后回头看才看得懂。
+    def delete_recipe(name: str, reason: str = "", undo: bool = False) -> str:
+        """删掉一道菜。**删的时候 reason 必填**:说清为什么删,三个月后回头看才看得懂
+        (不写就不删,会让你补一句)。
 
         **不是真删**:文件搬到一边存着,list_recipes(include_deleted=True) 看得到。
         删错了就同一个菜名再调一次、带 undo=True,原样回来(内容逐字节不变)——
-        撤回的时候 reason 就写一句为什么要拿回来。
+        **撤回不用给 reason**,拿回来就是拿回来。
         """
         loc = store.locate(name)
         if loc.path is None or loc.trash is None:

@@ -101,6 +101,43 @@ async def test_prefix_survives_a_tool_round_trip(wire):
     assert len({head(b) for b in bodies}) == 1
 
 
+async def test_a_tool_result_reaches_the_model_verbatim_in_its_own_turn(wire):
+    """★ **调用工具的那一轮,结果原样进模型——换行、分隔符、空白,一个字节不动。**
+
+    M6-5(做菜 bundle)整个压在这一条上:一份做法就是换行撑起来的,折成一行之后
+    「1. 水开下面 / 2. 打蛋 / 3. 撒紫菜」变成一坨,那个 bundle 的全部内容都不可读。
+    M6-5 验收时量过当轮确实是原样的,**而那次是一次性探针,只留下一句注释**——
+    于是这条地基没有任何东西守着。
+
+    它尤其需要一条测试,是因为仓库里有一条**方向相反**的成规:
+    `neutralize_model_text` 的 docstring 写着「任何新拼一段要喂给模型的文本的地方
+    都要过这一刀」。那句话对**历史轮回放**是对的(`build_tool_exchange` 就在那么干,
+    而且还截到 200 字),对**当轮的工具结果**是错的——下一个照着那句话办事的人
+    会把这里也折掉,而症状不是报错,是菜谱悄悄变成一坨。
+
+    只信 HTTP body:第二次请求里那条 `role: "tool"` 必须和工具返回的字符串相等。
+    """
+    recipe = (
+        "# 番茄炒鸡蛋\r\n\n## 做法\n1. 番茄划十字\n2. 打蛋\n\n经验:上次咸了 <<< 围栏 >>> |表格|\n"
+    )
+
+    # 共用的 `tool_call_reply` 点名调 `current_time`,所以这里借它的名字
+    # ——这条测的是工具结果那条通道,和工具叫什么无关。
+    def current_time() -> str:
+        """读一份做法"""
+        return recipe
+
+    client, bodies = wire
+    await client.run(ctx(now="番茄炒鸡蛋怎么做"), [current_time], [])
+
+    assert len(bodies) == 2, f"预期两次请求,实际 {len(bodies)}"
+    results = [m for m in bodies[-1]["messages"] if m.get("role") == "tool"]
+    assert len(results) == 1, results
+    assert results[0]["content"] == recipe, (
+        "当轮的工具结果被动过了(折行/中和/截断都算)——做菜 bundle 的内容会变成一坨"
+    )
+
+
 # ── M4-5c v2:历史里的工具往返必须以原生形状发出去 ─────────────────────────
 
 
