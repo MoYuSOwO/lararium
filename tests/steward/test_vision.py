@@ -1,9 +1,13 @@
-"""M5-5:图片进模型的那一层。
+"""M5-5 建、M6-2 翻过来一半:图片进模型的那一层。
 
 ★ 这是一个**全新的注入面**。现有防线保护的全是文本;图片绕开全部,因为根本不存在
-"渲染"这一步。这里的测试只能证明**机制那一半**(限量、只在到达轮、降级不崩、
-框定语真的在场);"框定语管不管用"是模型行为,只能拿真模型打,见
-`tests/test_live_vision_injection.py`。
+"渲染"这一步。这里的测试只能证明**机制那一半**(读不了的有话说、框定语真的在场);
+"框定语管不管用"是模型行为,只能拿真模型打,见 `tests/test_live_vision_injection.py`。
+
+**M6-2 之后这一层不再取字节。** 到达轮只报一行 id(`Attachment.as_line()`),字节要
+等模型自己调 `read_image` 才进上下文——所以"限量"和"只在一轮里"这两条机制的落点搬到了
+`tools.read_image`(见 `tests/steward/test_tools.py`),这里剩下的是**替模型先说清
+哪几张它根本读不了**那一支:`unreadable_notes()`。
 """
 
 import hashlib
@@ -11,84 +15,47 @@ import hashlib
 import pytest
 
 from lararium.envelope import Attachment
-from lararium.steward.vision import MAX_IMAGES_PER_TURN, ImagePart, framing, load_images
+from lararium.steward.vision import framing, unreadable_notes
 
 JPEG = b"\xff\xd8\xff\xe0 pretend this is a photo"
 
 
-def store(media_dir, data=JPEG, media_type="image/jpeg"):
-    """把一份字节按内容哈希放进 media/,返回它的 Attachment(和适配器同一套命名)。"""
-    a = Attachment(kind="image", sha256=hashlib.sha256(data).hexdigest(), media_type=media_type)
-    media_dir.mkdir(parents=True, exist_ok=True)
-    (media_dir / f"{a.sha256}.{a.path.rsplit('.', 1)[1]}").write_bytes(data)
-    return a
+def image(data=JPEG, media_type="image/jpeg", kind="image"):
+    """造一份附件引用(和适配器同一套命名)。**这一层不碰磁盘了**,所以不用落盘。"""
+    return Attachment(kind=kind, sha256=hashlib.sha256(data).hexdigest(), media_type=media_type)
 
 
-def test_an_image_on_disk_is_loaded_with_its_bytes(tmp_path):
-    a = store(tmp_path)
+def test_a_readable_image_gets_no_note_at_all(tmp_path):
+    """能读的图**一个字都不多说**:那行报告已经写着"要看就调 read_image"。
 
-    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=True)
+    这一层只负责"先说清读不了的",不负责介绍能力——介绍写在报告行和工具 docstring 里,
+    两处各写一遍的那天就开始漂。
+    """
+    assert unreadable_notes(attachments=[image()], enabled=True) == ()
 
-    assert parts == (ImagePart(sha256=a.sha256, media_type="image/jpeg", data=JPEG),)
-    assert notes == ()
 
-
-def test_vision_off_still_keeps_the_file_and_says_so_in_words(tmp_path):
-    """模型看不了图不许崩,也不许假装看见了。
+def test_vision_off_says_so_once_instead_of_letting_the_model_find_out(tmp_path):
+    """模型看不了图不许假装看见了,**也不该让它花一次工具调用才知道**。
 
     端点是可配的,用户接的模型未必能读图(仓库默认的 deepseek-chat 就不能)。
-    这时图**照样存着**,进上下文的是一行说明——模型据此如实告诉用户,而不是
-    对着一行 `(图片 · media/…)` 编内容。
+    这时图照样存着、报告行照样在,但上下文里多一句说明——不说的话模型会照着报告行
+    去调 `read_image`,得到一句"当前模型看不了图",而那一次往返是白花的。
     """
-    a = store(tmp_path)
+    notes = unreadable_notes(attachments=[image()], enabled=False)
 
-    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=False)
-
-    assert parts == ()
     assert notes and "看不了图" in notes[0]
-    assert (tmp_path / f"{a.sha256}.jpg").exists(), "关掉视觉不该影响落盘"
+    assert "1" in notes[0], "得说清是几张"
 
 
-def test_a_missing_file_says_the_replay_is_incomplete(tmp_path):
-    """原件不在了要**明说重放不完整**,不许静默给一份残缺的。
+def test_non_image_attachments_are_not_mentioned_here(tmp_path):
+    """语音/文件/视频不在这一层说话——它们**自己那行报告里**已经写明有没有路。
 
-    起居注落的是引用+哈希,字节在 `media/` 下。哪天那个文件被清掉、或者换了台机器
-    只搬了库没搬 media/,静默跳过的话模型会对着"什么都没有"照常作答,而外面看不出
-    这一轮比当初少了东西。
+    在这儿再提一遍就是两处各写一套同一件事(M5-5 栽过的那个形状),而且是噪声:
+    它们压根没打算进模型。
     """
-    a = Attachment(kind="image", sha256="ab" * 32, media_type="image/jpeg")
+    voice = image(data=b"#!SILK_V3 xxxx", media_type="audio/silk", kind="voice")
 
-    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=True)
-
-    assert parts == ()
-    assert notes and "重放不完整" in notes[0]
-    assert a.short in notes[0], "得说清楚是哪一张不见了"
-
-
-def test_non_image_attachments_never_reach_the_model(tmp_path):
-    """语音/文件/视频不是这一步的事。只有图片进模型——注入面能小就小。"""
-    voice = store(tmp_path, data=b"#!SILK_V3 xxxx", media_type="audio/silk")
-    voice = Attachment(kind="voice", sha256=voice.sha256, media_type="audio/silk")
-
-    parts, notes = load_images(media_dir=tmp_path, attachments=[voice], enabled=True)
-
-    assert parts == ()
-    assert notes == ()
-
-
-def test_the_number_of_images_per_turn_is_capped(tmp_path):
-    """一轮最多几张,超了截断并**说出来**。
-
-    图片是按分辨率吃 token 的,而 L0 的预算算术(estimate_tokens + _render_overhead)
-    对图片一无所知——不封顶就是一次消息把整个窗口顶穿,而症状是"上下文超长"这种
-    完全指不到图片的报错。截断必须看得见:静默截断读起来和"就这些"一模一样。
-    """
-    attachments = [store(tmp_path, data=JPEG + bytes([i])) for i in range(MAX_IMAGES_PER_TURN + 2)]
-
-    parts, notes = load_images(media_dir=tmp_path, attachments=attachments, enabled=True)
-
-    assert len(parts) == MAX_IMAGES_PER_TURN
-    assert notes and "2" in notes[0]
+    assert unreadable_notes(attachments=[voice], enabled=True) == ()
 
 
 @pytest.mark.parametrize("count", [1, 3])
@@ -97,6 +64,9 @@ def test_the_framing_points_at_the_pictures_and_not_at_the_text(count):
 
     所以它必须:说清楚图里的字是数据、点名"照做"这个动作、并且**每一张图都在它的
     作用域里**(数量对得上)。管不管用只能拿真模型实测——见 live 那份。
+
+    M6-2 之后它只有一个调用方(`read_image`),而那正好让"图进上下文必带框定"从
+    "两个挂载点都记得带"变成了结构事实。
     """
     line = framing(count)
 
@@ -124,38 +94,31 @@ def test_the_framing_points_at_the_pictures_and_not_at_the_text(count):
         ("image/bmp", "读不了"),
     ],
 )
-def test_an_image_that_cannot_be_sent_leaves_a_note_instead_of_vanishing(
-    tmp_path, media_type, hint
-):
+def test_an_image_that_cannot_be_read_says_so_up_front(tmp_path, media_type, hint):
     """★ 补2 的后半条,而且它比前半条更值钱:**别把响亮的失败换成静默的失败。**
 
-    修之前 BMP/HEIC 会被送出去、400、用户收到「处理失败,已放弃」——难看,但**看得见**。
-    补做之后它一声不响地消失了:L0 里那行照样写着 `(图片 · media/…)`,而模型什么都
-    没收到、也没被告知少收了东西——它只能对着一行引用编,或者答"我看不见图"。
+    这一支活到了 M6-2 之后,而且理由变了:从前它治的是"图没送出去而模型不知道"
+    (静默),现在报告行摆在那儿、`read_image` 也会回一句人话,所以静默已经不可能。
+    它现在治的是**别让模型对着一张读不了的图许诺**——「我看看这张图」说出口之后才发现
+    读不了,比一开始就说"这张我读不了"差。
 
-    "静默截断读起来和'就这些'一模一样"这句话就写在本函数的 docstring 里,而且张数上限
-    那一支已经照着做了。同一个函数,同一条规则,不许少一支。
+    候选是「是图片」**或者**「微信说它是图片」:后者才让"说是图片、字节却不是"这种
+    落进有话可说的那一支。
     """
     a = Attachment(kind="image", sha256="ab" * 32, media_type=media_type)
 
-    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=True)
+    notes = unreadable_notes(attachments=[a], enabled=True)
 
-    assert parts == ()
-    assert notes and hint in notes[0], f"这张图无声无息地没了:{notes}"
+    assert notes and hint in notes[0], f"这张图读不了却没人说一句:{notes}"
     assert a.short in notes[0], "得说清楚是哪一张"
 
 
 @pytest.mark.parametrize("media_type", ["image/gif", "image/jpeg", "image/png", "image/webp"])
-def test_every_sendable_type_still_goes_through(tmp_path, media_type):
-    """反向守卫:别为了挡住 HEIC/BMP 把清单里的也一起挡了。
+def test_every_sendable_type_stays_readable(tmp_path, media_type):
+    """反向守卫:别为了挡住 HEIC/BMP 把清单里的也一起说成读不了。
 
-    逐个走一遍而不是抽一个:清单是**服务商相关**的,收窄它的那次改动最容易顺手多砍一个,
-    而少送一种格式的症状是"这张图它就是不看",没有任何报错。
+    逐个走一遍而不是抽一个:清单是**服务商相关**的,收窄它的那次改动最容易顺手多砍
+    一个,而多说一句"这张读不了"的后果是模型再也不去调 `read_image`——症状是
+    "这张图它就是不看",没有任何报错。
     """
-    blob = b"\xff\xd8\xff\xe0 pretend"
-    a = store(tmp_path, data=blob, media_type=media_type)
-
-    parts, notes = load_images(media_dir=tmp_path, attachments=[a], enabled=True)
-
-    assert [p.media_type for p in parts] == [media_type]
-    assert notes == ()
+    assert unreadable_notes(attachments=[image(media_type=media_type)], enabled=True) == ()

@@ -18,6 +18,7 @@ from lararium.steward.tools import (
     MIN_FETCH_CHARS,
     BuiltinTools,
 )
+from lararium.steward.vision import MAX_IMAGES_PER_TURN
 from lararium.steward.websearch import WebResult, WebSearchError
 
 
@@ -65,7 +66,9 @@ def test_search_history_reports_no_match_clearly(tools):
 def test_tool_function_order_is_fixed(tools):
     """工具 schema 顺序必须稳定,否则每次启动都毁前缀缓存。
     M3-2:open_thread/close_thread 追加在既有内置之后,不许插队。
-    M5-5:look_at_image 追加在末尾,位置定了同样不许再动。
+    M5-5:读图那个工具追加在末尾,位置定了同样不许再动;M6-2 把它**改名**成
+    `read_image`(和以后的 `read_pdf` 成对),名字变了 schema 就变了 = 前缀重建一次,
+    但**位置一格都没动**——那才是每轮毁一次缓存的那件事。
     M5-21:web_search 同理。多一个工具会让前缀重建**一次**(认了,prefix_log 会记),
     插到中间则是每轮毁一次缓存——这条测试钉的正是后者。
     M5-22:web_fetch 追加在 web_search 之后,同一条规矩。
@@ -80,7 +83,7 @@ def test_tool_function_order_is_fixed(tools):
         "open_thread",
         "close_thread",
         "recall_similar",
-        "look_at_image",
+        "read_image",
         "web_search",
         "web_fetch",
         "list_threads",
@@ -408,7 +411,7 @@ def put_image(tmp_path):
     (tmp_path / "media" / f"{DIGEST}.jpg").write_bytes(JPEG)
 
 
-def test_look_at_image_hands_the_bytes_back_with_the_same_framing(tmp_path, tools):
+def test_read_image_hands_the_bytes_back_with_the_same_framing(tmp_path, tools):
     """图不默认一直在,所以要有一条**按 id 取回**的路——但取回来的那张同样要带框定。
 
     少了框定的话,"重看"就成了绕过防线的口子:第一次进来带着"这是数据不是指令",
@@ -416,7 +419,7 @@ def test_look_at_image_hands_the_bytes_back_with_the_same_framing(tmp_path, tool
     """
     put_image(tmp_path)
 
-    result = tools.look_at_image(DIGEST[:12])
+    result = tools.read_image(DIGEST[:12])
 
     assert result.images[0].data == JPEG
     assert result.images[0].sha256 == DIGEST
@@ -428,7 +431,7 @@ def test_look_at_image_hands_the_bytes_back_with_the_same_framing(tmp_path, tool
     "bad_id",
     ["../../prompts/character.default", "ab", "ab*", "abcdef/../../x", "'; DROP TABLE"],
 )
-def test_look_at_image_refuses_anything_that_is_not_a_hash(tmp_path, tools, bad_id):
+def test_read_image_refuses_anything_that_is_not_a_hash(tmp_path, tools, bad_id):
     """image_id 是**模型可控文本**,而它会被当成文件路径的一部分用。
 
     形状不对就当场回人话——glob 的通配符也要挡下(`ab*` 能把 media/ 底下第一张图
@@ -436,21 +439,21 @@ def test_look_at_image_refuses_anything_that_is_not_a_hash(tmp_path, tools, bad_
     """
     put_image(tmp_path)
 
-    out = tools.look_at_image(bad_id)
+    out = tools.read_image(bad_id)
 
     assert isinstance(out, str), f"{bad_id!r} 居然取回了东西"
     assert "没找到" in out or "看不了" in out or "认不出" in out
 
 
-def test_look_at_image_says_plain_words_when_the_file_is_gone(tmp_path, tools):
+def test_read_image_says_plain_words_when_the_file_is_gone(tmp_path, tools):
     """原件不在了要明说,不许静默返回一份空的(E2)。"""
-    out = tools.look_at_image("ab" * 6)
+    out = tools.read_image("ab" * 6)
 
     assert isinstance(out, str)
     assert "没找到" in out
 
 
-def test_look_at_image_degrades_when_the_model_cannot_see(tmp_path):
+def test_read_image_degrades_when_the_model_cannot_see(tmp_path):
     """视觉关着时不许把字节递出去——递了就是发一个模型读不了的报文出去,白花钱还报错。"""
     conn = connect(tmp_path / "steward.sqlite")
     blind = BuiltinTools(
@@ -463,7 +466,7 @@ def test_look_at_image_degrades_when_the_model_cannot_see(tmp_path):
     )
     put_image(tmp_path)
 
-    out = blind.look_at_image(DIGEST[:12])
+    out = blind.read_image(DIGEST[:12])
 
     assert isinstance(out, str) and "看不了图" in out
 
@@ -476,27 +479,124 @@ def test_look_at_image_degrades_when_the_model_cannot_see(tmp_path):
         (".bin", b"%PDF-1.7 not an image", "文件"),
     ],
 )
-def test_look_at_image_refuses_anything_that_is_not_a_picture(tmp_path, tools, suffix, blob, word):
+def test_read_image_refuses_anything_that_is_not_a_picture(tmp_path, tools, suffix, blob, word):
     """★ M5-5 补:**两个出口,同一条规则。**
 
-    `load_images` 那边挡住了非图片,`look_at_image` 这边原来一个种类判断都没有;
+    到达轮那边挡住了非图片,`read_image` 这边原来一个种类判断都没有;
     再撞上"认不出就按 jpeg 送"的兜底,一段语音、一份 PDF 都会被贴上 `image/jpeg`
     交出去。真模型自己就走进去了:发一份 PDF 问「里面最大的一笔是多少」,它调
-    `look_at_image` → 服务商 400 `invalid image format` → 这一轮当场死掉,
+    `read_image` → 服务商 400 `invalid image format` → 这一轮当场死掉,
     用户看到的是一句全是黑话的「处理失败,已放弃」。
 
     而这个教训就写在 `envelope._KIND_WORDS` 上方、同一个里程碑里
     ——「两个出口各写一套词,总有一个先漂」。所以这条测试必须落在**这条路**上,
-    不是只落在 `load_images` 上。
+    不是只落在到达轮那条上(M6-2 之后到达轮那个出口只出话不出字节,
+    而 `cannot_send` 仍然是两边共用的**同一个**函数)。
     """
     (tmp_path / "media").mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(blob).hexdigest()
     (tmp_path / "media" / f"{digest}{suffix}").write_bytes(blob)
 
-    out = tools.look_at_image(digest[:12])
+    out = tools.read_image(digest[:12])
 
     assert isinstance(out, str), f"{suffix} 居然被当成图片交出去了:{out!r}"
     assert word in out and "看不了" in out
+
+
+# ── M6-2:张数封顶搬到这条路上 ────────────────────────────────────────────
+#
+# 从前封顶在到达轮(`load_images` 只取前 4 张,多的说一句"还有 N 张没看");现在到达轮
+# 一张都不取,**张数就得在这里数**。两个性质都不许丢:一轮里看得下的张数有上限
+# (图按分辨率吃 token,而 L0 的预算算术对图片一无所知),而**超了要说出来**
+# ——静默截断读起来和"就这些"一模一样。
+
+
+def put_images(tmp_path, count):
+    """落 count 张互不相同的图,返回它们的短 id。"""
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    ids = []
+    for i in range(count):
+        blob = JPEG + bytes([i])
+        digest = hashlib.sha256(blob).hexdigest()
+        (tmp_path / "media" / f"{digest}.jpg").write_bytes(blob)
+        ids.append(digest[:12])
+    return ids
+
+
+def test_the_number_of_images_per_turn_is_still_capped(tmp_path, tools):
+    """★ 上限照旧,而且**拒绝要说清**——不是静默返回一句没有图的话。
+
+    这条是 M6-2 里"比 M5-5 更严"那句话的兑现处:注入面不再随到达而累积(模型得自己
+    决定去取),但**一轮里能进模型的张数一格都没放宽**。
+    """
+    ids = put_images(tmp_path, MAX_IMAGES_PER_TURN + 1)
+    tools.begin_turn()
+
+    taken = [tools.read_image(i) for i in ids[:MAX_IMAGES_PER_TURN]]
+    refused = tools.read_image(ids[MAX_IMAGES_PER_TURN])
+
+    assert all(not isinstance(t, str) for t in taken), f"上限之内的被拒了:{taken}"
+    assert isinstance(refused, str), "第 5 张居然也交出了字节"
+    assert str(MAX_IMAGES_PER_TURN) in refused, f"拒绝了却没说清上限是多少:{refused}"
+
+
+def test_the_cap_resets_when_the_next_turn_starts(tmp_path, tools):
+    """上限是**一轮**的,不是一辈子的。
+
+    不按轮重置的话,用得越久越看不了图,而症状是"以前能看现在不能看了",
+    没有任何报错——M5-11 的守卫栽过同一个形状(「守卫不按轮重置」那条变异)。
+    """
+    ids = put_images(tmp_path, MAX_IMAGES_PER_TURN + 1)
+    tools.begin_turn()
+    for i in ids[:MAX_IMAGES_PER_TURN]:
+        tools.read_image(i)
+    assert isinstance(tools.read_image(ids[0]), str), "上限没生效,这条测试什么都没测"
+
+    tools.begin_turn()
+
+    assert not isinstance(tools.read_image(ids[0]), str), "新一轮还在用上一轮的额度"
+
+
+def test_a_refused_image_does_not_eat_the_quota(tmp_path, tools):
+    """读不了的那些**不算在额度里**:额度管的是"进了几张图",不是"调了几次"。
+
+    算进去的话,一份 PDF、一张 HEIC、一个打错的 id 就能把这一轮的图额度吃光,
+    而模型完全看不出自己为什么忽然"看不了图了"。
+    """
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    pdf = hashlib.sha256(b"%PDF-1.7 x").hexdigest()
+    (tmp_path / "media" / f"{pdf}.pdf").write_bytes(b"%PDF-1.7 x")
+    ids = put_images(tmp_path, MAX_IMAGES_PER_TURN)
+    tools.begin_turn()
+
+    for _ in range(MAX_IMAGES_PER_TURN):
+        tools.read_image(pdf[:12])
+        tools.read_image("ff" * 6)
+
+    assert all(not isinstance(tools.read_image(i), str) for i in ids)
+
+
+def test_the_docstring_tells_her_when_to_call_it_and_not_to_guess(tools):
+    """★ **这是本步唯一能对"她该看的时候不看"下的手。**
+
+    真机 68 轮里读图工具被调过 0 次——因为图一直是预先塞好的,从来没有"需要去调"的
+    场合,所以我们对"她会不会调"一无所知。docstring 就是工具 schema(每轮都在前缀里),
+    它是唯一能在模型决定之前说上话的地方,所以这几句不许被顺手删掉:
+
+    - **不调就等于没看过**——这一条最要紧。M5-5 已经抓到过它的近亲:图上一个中文都
+      没有,她回「看到一些中文文字」。**读不清会编,那没看更会编。**
+    - **什么时候该调**(用户问的是图里的东西);
+    - **图只在这一轮进模型**(要留的结论当场说);
+    - **有上限**(不许静默,但**数字不写在这儿**——写了就是两处维护同一个事实,
+      真正的数字由拒绝那句话带,见上面几条)。
+    """
+    doc = tools.read_image.__doc__ or ""
+
+    assert "没看过" in doc or "没看" in doc, "没说清不调等于没看过"
+    assert "编" in doc or "猜" in doc, "没说清没看时不许编"
+    assert "这一轮" in doc, "没说清图只在这一轮进模型"
+    assert "上限" in doc, "没说清张数有上限"
+    assert str(MAX_IMAGES_PER_TURN) not in doc, "把上限的数字抄进了 docstring,两处一定会漂"
 
 
 # ── M5-21 web_search:渲染、封顶、不可信闩、没配 key ──────────────────────
@@ -986,7 +1086,7 @@ def test_a_page_whose_body_is_an_image_is_said_differently(tmp_path):
 
     「抓不到」是我们够不着(登录墙/反爬/JS 渲染),「抓到了但正文是图」是内容本身
     不是文字(整篇长图、扫描件)。合成一句的话,真机上攒不出"到底哪种更多"的数据,
-    而那正是要不要建第三层(把图交给 look_at_image)的唯一判据。
+    而那正是要不要建第三层(把图交给 read_image)的唯一判据。
     """
     # ★ 图片链接**故意造得长**(真机上公众号的图链就是这样):不刨掉图片标记再数字数
     # 的话,这一串够长、过得了门槛,于是一串 qpic.cn 的链接会被当成正文塞进上下文,

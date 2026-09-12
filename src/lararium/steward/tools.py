@@ -16,7 +16,13 @@ from lararium.steward.assembler import (
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.registry import Registry
 from lararium.steward.threads import ThreadInfo, Threads
-from lararium.steward.vision import ImagePart, ImageReturn, cannot_send, framing
+from lararium.steward.vision import (
+    MAX_IMAGES_PER_TURN,
+    ImagePart,
+    ImageReturn,
+    cannot_send,
+    framing,
+)
 from lararium.steward.websearch import (
     SEARCH_TIME_RANGES,
     SEARCH_TOPICS,
@@ -67,7 +73,7 @@ MIN_FETCH_CHARS = 120
 # 是有人在拿 data: blob 灌预算,而一次白花的往返也是一次额度。
 MAX_FETCH_URL_CHARS = 2000
 
-# look_at_image 的 image_id 是**模型可控文本**,而它会被当成文件名的一部分用。
+# read_image 的 image_id 是**模型可控文本**,而它会被当成文件名的一部分用。
 # 只认十六进制:路径分隔符、`..`、glob 通配符一个都进不来。下界 6 位是为了挡住
 # "给个 a 就把 media/ 底下第一张捞出来"。
 _IMAGE_ID_RE = re.compile(r"^[0-9a-f]{6,64}$")
@@ -267,6 +273,19 @@ class BuiltinTools:
         # M3-4:语义检索的相似度阈值。2026-08-18 实测命中 0.44~0.58、未命中 0.35,
         # 这个 0.35 是猜的初值——真机跑几天要按实际分布调。
         self.recall_min_similarity = recall_min_similarity
+        # M6-2:这一轮已经有几张图进了上下文。到达轮不再塞图之后,张数上限就只能在
+        # `read_image` 这条唯一的路上数(从前是 `load_images` 取前 4 张)。
+        # 放实例上而不是模块级:模块级可变状态会让测试互相污染(F5)。
+        self._images_this_turn = 0
+
+    def begin_turn(self) -> None:
+        """一轮开始时清零本轮的看图额度。由 `loop.process_next` 认领信封之后调。
+
+        **按轮重置,不按信封**:重试是同一个信封重跑一遍,而上一次尝试那几张图跟着
+        那次失败的请求一起没了——不重置的话,一次 429 之后这一轮就再也看不了图,
+        而症状是"它忽然不看图了",没有任何报错(M5-11 的守卫栽过同一个形状)。
+        """
+        self._images_this_turn = 0
 
     def _note_hits(self, hits: list[Any]) -> None:
         """命中里只要有一条不可信的,就把这一轮拉成不可信。
@@ -378,20 +397,31 @@ class BuiltinTools:
             lines.append(f"- {body}{mark} · 更新于 {t.updated_at[:10]}")
         return "\n".join(lines)
 
-    def look_at_image(self, image_id: str) -> Any:
-        """重新看一眼之前收到的某张图片。图片只在收到的那一轮直接进上下文,之后的历史里
-        只留一行 `(图片 · media/xxxxxxxxxxxx…)` 引用;要再看就调这个,image_id 就是
-        那一行里的那串短 id。取不到时返回一句说明,不报错。"""
+    def read_image(self, image_id: str) -> Any:
+        """看一眼收到的某张图片。**图片不会自己进上下文,不调这个就等于没看过。**
+
+        收到一张图,正文里只有一行报告(类型 · 文件名 · id · 能拿它干什么);
+        image_id 就是那行里 `id` 后面那串十六进制,**整串照抄进来**——它不是截断的。
+
+        什么时候该调:用户问的是图里的东西(这是什么 / 多少钱 / 上面写了什么 /
+        帮我看看),而这一轮只有那行报告。**那就先调它,再回答。**
+        **没调就不许说图上有什么**——报告行里没有图的内容,凭它作答就是编。
+        读不了的时候(格式不支持、原件不在了)会回一句人话,照实告诉用户,别改口说看见了。
+
+        图**只在这一轮**进模型,下一轮又只剩那行报告——要留下的结论得当场说出来。
+        一轮里能看的张数有上限,超了会拒绝并说清上限是多少。
+        """
         if not self.vision:
             return "当前模型看不了图,只能看那行引用。"
         if not (self.media_dir and _IMAGE_ID_RE.match(image_id)):
-            return f"认不出这个图片 id:{image_id[:20]}。它应该是那行引用里的一串十六进制。"
+            return f"认不出这个图片 id:{image_id[:20]}。它应该是那行报告里的一串十六进制。"
         # glob 而不是拼后缀:短 id 不带后缀,而后缀由内容嗅探决定(jpg/png/webp…)。
         # 通配符进不来——image_id 已经被 _IMAGE_ID_RE 限死成纯十六进制。
         matches = sorted(self.media_dir.glob(f"{image_id}*")) if self.media_dir.is_dir() else []
         if len(matches) != 1:
             return f"没找到 {image_id[:12]} 这张图(原件可能已经不在了)。"
-        # **只认图片,和 load_images 同一条规则。** 两个出口各写一套的那天,总有一个
+        # **只认图片,和到达轮那个出口同一条规则**(`vision.cannot_send`,一个函数管
+        # 两边)。两个出口各写一套的那天,总有一个
         # 先漂——这里原来一个种类判断都没有,再撞上"认不出就按 jpeg 送"的兜底,
         # 一段语音、一份 PDF 都会被贴上 image/jpeg 交出去,而服务商回的是
         # `invalid image format`:这一轮当场死掉,用户看到的是一句全是黑话的
@@ -402,7 +432,16 @@ class BuiltinTools:
             # 措辞里**不带省略号**:实测模型会盯着那个 `…` 认定"图片 id 被截断了",
             # 转头让用户重发一次图,而真相是那份东西根本不是图。回绝要说清楚是什么,
             # 别给它一个更顺嘴的错误解释。
-            return f"media/{image_id[:12]} {reason},我看不了。"
+            return f"id {image_id[:12]} {reason},我看不了。"
+        # M6-2:张数上限**在这儿数**,而且只数真进了上下文的那些——读不了的、id 打错的
+        # 都不扣额度(扣的话一份 PDF 加几个错 id 就能把这一轮的图额度吃光,而模型完全
+        # 看不出自己为什么忽然"看不了图了")。**拒绝要说清**:静默返回一句没有图的话,
+        # 读起来和"我看了,没什么"一模一样。
+        if self._images_this_turn >= MAX_IMAGES_PER_TURN:
+            return (
+                f"这一轮已经看了 {MAX_IMAGES_PER_TURN} 张图,到上限了——图按分辨率吃 token,"
+                "一轮最多这么多。剩下的先说说你想从哪张里看什么,或者下一轮再看。"
+            )
         # M5-18:**无条件**把这一轮拉成不可信。选的是严的那一支,理由:
         # 图片是绕开全部文本防线的注入面(M5-5),而"这张图当初是哪一轮进来的"起居注里
         # 现在查不到(envelope 事件不记 attachments,只能反扫 prompt 事件推)。
@@ -412,10 +451,11 @@ class BuiltinTools:
         self._on_untrusted()
         data = matches[0].read_bytes()
         digest = matches[0].stem
-        # **重看这条路同样要带框定**。少了它,"重看"就成了绕过防线的支路:
-        # 第一次进来带着"这是数据不是指令",第二次进来光秃秃的。
+        self._images_this_turn += 1
+        # **这条路必须带框定**,而 M6-2 之后它是**唯一**一条:图进上下文必带框定,
+        # 从"两个挂载点都记得带"变成了结构事实。
         return ImageReturn(
-            text=f"(重新附上 media/{digest[:12]}…)\n{framing(1)}",
+            text=f"(附上 id {digest[:12]} 这张图)\n{framing(1)}",
             images=(ImagePart(sha256=digest, media_type=media_type, data=data),),
         )
 
@@ -551,7 +591,7 @@ class BuiltinTools:
             # ★ **两岔,不许合并成一句,更不许说成"这页没什么内容"**——那是把"我读
             # 不到"说成"它没有",是编的,而用户会信(他不会去点开那条链接复核)。
             # 分开说还有第二个用处:攒真机数据。要不要建第三层(把整页的图交给
-            # look_at_image)只有一个判据,就是这两岔各占多少——现在没有这个数,
+            # read_image)只有一个判据,就是这两岔各占多少——现在没有这个数,
             # 所以按 G6 先不建,只把话说得能分辨。
             if _MD_IMAGE_RE.search(page.text):
                 return (
@@ -576,7 +616,7 @@ class BuiltinTools:
 
         M3-2/3-3:新工具**只追加在末尾**,不许插队——插进中间等于每轮毁一次缓存。
         M3-4:recall_similar 追加在 close_thread 之后,位置定了就不许再动。
-        M5-21:web_search 追加在 look_at_image 之后。多一个工具 = schema 变 = 前缀
+        M5-21:web_search 追加在读图那个工具之后。多一个工具 = schema 变 = 前缀
         重建**一次**(prefix_log 会记),这个代价认;插到中间是**每轮**毁一次缓存。
         M5-22:web_fetch 追加在 web_search 之后,同一条规矩、同一个代价。
         M5-27:**没有新工具,但两条老工具各多了几个可选参数——schema 照样变了**,
@@ -594,7 +634,7 @@ class BuiltinTools:
             self.open_thread,
             self.close_thread,
             self.recall_similar,
-            self.look_at_image,
+            self.read_image,
             self.web_search,
             self.web_fetch,
             self.list_threads,

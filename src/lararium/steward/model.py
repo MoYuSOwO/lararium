@@ -301,7 +301,6 @@ class PydanticAIClient:
     ) -> ModelReply:
         from pydantic_ai import Agent, capture_run_messages
         from pydantic_ai.messages import (
-            BinaryContent,
             ModelRequest,
             ModelResponse,
             SystemPromptPart,
@@ -357,16 +356,11 @@ class PydanticAIClient:
         else:
             history.insert(0, ModelRequest(parts=[prefix]))
 
-        # M5-5:图**只挂在最后一条**(组装器结构上只有那一个挂载点)。有图时当前轮
-        # 发的是 [正文, 图…] 的多模态形状;没图时逐字节还是原来那个字符串
-        # ——不许因为加了这条路,把所有不带图的轮次的报文也换个形状。
-        last = ctx.messages[-1]
-        prompt: Any = last["content"]
-        if last.get("images"):
-            prompt = [
-                last["content"],
-                *(BinaryContent(data=i.data, media_type=i.media_type) for i in last["images"]),
-            ]
+        # M6-2:**当前轮的 prompt 永远是一个字符串。** M5-5 那会儿这里有一支
+        # "有图就发 [正文, 图…] 的多模态形状";到达轮不再塞图之后,组装器压根挂不上字节
+        # (见 `assemble` 的 docstring),那一支的输入永远是空的——留着它就是留一扇
+        # 随手能推开的门,而图片真正的那条路是工具返回(`_adapt` → ToolReturn.content)。
+        prompt: Any = ctx.messages[-1]["content"]
 
         # M5-13:`capture_run_messages` 是库自己给的口子,专门用来回答"炸的时候都发了些
         # 什么"。**只在出错那条路上取**,正常轮次一个字节都不多带。

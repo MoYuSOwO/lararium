@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ from bundles.memory.server import build_memory_components, memory_tool_functions
 from lararium import db as db_module
 from lararium.config import Settings
 from lararium.db import connect
-from lararium.envelope import Attachment, Envelope
+from lararium.envelope import MAX_ATTACHMENTS, Attachment, Envelope
 from lararium.steward import tools as tools_module
 from lararium.steward.assembler import AssembledContext
 from lararium.steward.inbox import Inbox
@@ -91,8 +92,9 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         "open_thread",
         "close_thread",
         "recall_similar",
-        # M5-5:look_at_image 同样只追加在内置那一段的末尾
-        "look_at_image",
+        # M5-5:读图那个工具同样只追加在内置那一段的末尾;M6-2 只改了名字
+        # (`read_image`,和以后的 `read_pdf` 成对),**位置一格没动**。
+        "read_image",
         # M5-21:web_search 同样只追加在末尾。多一个工具 = 工具 schema 变 = 前缀
         # 重建一次,这个代价认(prefix_log 会记);插到中间则是**每轮**毁一次缓存。
         "web_search",
@@ -765,28 +767,65 @@ def with_image(tmp_path, *, on_disk=True):
     )
 
 
-async def test_the_arriving_turn_carries_the_image_and_the_journal_carries_the_hash(
-    steward_factory, tmp_path
-):
-    """一次跑通三条约束里的两条:图进了模型(到达轮),起居注里只有哈希没有字节。"""
+async def test_every_single_picture_gets_a_line_nothing_is_truncated(steward_factory, tmp_path):
+    """★ **满载的一条消息:每一张都报,一行都不许少。**
+
+    从前一条消息带 8 张图,到达轮硬塞前 4 张、剩下的写一句"还有 4 张没看"
+    ——**模型没得选**,挑哪几张是我们替它挑的(而我们不知道用户问的是哪张)。
+    现在八行全报,它自己挑;一轮里能看几张仍然有上限(`read_image` 那边数),
+    但那是"看"的上限,不是"知道有哪些"的上限。**这两件事从前是一件,现在分开了。**
+    """
+    (tmp_path / "media").mkdir(parents=True, exist_ok=True)
+    shots = []
+    for i in range(MAX_ATTACHMENTS):
+        blob = JPEG + bytes([i])
+        a = Attachment(
+            kind="image", sha256=hashlib.sha256(blob).hexdigest(), media_type="image/jpeg"
+        )
+        (tmp_path / "media" / f"{a.sha256}.jpg").write_bytes(blob)
+        shots.append(a)
+    steward, model = steward_factory([ModelReply(text="收到")], vision=True)
+    steward.submit(
+        Envelope.new(
+            source="user",
+            channel="wechat",
+            content="这几张里哪张是麦当劳那笔\n" + "\n".join(a.as_line() for a in shots),
+            attachments=shots,
+        )
+    )
+
+    await steward.process_next()
+
+    body = model.seen[0].messages[-1]["content"]
+    assert all(f"id {a.short}" in body for a in shots), f"有图没报出来:{body}"
+    assert "没看" not in body, f"又静默截断了:{body}"
+    assert "images" not in model.seen[0].messages[-1]
+
+
+async def test_an_arriving_image_is_reported_not_loaded(steward_factory, tmp_path):
+    """★ **M6-2 的主体:到达轮一个字节都不送,只报一行。**
+
+    从前这一轮会把图直接塞进上下文(不管模型用不用得上);现在正文里只有那行报告
+    (完整 id + 怎么看它),字节要等模型自己调 `read_image`。三处比从前紧,理由写在
+    `vision.py` 的模块 docstring 里——最硬的那条不是省 token:
+    **图片是特例,而那正是别的类型一条路都没有的原因。**
+
+    顺带把约束 3 也验了:起居注的 `prompt` 事件里没有字节——而 M6-2 之后这不是靠擦,
+    是**组装器压根挂不上**(`journalable_messages` 因此删掉了)。
+    """
     steward, model = steward_factory([ModelReply(text="看到了")], vision=True)
     steward.submit(with_image(tmp_path))
 
     await steward.process_next()
 
     sent = model.seen[0].messages[-1]
-    assert sent["images"][0].data == JPEG
+    assert "images" not in sent, "到达轮又把图塞进去了"
+    assert f"id {hashlib.sha256(JPEG).hexdigest()[:12]}" in sent["content"]
+    assert "read_image" in sent["content"], "报告行里没说怎么看这张图"
 
     events = steward.journal.replay(steward.journal.recent_turns(1)[0]["envelope_id"])
     payload = next(e["payload"] for e in events if e["kind"] == "prompt")
-    # 形状写死:只有引用+哈希+大小三项,没有第四项能装得下字节(约束 3)
-    assert payload["messages"][-1]["images"] == [
-        {
-            "sha256": hashlib.sha256(JPEG).hexdigest(),
-            "media_type": "image/jpeg",
-            "size": len(JPEG),
-        }
-    ]
+    assert "\\xff" not in json.dumps(payload, ensure_ascii=False), "字节溜进起居注了"
 
 
 async def test_vision_off_never_sends_bytes_and_says_so(steward_factory, tmp_path):
@@ -804,8 +843,14 @@ async def test_vision_off_never_sends_bytes_and_says_so(steward_factory, tmp_pat
     assert "看不了图" in sent["content"]
 
 
-async def test_a_missing_original_says_the_replay_is_incomplete(steward_factory, tmp_path):
-    """原件不在了要明说,不许静默给一份残缺的——外面得看得出这一轮比当初少了东西。"""
+async def test_a_missing_original_is_still_reported_and_costs_nothing(steward_factory, tmp_path):
+    """原件不在了,到达轮**照样只报那一行**——而"不在"这件事由 `read_image` 当场说。
+
+    从前到达轮会去读盘,读不到就写一句「这次重放不完整」。M6-2 之后到达轮不碰磁盘:
+    那句话搬到了唯一那条真取字节的路上(`read_image`:「没找到…原件可能已经不在了」,
+    `test_read_image_says_plain_words_when_the_file_is_gone` 钉着)。**一支都没少**,
+    只是从"提前体检"变成"用的时候说实话"——而好处是模型不看的时候一次磁盘都不读。
+    """
     steward, model = steward_factory([ModelReply(text="好")], vision=True)
     steward.submit(with_image(tmp_path, on_disk=False))
 
@@ -813,7 +858,7 @@ async def test_a_missing_original_says_the_replay_is_incomplete(steward_factory,
 
     sent = model.seen[0].messages[-1]
     assert "images" not in sent
-    assert "重放不完整" in sent["content"]
+    assert f"id {hashlib.sha256(JPEG).hexdigest()[:12]}" in sent["content"]
 
 
 async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, tmp_path):
@@ -830,14 +875,14 @@ async def test_an_image_result_is_journalled_as_not_replayable(steward_factory, 
     steward._active_envelope_id = "env-x"
     wrapped = {f.__name__: f for f in steward.all_tools()}
 
-    wrapped["look_at_image"](digest[:12])
+    wrapped["read_image"](digest[:12])
     wrapped["current_time"]()
 
     executed = [
         e["payload"] for e in steward.journal.replay("env-x") if e["kind"] == "tool_executed"
     ]
     assert [(p["tool"], p["replayable"]) for p in executed] == [
-        ("look_at_image", False),
+        ("read_image", False),
         ("current_time", True),
     ]
     assert "\\xff" not in str(executed[0]["result"]), "字节顺着 result 溜进起居注了"
@@ -1153,8 +1198,13 @@ async def test_the_mark_resets_between_turns(steward_factory):
     assert steward.gate.pending() == [], "上一轮的脏带到这一轮了"
 
 
-async def test_looking_at_an_image_again_raises_the_mark(steward_factory, tmp_path):
-    """`look_at_image` 无条件拉高——**选的是严的那一支**,理由写在实现的 docstring 里。"""
+async def test_reading_an_image_raises_the_untrusted_mark(steward_factory, tmp_path):
+    """`read_image` 无条件拉高——**选的是严的那一支**,理由写在实现的 docstring 里。
+
+    M6-2 之后这一条**覆盖了每一张进模型的图**,不再只覆盖"重看"那一次:到达轮那条路
+    从前不拉高(一张图跟着一句「记下来」进来,那一轮照旧是可信轮、propose 自动放行),
+    而现在图只有这一条路进得来。**这是本步比 M5-5 更严的地方之一,不是副作用。**
+    """
     steward, _ = steward_factory(vision=True)
     (tmp_path / "media").mkdir(parents=True, exist_ok=True)
     blob = b"\xff\xd8\xff\xe0 photo"
@@ -1162,7 +1212,7 @@ async def test_looking_at_an_image_again_raises_the_mark(steward_factory, tmp_pa
     (tmp_path / "media" / f"{digest}.jpg").write_bytes(blob)
     await start_turn(steward)
 
-    tool(steward, "look_at_image")(digest[:12])
+    tool(steward, "read_image")(digest[:12])
     tool(steward, "propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1

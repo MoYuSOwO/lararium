@@ -17,6 +17,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from lararium.envelope import Attachment
 from lararium.gateway import wechat
 from lararium.gateway.ilink import Credentials, ILinkError, InboundMessage, MediaRef, QrStatus
 from lararium.gateway.wechat import (
@@ -713,7 +714,11 @@ async def test_an_image_is_stored_under_its_content_hash_exactly_once(tmp_path):
 
 
 async def test_the_envelope_gets_a_reference_and_a_readable_line_not_bytes(tmp_path):
-    """信封带的是**引用**,`content` 是一行人话——下游一切按文本走的东西都不用动。"""
+    """信封带的是**引用**,`content` 是一行人话——下游一切按文本走的东西都不用动。
+
+    M6-2:那一行的措辞变了(完整 id + 怎么看它),**口径由 `Attachment.as_line()` 定**,
+    这里断的是"适配器把它原样放进 content 了",不是再抄一遍那句话的格式。
+    """
     posted: list[dict] = []
 
     def handler(request):
@@ -728,11 +733,49 @@ async def test_the_envelope_gets_a_reference_and_a_readable_line_not_bytes(tmp_p
     await a.pump_inbound_once()
 
     digest = hashlib.sha256(b"\xff\xd8\xff\xe0jpeg-bytes").hexdigest()
-    assert posted[0]["content"] == f"这是啥\n(图片 · media/{digest[:12]}…)"
+    expected = Attachment(kind="image", sha256=digest, media_type="image/jpeg")
+    assert posted[0]["content"] == f"这是啥\n{expected.as_line()}"
+    assert f"id {digest[:12]}" in posted[0]["content"], "id 不完整,模型得猜"
     assert posted[0]["attachments"] == [
-        {"kind": "image", "sha256": digest, "media_type": "image/jpeg"}
+        {"kind": "image", "sha256": digest, "media_type": "image/jpeg", "name": ""}
     ]
     assert "jpeg-bytes" not in json.dumps(posted[0]), "字节被塞进信封了"
+
+
+async def test_the_original_file_name_rides_along_to_the_report_line(tmp_path):
+    """★ **微信带的原名要进那行报告**(M6-2):`id` 是把手,名字才是人看的。
+
+    没有名字的话模型只能说「你发的那个 77aa…」,而用户不认识那串东西。
+    名字**影响不了落盘和类型**——那两样仍然是哈希和魔数说了算(`_sniff` 的
+    「不信对方给的文件名」一个字没松),所以让它进来的代价是有界的。
+    """
+    posted: list[dict] = []
+
+    def handler(request):
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={"envelope_id": "e1"})
+
+    named = MediaRef(
+        kind="file",
+        encrypted_query_param="q1",
+        full_url="",
+        aes_key_b64="",
+        file_name="第3讲 傅里叶变换.pdf",
+    )
+    ilink = FakeILinkWithCdn(
+        batches=[([InboundMessage(1, "u1@im.wechat", "存一下", "ctx", media=(named,))], "c1")],
+        blobs={"q1": b"%PDF-1.7 lecture"},
+    )
+    a = adapter(tmp_path, ilink, handler)
+
+    await a.pump_inbound_once()
+
+    assert "第3讲 傅里叶变换.pdf" in posted[0]["content"]
+    assert posted[0]["attachments"][0]["name"] == "第3讲 傅里叶变换.pdf"
+    digest = hashlib.sha256(b"%PDF-1.7 lecture").hexdigest()
+    assert [p.name for p in (tmp_path / "media").iterdir()] == [f"{digest}.pdf"], (
+        "落盘名字应该只由哈希算,不许被对方给的文件名影响"
+    )
 
 
 async def test_a_failed_download_is_plain_words_and_the_message_still_lands(tmp_path):
