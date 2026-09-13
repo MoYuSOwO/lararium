@@ -9,7 +9,7 @@
 落点的单位是一门课的目录     <root>/<课程>/notes.md
                              ——所以改名和删除搬的是整个目录;课件的归属在表里
                              (M6-6b,`materials.py`),键就是这个目录的相对路径(`label`)
-笔记本会长,所以要分页       做菜那边 read_recipe 不分页,这一条只有学习要(G5:
+笔记本会长,所以要分页       做菜那边 recipes__read_recipe 不分页,这一条只有学习要(G5:
                              按两个真实用例定边界,只有一边用的不进共用层)
 回收站里是 <课程>-<时间戳>/  M5-20 的形状。有时间戳,所以同一门课删两次不会撞;
                              时间戳里没有连字符,所以「C-语言」解得回来
@@ -73,7 +73,7 @@ def name_error(name: str) -> str | None:
     if fault is None:
         return None
     if fault.kind == "empty":
-        return '课程名是空的。给一门课的名字,比如 read_note("线性代数")。'
+        return '课程名是空的。给一门课的名字,比如 courses__read_note("线性代数")。'
     if fault.kind == "too_long":
         return (
             f"这个课程名太长了({len(name)} 字,最多 {MAX_NAME_CHARS} 字),没这么建。"
@@ -114,7 +114,7 @@ def page_index(pages: list[str], at: int) -> int:
     """一个下标落在第几页(从 1 起)。越界钳到最后一页,不报错。
 
     ★ 没有这一步,搜到了也不知道去读哪一页,而「找一段的正常姿势是搜,不是从头读」
-    就断在最后一米上——搜索是主要入口,它得**接得上 `read_note`**。
+    就断在最后一米上——搜索是主要入口,它得**接得上 `courses__read_note`**。
     """
     seen = 0
     for i, page in enumerate(pages, start=1):
@@ -175,7 +175,7 @@ class CourseStore:
     def names(self) -> list[str]:
         """有哪些课。**一门课是一个目录**,所以列的是目录而不是笔记文件
 
-        ——一门只有课件、还没记过笔记的课(M6-6b 的 `add_file` 先建目录)也是一门课。
+        ——一门只有课件、还没记过笔记的课(M6-6b 的 `courses__add_file` 先建目录)也是一门课。
 
         ★ **跳过前导 `.` 的**:名字白名单拒前导 `.`,所以那些目录**模型寻址不到**,
         列出来只会让用户看到一门叫 `.trash` 的课,而她点不开。
@@ -212,14 +212,14 @@ class CourseStore:
         return folder.relative_to(self.root).as_posix()
 
     def create(self, folder: Path) -> None:
-        """建出一门课的目录(还没有笔记)。`add_file` 归到一门新课时用——一门课是一个目录,
-        `names()` 只认目录,不建的话这门课在 `list_courses` 里看不见。"""
+        """建出一门课的目录(还没有笔记)。`courses__add_file` 归到一门新课时用——一门课是一个目录,
+        `names()` 只认目录,不建的话这门课在 `courses__list_courses` 里看不见。"""
         folder.mkdir(exist_ok=True)
 
     def rename(self, src: Path, dst: Path) -> None:
         """改名:**搬整个课程目录**,笔记和课件一起走,字节天然一个不变。
 
-        调用方负责先确认 `dst` 不存在——合并比重名更坏(见 `rename_course`)。
+        调用方负责先确认 `dst` 不存在——合并比重名更坏(见 `courses__rename_course`)。
         """
         relocate(src, dst)
 

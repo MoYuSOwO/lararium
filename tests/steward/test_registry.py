@@ -129,3 +129,84 @@ def test_read_skill_rejects_unknown_skill_name_in_finance(registry):
     """白名单校验对 finance 同样生效:skill 名来自模型输出,不许拿去拼路径。"""
     with pytest.raises(KeyError, match="monthly-review"):
         registry.read_skill("finance", "../../../etc/passwd")
+
+
+# ── M6-6d:工具名加 bundle 前缀 ───────────────────────────────────────────
+
+
+def _cook_registry(tmp_path: Path, tools: str = "[boil, fry]") -> Registry:
+    _write_bundle(tmp_path, "cook", f"name: cook\ndescription: 做饭\ntools: {tools}\n")
+    return Registry.load(tmp_path)
+
+
+def boil(minutes: int, salt: bool = False) -> str:
+    """把东西煮 minutes 分钟。salt 为真时先放盐。"""
+    return f"煮了 {minutes} 分钟" + (",放了盐" if salt else "")
+
+
+def fry() -> str:
+    """炒一下。"""
+    return "炒好了"
+
+
+def test_bundle_tools_are_prefixed_with_the_manifest_name(tmp_path):
+    """★ 前缀从 manifest 的 `name` 来,调用方只说"这是哪个 bundle 的",拼不出别的前缀。"""
+    registry = _cook_registry(tmp_path)
+
+    out = registry.qualify_tools("cook", [boil, fry])
+
+    assert [f.__name__ for f in out] == ["cook__boil", "cook__fry"]
+    assert registry.get("cook").tool_name("boil") == "cook__boil"
+
+
+def test_prefixing_changes_nothing_but_the_name(tmp_path):
+    """签名、docstring、行为一个不动;原函数顺着 `__wrapped__` 找得回来(守卫按身份认靠这个)。"""
+    import inspect
+
+    (qualified,) = _cook_registry(tmp_path, "[boil]").qualify_tools("cook", [boil])
+
+    assert inspect.signature(qualified) == inspect.signature(boil)
+    assert inspect.getdoc(qualified) == inspect.getdoc(boil)
+    assert qualified(3, salt=True) == boil(3, salt=True)
+    assert inspect.unwrap(qualified) is boil
+    assert boil.__name__ == "boil", "改的是包装,不许动 bundle 自己的函数对象"
+
+
+@pytest.mark.parametrize(
+    "handed",
+    [
+        pytest.param(["fry", "boil"], id="顺序不对"),
+        pytest.param(["boil"], id="少一个"),
+        pytest.param(["boil", "fry", "boil"], id="多一个"),
+    ],
+)
+def test_prefixing_refuses_a_tool_list_the_manifest_does_not_declare(tmp_path, handed):
+    """manifest 的 tools 是这个 bundle 有哪些工具的**唯一**声明。交出来的函数和它对不上,
+    说明组装根拿错了 bundle 的名字(或者 manifest 忘了改)——前缀会贴错,必须当场炸。"""
+    registry = _cook_registry(tmp_path)
+    funcs = {"boil": boil, "fry": fry}
+
+    with pytest.raises(ValueError, match="cook"):
+        registry.qualify_tools("cook", [funcs[n] for n in handed])
+
+
+def test_legacy_names_are_derived_from_the_manifests(registry):
+    """旧名 → 新名是**推出来的**:每个 manifest 里的每个工具一条,不多不少。"""
+    legacy = registry.legacy_tool_names()
+
+    assert legacy["propose_fact"] == "memory__propose_fact"
+    assert legacy["list_recent"] == "finance__list_recent"
+    assert legacy["list_materials"] == "courses__list_materials"
+    assert set(legacy.values()) == {b.tool_name(t) for b in registry.bundles for t in b.tools}
+    assert len(legacy) == sum(len(b.tools) for b in registry.bundles)
+
+
+def test_a_bare_name_two_bundles_share_is_left_out_of_the_legacy_map(tmp_path):
+    """两个 bundle 各有一个 `read_note`:旧记录里那个 `read_note` 是谁的**说不清**,
+    宁可认不出(那次往返照 L3 丢掉),不许猜一个塞进上下文。"""
+    _write_bundle(tmp_path, "a", "name: courses\ndescription: 课\ntools: [read_note, add_file]\n")
+    _write_bundle(tmp_path, "b", "name: diary\ndescription: 日记\ntools: [read_note]\n")
+
+    legacy = Registry.load(tmp_path).legacy_tool_names()
+
+    assert legacy == {"add_file": "courses__add_file"}

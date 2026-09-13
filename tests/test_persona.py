@@ -140,11 +140,13 @@ def test_no_tool_can_reach_the_character_file(tmp_path, monkeypatch):
     settings = Settings.load()
     conn = connect(tmp_path / "steward.sqlite")
     ledger, gate = build_memory_components(tmp_path)
+    registry = Registry.load(Path("bundles"))
+    memory = memory_tool_functions(gate)
     steward = Steward(
         settings=settings,
         inbox=Inbox(conn),
         journal=Journal(conn),
-        registry=Registry.load(Path("bundles")),
+        registry=registry,
         ledger=ledger,
         gate=gate,
         model=object(),
@@ -152,9 +154,12 @@ def test_no_tool_can_reach_the_character_file(tmp_path, monkeypatch):
         outbox=Outbox(conn),
         threads=Threads(conn),
         bundle_tools=[
-            *memory_tool_functions(gate),
-            *build_finance(tmp_path, timezone="Asia/Shanghai").tools,
+            *registry.qualify_tools("memory", memory),
+            *registry.qualify_tools(
+                "finance", build_finance(tmp_path, timezone="Asia/Shanghai").tools
+            ),
         ],
+        proposal_tool=memory.propose_fact,
     )
 
     target = character_path(tmp_path)

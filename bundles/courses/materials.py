@@ -60,8 +60,8 @@ class Materials:
         """一个事务,**整块持锁**(`db.transaction`)。
 
         两个用处:① 改名 / 撤回时表和目录"一起成、一起不成"——表先改、目录后搬,搬失败
-        (OSError)事务就回滚;② `add_file` 的"查有没有重的 → 插进去"在同一把锁里,
-        一条 assistant 消息里并发的两次 add_file 不会一起查到"没有"。
+        (OSError)事务就回滚;② `courses__add_file` 的"查有没有重的 → 插进去"在同一把锁里,
+        一条 assistant 消息里并发的两次 courses__add_file 不会一起查到"没有"。
         """
         with transaction(self._conn):
             yield

@@ -74,11 +74,13 @@ def system(tmp_path, monkeypatch):
 
     def make(script, fail_on, extra_tools=()):
         model = ToolCallingModel(script, fail_on)
+        registry = Registry.load(Path("bundles"))
+        memory = memory_tool_functions(gate)
         steward = Steward(
             settings=settings,
             inbox=Inbox(conn),
             journal=Journal(conn),
-            registry=Registry.load(Path("bundles")),
+            registry=registry,
             ledger=ledger,
             gate=gate,
             model=model,
@@ -86,10 +88,13 @@ def system(tmp_path, monkeypatch):
             outbox=Outbox(conn),
             threads=Threads(conn),
             bundle_tools=[
-                *memory_tool_functions(gate),
-                *build_finance(tmp_path, timezone="Asia/Shanghai").tools,
+                *registry.qualify_tools("memory", memory),
+                *registry.qualify_tools(
+                    "finance", build_finance(tmp_path, timezone="Asia/Shanghai").tools
+                ),
                 *extra_tools,
             ],
+            proposal_tool=memory.propose_fact,
         )
         return steward, model, gate, ledger
 
@@ -121,13 +126,13 @@ def counting_tool():
 
 
 LUNCH = (
-    "record_expense",
+    "finance__record_expense",
     (),
     {"amount": 45, "category": "餐饮", "occurred_at": "2026-08-23T12:00"},
 )
 CHARGE = ("charge_the_card", (), {"what": "房租"})
 ALLERGY = (
-    "propose_fact",
+    "memory__propose_fact",
     (),
     {"kind": "add", "content": "对花生过敏", "provenance": "user_stated", "section": "长期偏好"},
 )
@@ -192,10 +197,10 @@ async def test_an_attempt_that_reached_no_tool_does_not_uncover_an_earlier_execu
         if e["kind"] == "tool_executed"
     ]
     assert executed == [
-        ("record_expense", False),
+        ("finance__record_expense", False),
         ("charge_the_card", False),
         # 第 2 次尝试:一条都没有。
-        ("record_expense", True),
+        ("finance__record_expense", True),
         ("charge_the_card", True),
     ], "第 3 次必须是**回放**上一次确立的结果,而不是碰巧没调"
 
@@ -265,7 +270,7 @@ async def test_execution_is_journalled_even_when_the_turn_fails(system, tmp_path
 
     executed = [e for e in steward.journal.replay(env.id) if e["kind"] == "tool_executed"]
     # M5-14 摘掉守卫之后又回到一步:调一次 record_expense。
-    assert [e["payload"]["tool"] for e in executed] == ["record_expense"]
+    assert [e["payload"]["tool"] for e in executed] == ["finance__record_expense"]
     assert executed[0]["payload"]["replayed"] is False
 
 
@@ -308,9 +313,9 @@ async def test_replay_follows_the_recorded_sequence_across_different_tools(syste
     ]
     assert flags == [
         ("current_time", False),
-        ("record_expense", False),
+        ("finance__record_expense", False),
         ("current_time", True),
-        ("record_expense", True),
+        ("finance__record_expense", True),
     ]
 
 

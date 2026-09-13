@@ -11,6 +11,7 @@ import hmac
 import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -56,25 +57,44 @@ _UNAUTHORIZED = JSONResponse({"error": "未授权"}, status_code=401)
 _FORBIDDEN = JSONResponse({"error": "无权限"}, status_code=403)
 
 
-def _assemble_bundle_tools(data_dir: Path, gate: Any, timezone: str) -> list[Callable]:
+@dataclass(frozen=True)
+class AssembledTools:
+    """组装根拼好的 bundle 工具,外加 P0-1 守卫要认的那一个。
+
+    `proposal_tool` 是 memory 交出来的**原函数对象**(没加前缀的那个)。Steward 顺着
+    `__wrapped__` 链按身份找它,不按名字——名字是注册那一刻才加的,以后还可能再变(M6-6d)。
+    """
+
+    tools: list[Callable]
+    proposal_tool: Callable
+
+
+def _assemble_bundle_tools(
+    data_dir: Path, gate: Any, *, timezone: str, registry: Registry
+) -> AssembledTools:
     """组装根的显式小表:加一个领域 bundle,在这里加一行。
 
     memory 是特殊 bundle(§6.1,ledger/gate 走 Steward 的 ports,不试图抹平),
     工具**仍排最前**;领域 bundle 走统一构造入口 `build(data_dir) -> BundleRuntime`,
     追加在后。顺序即工具 schema(前缀第0层),`test_bundle_tool_order_*` 把它钉死——
     一旦定了不许再动,免得哪天有人把 finance 插到 memory 前面还自认为是排序优化。
+
+    M6-6d:每一段都过 `registry.qualify_tools`,**前缀取自那个 bundle 的 manifest**。
+    这里写的 "finance" 只是去找 manifest 的钥匙,找到之后要和 build() 交出来的函数名逐个对账,
+    写错成别人的名字当场炸,贴不上错的前缀。
     """
-    tools: list[Callable] = list(memory_tool_functions(gate))
-    tools.extend(build_finance(data_dir, timezone=timezone).tools)  # 每加一个领域,加一行
+    memory = memory_tool_functions(gate)
+    tools = registry.qualify_tools("memory", memory)
+    # 每加一个领域,加一行
+    tools += registry.qualify_tools("finance", build_finance(data_dir, timezone=timezone).tools)
     # M6-5 做菜:**追加在末尾**,finance 那一段一格没动。新 bundle = 目录行 + 8 个工具
     # schema,前缀重建一次(A1,启动时 prefix_log 会记);插到中间则是**每轮**毁一次缓存。
     # 它不收 timezone:那一层没有任何时间戳(见 bundles/recipes/server.py 的 build)。
-    tools.extend(build_recipes(data_dir).tools)
-    # M6-6a 学习(笔记那半):同样**追加在末尾**,上面 20 个一格没动。新 bundle = 目录行 +
-    # 7 个工具 schema,前缀重建一次(A1)。它收 timezone:回收站目录名里有时间戳。
-    # M6-6b 的 add_file / list_materials 会追加在这 7 个之后(manifest 里已注明)。
-    tools.extend(build_courses(data_dir, timezone=timezone).tools)
-    return tools
+    tools += registry.qualify_tools("recipes", build_recipes(data_dir).tools)
+    # M6-6a 学习:同样**追加在末尾**,上面 20 个一格没动(M6-6b 课件那两个在它自己那段末尾)。
+    # 它收 timezone:回收站目录名里有时间戳。
+    tools += registry.qualify_tools("courses", build_courses(data_dir, timezone=timezone).tools)
+    return AssembledTools(tools=tools, proposal_tool=memory.propose_fact)
 
 
 def _push_notifier(steward: Steward) -> Any:
@@ -120,6 +140,9 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
         if settings.vision
         else None
     )
+    assembled = _assemble_bundle_tools(
+        settings.data_dir, gate, timezone=settings.timezone, registry=registry
+    )
     steward = Steward(
         settings=settings,
         inbox=inbox,
@@ -132,7 +155,8 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
         outbox=Outbox(conn),
         threads=Threads(conn),
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
-        bundle_tools=_assemble_bundle_tools(settings.data_dir, gate, settings.timezone),
+        bundle_tools=assembled.tools,
+        proposal_tool=assembled.proposal_tool,
         transcriber=transcriber,
     )
     # 前缀变更留痕:改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么
@@ -148,6 +172,13 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
     previous = record_prefix_change(conn, digest)
     if previous is not None:
         logger.warning("前缀区变了:%s → %s,本次启动缓存会重建一次", previous[:12], digest[:12])
+    # M6-6d 旧工具名映射的删除条件:每次启动问一次,它的读者(这台机器上没压缩的历史)
+    # 没了就说出来。读到这句的人要做的事是删代码,所以措辞直接写删哪几处。
+    if steward.legacy_tool_names_retired():
+        logger.warning(
+            "旧工具名映射已经没有读者了(没压缩的历史里一次改名前的工具记录都没有):"
+            "可以删掉 Registry.legacy_tool_names、Steward._legacy_tool_names 及其两处调用(M6-6d)"
+        )
     return steward
 
 

@@ -451,7 +451,7 @@ def test_undoing_a_delete_puts_the_line_back_over_and_says_so(runtime):
 
     assert deleted == (
         "删了 #1:餐饮 620.00 元 · 原因「记重了」。合计里不算它了。"
-        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+        "删错的话再调一次 finance__delete_expense、带 undo=True 就能拿回来。"
     ), "删完已经在线下了,还在说超支"
     assert restored == "\n".join(
         (
@@ -477,7 +477,7 @@ def test_a_delete_that_leaves_the_line_still_over_says_so(runtime):
     assert said == "\n".join(
         (
             "删了 #2:餐饮 200.00 元 · 原因「记重了」。合计里不算它了。"
-            "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。",
+            "删错的话再调一次 finance__delete_expense、带 undo=True 就能拿回来。",
             "2026-09 餐饮已花 620.00 元,额度 500.00 元,超了 120.00 元。",
         )
     )

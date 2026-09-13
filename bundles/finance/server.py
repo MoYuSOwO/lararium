@@ -4,11 +4,11 @@ M4-1 立的骨架:manifest + 独占 SQLite + 统一构造入口 `build(...)`。�
 **签名与文档在 M4-1 定死**(工具 schema 是前缀第0层,顺序冻结后不许再动);
 M4-2 起只换函数体、不动签名与 docstring——docstring 就是 schema,改它是一次前缀重建。
 
-M4-2 落地 `record_expense`,M4-3 落地 `query_spending`,M4-4 落地 `list_recent`。
-M5-15 / M5-20 追加 `amend_expense` / `delete_expense`(两个都是真机逼出来的,不是设计
-出来的);M6-3 追加 `record_income` / `list_income`——账本终于不只有"花出去"一个口子。
+M4-2 落地 `finance__record_expense`,M4-3 落地 `finance__query_spending`,M4-4 落地 `finance__list_recent`。
+M5-15 / M5-20 追加 `finance__amend_expense` / `finance__delete_expense`(两个都是真机逼出来的,不是设计
+出来的);M6-3 追加 `finance__record_income` / `finance__list_income`——账本终于不只有"花出去"一个口子。
 M6-3a 把 M6-3 的一半拆掉:**退款并进收入**,`kind` / `of_expense_id` 两列退休。
-M6-4 追加 `set_budget` / `list_budgets` / `remove_budget`,以及**超线那句话**——它不新开
+M6-4 追加 `finance__set_budget` / `finance__list_budgets` / `finance__remove_budget`,以及**超线那句话**——它不新开
 一条消息,是拼在写操作的回话尾巴上(新开一条就要走出件箱,那是主动推送的形状)。
 用户的判断比 M6-3 里写的任何一条都硬:「很难说全退」——真实退款经常是部分退、几笔合并退、
 退到代金券,「冲抵某一笔支出」这个指针大多数时候指不准;而"抵掉退款后实际花掉 Z"整个
@@ -22,7 +22,7 @@ M6-4 追加 `set_budget` / `list_budgets` / `remove_budget`,以及**超线那句
 - 按**表**切(expenses | income | budgets)切不动:三份共享同一条连接、同一套渲染器
   (`_render_note` 两个出口渲染不一致就是 P1-1 那个事故)、同一份金额与时间解析,
   拆了就是三份渲染器三份解析器——**而 M6-4 恰好加重了这一条**:「已花」必须和
-  `query_spending` 印的数一模一样,保证它的办法是**只有一份 SQL**(`_GROUP_SQL`),
+  `finance__query_spending` 印的数一模一样,保证它的办法是**只有一份 SQL**(`_GROUP_SQL`),
   拆出去就变成一次跨模块调用去借那条查询,借的时候借错一个参数就是两个数对不上。
 - 按**层**切(SQL 一个模块、工具一个模块)是可以切的,但那条缝把「一次查询」变成
   「一次跨模块调用」,而本文件的价值恰恰在于每条 SQL 旁边写着它防的那次事故。
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS expenses (
     deleted_at     TEXT,
     deleted_reason TEXT
 );
--- occurred_at 是唯一的检索维度:list_recent 按它倒序取前 N,query_spending 按它做范围
+-- occurred_at 是唯一的检索维度:finance__list_recent 按它倒序取前 N,finance__query_spending 按它做范围
 -- 扫描。没有索引时两者都要全表扫,而这张表只会越长越长(M4-4 补)。
 CREATE INDEX IF NOT EXISTS idx_expenses_occurred_at ON expenses(occurred_at);
 
@@ -336,7 +336,7 @@ def _retire_the_refund_columns(conn: sqlite3.Connection) -> None:
 
     `CREATE TABLE IF NOT EXISTS` 对**已经建出来的**表是空操作,而这张表 M6-3 当天就推上
     真机了(0 行)。不办这道手续的症状不是"多两列没人看":`kind TEXT NOT NULL` 还在,
-    而新的 `record_income` 不写它——于是**每一笔收入都撞 NOT NULL**,用户收到的是一句
+    而新的 `finance__record_income` 不写它——于是**每一笔收入都撞 NOT NULL**,用户收到的是一句
     「这笔没记进去(库写入失败……)」,那台机器从此记不了收入。
 
     **有行也是对的,不重建表、不搬数据**:一条 refund 行拿掉这两列就是一条收入行,
@@ -405,7 +405,7 @@ def _is_bindable_id(value: object) -> bool:
 
     超出 int64 的 int 在**绑定参数时**抛 `OverflowError`,而它不是 `sqlite3.Error` 的
     子类——`except sqlite3.Error` 接不住,异常直接逃出工具边界,整轮炸掉,用户看到的是
-    助手死掉。`record_expense` 的金额上界 `_MAX_CENTS` 防的是同一个东西(M4-2 补),
+    助手死掉。`finance__record_expense` 的金额上界 `_MAX_CENTS` 防的是同一个东西(M4-2 补),
     而模型给的 id 同样是不可信输入(L3)。
 
     **一个存不下的 id 在库里必然不存在**,所以这里只回真假:调用方照常走它那句
@@ -468,7 +468,7 @@ def _yuan(cents: int) -> str:
 def _month_bounds(when: date) -> tuple[str, str, str]:
     """那一天所在的**月**:("2026-09", "2026-09-01", "2026-10-01")。
 
-    上界取次月 1 号、开区间,理由同 `query_spending`:存的是 'YYYY-MM-DDTHH:MM:SS',
+    上界取次月 1 号、开区间,理由同 `finance__query_spending`:存的是 'YYYY-MM-DDTHH:MM:SS',
     闭区间会把月末带时刻的流水吃掉。`+31 天再 replace(day=1)` 对 28~31 天的月份都落在
     次月(2 月 1 号 + 31 天 = 3 月 4 号 → 3 月 1 号),不用算每个月有几天。
     """
@@ -485,10 +485,10 @@ def _budgets(conn: sqlite3.Connection) -> dict[str, int]:
 def _spent_by_category(conn: sqlite3.Connection, lower: str, upper: str) -> dict[str, int]:
     """一个月里每个类目的支出合计。
 
-    **跑的是 `query_spending` 那条 SQL(`_GROUP_SQL["category"]`),只此一份。** 「已花」和
+    **跑的是 `finance__query_spending` 那条 SQL(`_GROUP_SQL["category"]`),只此一份。** 「已花」和
     印给用户的那个数必须是同一个数,而保证它的办法不是"两份写得一样"——是**只有一份**:
     第二份迟早漏掉 `deleted_at IS NULL` 或者那个区间,而症状是两个数对不上、谁都说不清
-    哪个对。总额那条线 = 这些值加起来,和 `query_spending` 的合计行是同一句 Python
+    哪个对。总额那条线 = 这些值加起来,和 `finance__query_spending` 的合计行是同一句 Python
     (`sum(r["cents"] for r in groups)`)。
     """
     return {
@@ -497,7 +497,7 @@ def _spent_by_category(conn: sqlite3.Connection, lower: str, upper: str) -> dict
 
 
 def _budget_line(month: str, scope: str, spent: int, limit_cents: int) -> str:
-    """一条线的现状:已花 / 额度 /(超了多少)。**超线那句和 `list_budgets` 是同一句**
+    """一条线的现状:已花 / 额度 /(超了多少)。**超线那句和 `finance__list_budgets` 是同一句**
     ——两套渲染器必然漂(P1-1),而这一句里三个数的口径全在措辞上。
 
     **不许说"比上月多"**:账本 2026-09-06 才开张,8 月没有数,环比是编的(用户自己
@@ -539,8 +539,8 @@ def _budget_lines(
 def _budget_note(conn: sqlite3.Connection, *, when: date | None, category: str) -> list[str]:
     """写操作回话的尾巴:这一笔落进的那两条线(它的类目、总额)超了就说。
 
-    **四条写路径共用这一份**(`record_expense` / `amend_expense` / `delete_expense`,
-    外加 `set_budget` 自己划线那一次走 `_budget_lines`)。G8:一条不变量有几条路能破它,
+    **四条写路径共用这一份**(`finance__record_expense` / `finance__amend_expense` / `finance__delete_expense`,
+    外加 `finance__set_budget` 自己划线那一次走 `_budget_lines`)。G8:一条不变量有几条路能破它,
     就要在几处守——而把 50 改成 5000、把删掉的那笔 undo 回来,都能让"超了"成立,
     **而那两条路原来是无声的**。守的方式不是拦(底稿是用户的),是把事实说出口。
 
@@ -567,7 +567,7 @@ def _budget_note(conn: sqlite3.Connection, *, when: date | None, category: str) 
 
 def _no_such_scope(scope: str) -> str:
     """预算的 scope 走白名单(L3:模型给的东西是不可信输入),提示里列全合法值——
-    照 `record_expense` 那条非法类目的写法,模型才能自己纠正重试而不是吃一次空转。"""
+    照 `finance__record_expense` 那条非法类目的写法,模型才能自己纠正重试而不是吃一次空转。"""
     legal = "|".join(BUDGET_SCOPES)
     return f"没有「{scope}」这条线。预算只能设在:{legal}。"
 
@@ -597,7 +597,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
             # M6-3a 改了这半句的措辞:原话是「退款或收入用 record_income 记」,而"退款"
             # 已经不是一个单独的东西了(它就记成收入)。**这是回话不是 docstring,
             # 不进前缀**——改它不触发一次前缀重建。
-            hint = "钱回来了(收到的退款也算)用 record_income 记成收入,别记成负数的支出。"
+            hint = "钱回来了(收到的退款也算)用 finance__record_income 记成收入,别记成负数的支出。"
             tail = f"这笔没记。{hint}" if cents is not None and cents < 0 else "这笔没记。"
             return f"金额不对({amount}):要一个大于 0 的数字,单位是元(比如 28.5)。{tail}"
         if category not in CATEGORIES:
@@ -715,7 +715,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         或超大值都钳制到上限。since/until 格式 YYYY-MM-DD、两端都含,缺省为全时段;
         order 取 recent(最近的在前)或 largest(金额从大到小)。回答"某段时间最大的
         一笔"要 order=largest **并且**给上 since/until——只给 order 会答成全时段之最。
-        每行开头的 #id 可以直接喂给 amend_expense 或 delete_expense;被删掉的行默认
+        每行开头的 #id 可以直接喂给 finance__amend_expense 或 finance__delete_expense;被删掉的行默认
         不列,include_deleted=True 才带上(标「已删除」)
         ——用户说"删错了恢复一下"时就这么找回那个 #id。"""
         # 负数在 SQLite 的 LIMIT 里是"不限制",不钳制就是全表倒进上下文(M3-1 教训)。
@@ -773,10 +773,10 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         occurred_at: str | None = None,
         note: str | None = None,
     ) -> str:
-        """改一笔已经记错的流水。expense_id 是 list_recent 每行开头那个 #id;
+        """改一笔已经记错的流水。expense_id 是 finance__list_recent 每行开头那个 #id;
         只传要改的字段,没传的原样保留。**就地改,#id 不变**——改完还是那一行,
         用户记着的那个号接着能用;已经删掉的行改不了(要记就直接记一笔新的)。
-        **这个工具只管"改"。要整笔去掉用 delete_expense,别拿改备注的办法假装删掉**
+        **这个工具只管"改"。要整笔去掉用 finance__delete_expense,别拿改备注的办法假装删掉**
         ——那样金额还在账上照样计入合计,而用户以为已经没了。"""
         try:
             # M5-31:**整个读-改-写在一个事务里**。四个字段的新值全部来自那次 SELECT,
@@ -803,15 +803,13 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                     else None
                 )
                 if row is None:
-                    return (
-                        f"没有 #{expense_id} 这笔。先用 list_recent 看一眼有哪些,#id 在每行开头。"
-                    )
+                    return f"没有 #{expense_id} 这笔。先用 finance__list_recent 看一眼有哪些,#id 在每行开头。"
                 if row["deleted_at"] is not None:
                     # 不指恢复那条路(M5-26):「删了的账要改成别的数」不是撤销,是记一笔新的。
                     # 绕去恢复只会在账本上多两条没意义的痕迹——删了又活、活了又是另一个数。
                     return (
                         f"#{expense_id} 已经删了,改不了——它不在账上,改了你也看不见。"
-                        f"要记就直接记一笔新的(record_expense)。"
+                        f"要记就直接记一笔新的(finance__record_expense)。"
                     )
 
                 cents = row["amount_cents"] if amount is None else _to_cents(amount)
@@ -867,10 +865,10 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         undo: bool = False,
     ) -> str:
         """删掉一笔记错的账——比如这笔根本不该存在、或者是测试时随手记的。
-        expense_id 是 list_recent 每行开头那个 #id。删掉之后正常查询看不见它、
+        expense_id 是 finance__list_recent 每行开头那个 #id。删掉之后正常查询看不见它、
         合计也不算它。**删错了可以撤回**:同一个 id 再调一次、带 undo=True,
         原样回到账上(金额、类目、时间一个字都不变)。
-        要改金额或类目用 amend_expense,别先删再重记。"""
+        要改金额或类目用 finance__amend_expense,别先删再重记。"""
         try:
             # M5-31:这里也是「读了再改」,和 amend 同一个洞。判过 `deleted_at` 才动手,
             # 而判和动手之间原来敞着:两个并发的删除都读到"还在账上",都写一遍
@@ -893,7 +891,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                 if row is None:
                     return (
                         f"没有 #{expense_id} 这笔,什么都没动。"
-                        f"先用 list_recent 看一眼有哪些,#id 在每行开头。"
+                        f"先用 finance__list_recent 看一眼有哪些,#id 在每行开头。"
                     )
                 what = f"{row['category']} {_yuan(row['amount_cents'])} 元"
 
@@ -923,7 +921,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
                     # "修一个不该存在的东西",而这一句回到 M5-20 的原文、逐字节不变。
                     done = (
                         f"删了 #{expense_id}:{what}{_render_reason(reason)}。"
-                        f"合计里不算它了。删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+                        f"合计里不算它了。删错的话再调一次 finance__delete_expense、带 undo=True 就能拿回来。"
                     )
 
                 conn.execute(sql, args)
@@ -1009,10 +1007,10 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         since: str | None = None,
         until: str | None = None,
     ) -> str:
-        """列出收入(支出用 list_recent,两边是两本账)。since/until 格式 YYYY-MM-DD、
+        """列出收入(支出用 finance__list_recent,两边是两本账)。since/until 格式 YYYY-MM-DD、
         两端都含,缺省为全时段;硬封顶 20 条,limit 为负数或超大值都钳制到上限。
         第一行给的是**全区间**的收入合计和笔数,后面才是流水。
-        **收入不算在「花了多少」里**:这个数和 query_spending 那个数不许加减到一起,
+        **收入不算在「花了多少」里**:这个数和 finance__query_spending 那个数不许加减到一起,
         它们回答的不是同一个问题。"""
         # 负数在 SQLite 的 LIMIT 里是"不限制",不钳制就是全表倒进上下文(M3-1 教训)。
         # 上限和 list_recent 共用一个:两个工具都返回原始记录,顶穿 L0 的方式一模一样。
@@ -1067,7 +1065,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         """给一条线设**每月**额度。scope 取某个类目(餐饮|交通|日用|娱乐|医疗|人情|其他)
         或者「总额」,monthly_limit 为元;同一条线再设一次就是改额度。
         **不设就没有提醒**——没有默认额度;设了之后,哪个月哪条线超了,会在那一笔记账
-        (或改账)的回话里说出已花、额度、超了多少。撤掉一条线用 remove_budget,别设成 0。"""
+        (或改账)的回话里说出已花、额度、超了多少。撤掉一条线用 finance__remove_budget,别设成 0。"""
         if scope not in BUDGET_SCOPES:
             return _no_such_scope(scope) + "这条没设。"
         cents = _to_cents(monthly_limit)
@@ -1104,7 +1102,7 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
 
     def list_budgets() -> str:
         """列出设过的预算:每条线的月额度 + 那条线**本月**已花(超了会一并说出来),
-        没设过就直说没设。改额度用 set_budget,撤掉用 remove_budget。"""
+        没设过就直说没设。改额度用 finance__set_budget,撤掉用 finance__remove_budget。"""
         try:
             status = _budget_lines(
                 conn, when=datetime.now(tz).date(), scopes=BUDGET_SCOPES, over_only=False
@@ -1121,8 +1119,8 @@ def _tool_functions(conn: sqlite3.Connection, tz: ZoneInfo) -> list[Callable]:
         )
 
     def remove_budget(scope: str) -> str:
-        """撤掉一条线的预算(scope 同 set_budget):撤了之后这条线不再提醒,
-        回到"没设"那个状态。只想改额度的话用 set_budget,**别拿 0 当撤掉**。"""
+        """撤掉一条线的预算(scope 同 finance__set_budget):撤了之后这条线不再提醒,
+        回到"没设"那个状态。只想改额度的话用 finance__set_budget,**别拿 0 当撤掉**。"""
         if scope not in BUDGET_SCOPES:
             return _no_such_scope(scope) + "什么都没动。"
         try:

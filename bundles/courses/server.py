@@ -12,22 +12,22 @@
 
 **没有 `write_note`(整篇覆盖)。** 一学期的笔记整篇覆盖太危险;`append` + `replace`
 够用,真要重构**用户直接编辑那个 `.md`**——那正是选文件而不是 SQLite 的理由。
-**代价**:本子会长。所以 `read_note` **必须分页**,而 `search_notes` 从"锦上添花"变成
+**代价**:本子会长。所以 `courses__read_note` **必须分页**,而 `courses__search_notes` 从"锦上添花"变成
 **主要入口**——找一段的正常姿势是搜,不是从头读。
 
 **路径不出现在接口上**:模型手里只有课程名,只有 `CourseStore.locate` 知道目录在哪
 (`test_no_tool_signature_has_a_path_parameter` 机械地钉着这一条,同 M6-5、同 M5-4)。
 
-**课件那一半(M6-6b)**:`add_file` / `list_materials` 追加在七个笔记工具之后,
+**课件那一半(M6-6b)**:`courses__add_file` / `courses__list_materials` 追加在七个笔记工具之后,
 读课件是 Steward 侧的 `read_pdf` / `read_image`。**只记归属,不拷字节**——归属表在
 `materials.py`,键是课程目录的相对路径,所以改名 / 删除 / 撤回在搬目录的同时把那一列
 改过去,回话里说一声几份课件跟着走了(没有课件的课,回话一个字不变)。
 **不转文字、不建缓存、不搜课件**(那是 6c,要用户拍板):两个新工具的 docstring 里
-没有一个字暗示课件能搜,`list_materials` 反而明说不在任何搜索范围里。
+没有一个字暗示课件能搜,`courses__list_materials` 反而明说不在任何搜索范围里。
 
 ★ **换行不用管**(M6-5 探针量过,真实字符串见 REVIEW):工具结果在**调用它的那一轮是
 逐字节原样进模型的**,组装器的折行与 200 字截断只作用在**历史轮**的 L0 回放。所以
-`read_note` 原样返回;反过来,**一行一条**的输出(课程列表、命中片段、删除理由)里嵌的
+`courses__read_note` 原样返回;反过来,**一行一条**的输出(课程列表、命中片段、删除理由)里嵌的
 文本必须自己折行(`docstore.one_line`)——当轮没有任何上游会替我们折。
 """
 
@@ -119,8 +119,8 @@ def _speak_errors(fn: Callable[..., str]) -> Callable[..., str]:
 def _missing(spot: CourseSpot) -> str:
     """「没有这门课」那句话。三个工具共用一份措辞,别让它们各自漂。"""
     return (
-        f"没有「{spot.name}」这门课。list_courses 看看有哪些;"
-        f'第一次记笔记用 append_to_note("{spot.name}", "……"),没有的课会顺手建出来。'
+        f"没有「{spot.name}」这门课。courses__list_courses 看看有哪些;"
+        f'第一次记笔记用 courses__append_to_note("{spot.name}", "……"),没有的课会顺手建出来。'
     )
 
 
@@ -133,7 +133,7 @@ def _material_name_error(name: str) -> str | None:
     伪造列表行靠渲染挡(折行 + 中和「」),不靠拒。
     """
     if not name:
-        return '课件名是空的,没归。给一个用户认得出的名字,比如 add_file("线性代数", id, "第3讲")。'
+        return '课件名是空的,没归。给一个用户认得出的名字,比如 courses__add_file("线性代数", id, "第3讲")。'
     if len(name) > MATERIAL_NAME_CHARS:
         return (
             f"课件名太长了({len(name)} 字,最多 {MATERIAL_NAME_CHARS} 字),没归。"
@@ -168,7 +168,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
             rows.append(f"- {name}(已删{tail})")
         if not rows:
             return (
-                '还没有哪门课的笔记。第一次记就 append_to_note("线性代数", "……")'
+                '还没有哪门课的笔记。第一次记就 courses__append_to_note("线性代数", "……")'
                 "——没有的课会顺手建出来,而回话里会说一声。"
             )
         shown, page, pages = page_of(rows, page, LIST_PER_PAGE)
@@ -181,7 +181,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         """读一门课的笔记本,**原样给你**——换行、表格、公式,文件里是什么样就是什么样。
 
         一本装不下就分页(page 从 1 起),第一行会说这是第几页、一共几页。
-        **本子长的时候别从头翻**:想找某一段用 search_notes,它会告诉你在第几页。
+        **本子长的时候别从头翻**:想找某一段用 courses__search_notes,它会告诉你在第几页。
         """
         spot = store.locate(course)
         if spot.folder is None or spot.notes is None:
@@ -190,9 +190,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
             return _missing(spot)
         text = store.read(spot.notes, label=spot.name)
         if not text.strip():
-            return (
-                f"「{spot.name}」这门课的笔记本还是空的,里面什么都没写。记第一段用 append_to_note。"
-            )
+            return f"「{spot.name}」这门课的笔记本还是空的,里面什么都没写。记第一段用 courses__append_to_note。"
         pages = paginate(text, NOTE_PAGE_CHARS)
         if len(pages) == 1:
             # 一页装得下就**什么都不加**:硬口径二是"写进去再读回来逐字节一致",
@@ -201,7 +199,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         shown, page, total = page_of(pages, page, 1)
         return (
             f"「{spot.name}」的笔记,第 {page}/{total} 页(整本 {len(text)} 字)。"
-            f"找某一段用 search_notes 更快,它会说在第几页:\n{shown[0]}"
+            f"找某一段用 courses__search_notes 更快,它会说在第几页:\n{shown[0]}"
         )
 
     def append_to_note(course: str, text: str) -> str:
@@ -209,7 +207,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
 
         原有内容一个字不动,text 接在末尾(需要的话自动补一个换行)。
         **这门课不存在时会顺手新建**,而回话里会说一声——名字打错了看到那句话就能
-        rename_course 改回来。
+        courses__rename_course 改回来。
         """
         spot = store.locate(course)
         if spot.folder is None or spot.notes is None:
@@ -230,14 +228,14 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         # **说一声才挡得住**——所以这句话是这条缺口的唯一防线。
         return (
             f"「{spot.name}」这门课之前没有,给你新建了,第一段记进去了"
-            f"({len(text)} 字)。要是课程名打错了,rename_course 能改过来。"
+            f"({len(text)} 字)。要是课程名打错了,courses__rename_course 能改过来。"
         )
 
     def replace_in_note(course: str, old: str, new: str) -> str:
         """把一门课笔记里的 old 换成 new(new 给空串就是删掉那一段)。
 
         **old 必须在笔记里恰好出现一次**:一次都没有、或者出现好几次,都**不改**并告诉你
-        为什么。所以 old 要贴原文、必要时多带前后一两行让它唯一(search_notes 能先看一眼
+        为什么。所以 old 要贴原文、必要时多带前后一两行让它唯一(courses__search_notes 能先看一眼
         有几处)。改完会把改动前后那一小段回给你,自己核对一眼。
         """
         spot = store.locate(course)
@@ -252,7 +250,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         if got.count == 0:
             return (
                 f"「{spot.name}」的笔记里没找到这段,一个字没动:{OPEN}{_inline(old)}{CLOSE}。"
-                f"可能这处已经改过了,也可能记错了原文——先 search_notes 搜一下再来。"
+                f"可能这处已经改过了,也可能记错了原文——先 courses__search_notes 搜一下再来。"
             )
         if got.text is None:
             # 多次命中**绝不允许"改第一处"**:那是在猜用户指的是哪一处,
@@ -275,11 +273,11 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
 
         不给 course 就搜所有课:回的是**哪门课**命中、在第几页、加一小段片段。
         给了 course 就在那一本里搜:回的是**在哪几处**、各在第几页。
-        两个问题不一样,所以答案的形状也不一样。拿到页码就可以 read_note(course, page)。
+        两个问题不一样,所以答案的形状也不一样。拿到页码就可以 courses__read_note(course, page)。
         """
         needle = query.strip()
         if not needle:
-            return '没说搜什么。给一个词,比如 search_notes("行列式")。'
+            return '没说搜什么。给一个词,比如 courses__search_notes("行列式")。'
         shown_query = _inline(needle)
         # course 给了空串 / 全空格也当"没给"(全搜):模型传一个 "" 多半是想说"都搜",
         # 为它回一句「课程名是空的」是在惩罚一个合理的调用。
@@ -303,12 +301,12 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         if src.name == dst.name:
             return f"新名字和「{src.name}」一样,没改。"
         if not src.folder.is_dir():
-            return f"没有「{src.name}」这门课,没改。list_courses 看看有哪些。"
+            return f"没有「{src.name}」这门课,没改。courses__list_courses 看看有哪些。"
         if dst.folder.is_dir():
             # ★ **合并比重名更坏:重名你看得见,合并是静默的。**
             return (
                 f"已经有「{dst.name}」这门课了,没改——改名会把两门课的笔记合到一起,"
-                f"而那是静默的破坏。两边都 read_note 看一眼,自己决定留哪份。"
+                f"而那是静默的破坏。两边都 courses__read_note 看一眼,自己决定留哪份。"
             )
         # M6-6b:**表先改、目录后搬,在同一个事务里**——搬失败(OSError)表就回滚,
         # 不会出现"归属到了新名字下、课却还叫老名字"。漏了这一步就是改名后课件凭空消失。
@@ -326,7 +324,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         (不写就不删,会让你补一句)。
 
         **不是真删**:整个课程目录搬到一边存着,
-        list_courses(include_deleted=True) 看得到。删错了就同一个课程名再调一次、
+        courses__list_courses(include_deleted=True) 看得到。删错了就同一个课程名再调一次、
         带 undo=True,原样回来(一个字节不变)——**撤回不用给 reason**,拿回来就是拿回来。
         """
         spot = store.locate(course)
@@ -336,11 +334,11 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
 
         if undo:
             if trashed is None:
-                return f"「{spot.name}」没删过,不用恢复。list_courses 看看现在有哪些。"
+                return f"「{spot.name}」没删过,不用恢复。courses__list_courses 看看现在有哪些。"
             if spot.folder.is_dir():
                 return (
                     f"已经有一门课占着「{spot.name}」这个名字了,没恢复——"
-                    f"盖上去会把现在那份弄丢。先给现在这门改个名(rename_course)再来。"
+                    f"盖上去会把现在那份弄丢。先给现在这门改个名(courses__rename_course)再来。"
                 )
             # 同改名:表先改回活着的键、目录后搬回来,一个事务。
             key = store.label(trashed)
@@ -360,7 +358,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
                 return (
                     f"「{spot.name}」已经删过了,现在没有这门课。要拿回来就再调一次、带 undo=True。"
                 )
-            return f"没有「{spot.name}」这门课,什么都没动。list_courses 看看有哪些。"
+            return f"没有「{spot.name}」这门课,什么都没动。courses__list_courses 看看有哪些。"
         live = store.label(spot.folder)
         moved = shelf.count(live)
         trashed = store.into_trash(spot.folder, spot.name, reason)
@@ -384,7 +382,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         )
 
     def add_file(course: str, media_id: str, name: str) -> str:
-        """把收到的一份文件(课件 PDF、板书照片)归到一门课下面,以后 list_materials 列得出来。
+        """把收到的一份文件(课件 PDF、板书照片)归到一门课下面,以后 courses__list_materials 列得出来。
 
         media_id 是附件那行报告里 `id` 后面那串十六进制,**整串照抄**;name 用用户的叫法
         (「第3讲」「期中复习提纲」),别拿 id 当名字。用户没说是哪门课的,先问一句,别猜。
@@ -414,7 +412,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
                 return (
                     f"「{spot.name}」下面已经有一份叫{OPEN}{_inline(label)}{CLOSE}的课件了"
                     f"(id {clash.media_id}),没归——同名的两份,之后谁也说不清指的是哪份。"
-                    "换个名字,或者 list_materials 看一眼。"
+                    "换个名字,或者 courses__list_materials 看一眼。"
                 )
             if clash is not None:
                 return (
@@ -434,7 +432,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         # ★ 同 append_to_note:打错课程名的唯一防线是说一声。
         return (
             f"「{spot.name}」这门课之前没有,给你新建了。{filed}"
-            "要是课程名打错了,rename_course 能改过来。"
+            "要是课程名打错了,courses__rename_course 能改过来。"
         )
 
     def list_materials(course: str, page: int = 1) -> str:
@@ -452,7 +450,7 @@ def _tool_functions(store: CourseStore, shelf: Materials) -> list[Callable]:
         if not listed:
             return (
                 f"「{spot.name}」下面还没有课件。收到文件后用 "
-                f'add_file("{spot.name}", id, "名字") 归进来。'
+                f'courses__add_file("{spot.name}", id, "名字") 归进来。'
             )
         rows = [f"- {OPEN}{_inline(m.name)}{CLOSE} · id {m.media_id}" for m in listed]
         shown, page, pages = page_of(rows, page, LIST_PER_PAGE)
@@ -501,14 +499,14 @@ def _search_one(
     if not spots:
         return (
             f"「{spot.name}」的笔记里没提到{OPEN}{shown_query}{CLOSE}。"
-            f"换个说法再试(搜的是笔记原文),或者 read_note 从头看一眼。"
+            f"换个说法再试(搜的是笔记原文),或者 courses__read_note 从头看一眼。"
         )
     pages = paginate(text, NOTE_PAGE_CHARS)
     rows, page, page_total = page_of(spots, page, SEARCH_PER_PAGE)
     capped = f",只列前 {NOTE_HIT_CAP} 处(把搜索词说具体一点)" if total > len(spots) else ""
     lines = [
         f"{OPEN}{shown_query}{CLOSE}在「{spot.name}」的笔记里命中 {total} 处{capped},"
-        f"第 {page}/{page_total} 页(只给片段,要读整段用 read_note):"
+        f"第 {page}/{page_total} 页(只给片段,要读整段用 courses__read_note):"
     ]
     for at in rows:
         fragment = excerpt(text, at, len(needle), SNIPPET_RADIUS)
@@ -519,7 +517,7 @@ def _search_one(
 def _search_all(store: CourseStore, needle: str, shown_query: str, page: int) -> str:
     """跨课搜:问的是"哪门课",所以**课程名必须出现在每一行**。
 
-    ★ 不然模型拿着一段片段不知道它在哪门课里,接不上 read_note。顺序由
+    ★ 不然模型拿着一段片段不知道它在哪门课里,接不上 courses__read_note。顺序由
     `docstore.scan` **写死**(名字命中在前,同一类里按课程名排),不跟着 `iterdir`
     的顺序走——那个在不同机器上不一样,而"第 1/3 页"会因此指着不同的东西。
     """
@@ -528,13 +526,13 @@ def _search_all(store: CourseStore, needle: str, shown_query: str, page: int) ->
     if not hits:
         return (
             f"没有哪门课的笔记提到{OPEN}{shown_query}{CLOSE}。换个说法再试(搜的是课程名和"
-            f"笔记原文),或者 list_courses 看全部(一共 {len(entries)} 门)。"
+            f"笔记原文),或者 courses__list_courses 看全部(一共 {len(entries)} 门)。"
         )
     by_name = dict(entries)
     rows, page, total = page_of(hits, page, SEARCH_PER_PAGE)
     lines = [
         f"{OPEN}{shown_query}{CLOSE}命中 {len(hits)} 门课,第 {page}/{total} 页"
-        f"(只给片段,要读整段用 read_note):"
+        f"(只给片段,要读整段用 courses__read_note):"
     ]
     for hit in rows:
         kind = "名字+内容" if hit.in_name and hit.in_text else ("名字" if hit.in_name else "内容")

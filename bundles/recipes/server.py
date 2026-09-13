@@ -18,17 +18,17 @@
 ★ **换行这件事,量过再说的**(M6-5 探针,真实字符串见 REVIEW):规划里写的是
 「我们的渲染器折行,所以做法整篇会变成一坨,这个 bundle 的全部内容都不可读」——
 **实测不是这样**。工具结果在**调用它的那一轮是逐字节原样进模型的**(探针 1:
-`read_recipe` 返回 278 字带换行的做法,HTTP body 里那条 `role=tool` 消息与原文
+`recipes__read_recipe` 返回 278 字带换行的做法,HTTP body 里那条 `role=tool` 消息与原文
 `==` 为 True);组装器的折行(`fold_text`)与 200 字截断只作用在**历史轮**的 L0 回放
 (探针 2)。所以:
 
-- `read_recipe` **什么都不做**,原样返回。把换行换成 `① ②` 之类反而会毁掉硬口径第一条
+- `recipes__read_recipe` **什么都不做**,原样返回。把换行换成 `① ②` 之类反而会毁掉硬口径第一条
   (「读回来和写进去逐字节一致」)——那两条本来就是互相排斥的,而实测说明该保的是前者。
 - 反过来,**一行一条**的输出(列表行、命中片段、删除理由)里嵌的文本必须自己折行:
   当轮那份没有任何上游会替我们折(`store.one_line`)。
 
 **存进来的做法是用户让存的,不是"经过核实的"**:它可能是用户让 `web_fetch` 抓一份菜谱
-存下来的,那一轮是脏的。`write_recipe` 写的是本 bundle 自己的库、不经门控——**这不是
+存下来的,那一轮是脏的。`recipes__write_recipe` 写的是本 bundle 自己的库、不经门控——**这不是
 漏洞**(门控管的是长期档案),但 docstring 要把这件事说清楚,而不是在这一步发明新守卫
 (M5-11)。
 """
@@ -111,7 +111,7 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
             rows.append(f"- {name}(已删{tail})")
         if not rows:
             return (
-                '还没存过做法。写一份用 write_recipe("番茄炒鸡蛋", "……")'
+                '还没存过做法。写一份用 recipes__write_recipe("番茄炒鸡蛋", "……")'
                 "——正文就是普通的 markdown,想怎么写怎么写。"
             )
         shown, page, pages = page_of(rows, page, LIST_PER_PAGE)
@@ -124,8 +124,8 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         """读一份做法,**原样给你**——换行、表格、符号,文件里是什么样就是什么样。
 
         存进来的做法是用户让存的,**不是"经过核实的"**:有可能是从网上抓下来存的,
-        照着做之前该自己过一眼。想改其中一处用 replace_in_recipe,补一句经验用
-        append_to_recipe。
+        照着做之前该自己过一眼。想改其中一处用 recipes__replace_in_recipe,补一句经验用
+        recipes__append_to_recipe。
         """
         loc = store.locate(name)
         if loc.path is None:
@@ -133,8 +133,8 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         text = store.read(loc.path)
         if text is None:
             return (
-                f"没有「{loc.name}」这道菜。list_recipes 看看存了哪些;"
-                f"要是名字打错了,rename_recipe 能改过来。"
+                f"没有「{loc.name}」这道菜。recipes__list_recipes 看看存了哪些;"
+                f"要是名字打错了,recipes__rename_recipe 能改过来。"
             )
         if not text.strip():
             return f"「{loc.name}」这道菜的文件是空的,里面什么都没写。"
@@ -143,8 +143,8 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
     def write_recipe(name: str, content: str) -> str:
         """写一份做法(整篇),content 是普通 markdown,随便写。
 
-        **同名会整篇覆盖,旧的那版不留**——所以只改一处的时候用 replace_in_recipe、
-        补一句经验用 append_to_recipe,别把整篇重打一遍。
+        **同名会整篇覆盖,旧的那版不留**——所以只改一处的时候用 recipes__replace_in_recipe、
+        补一句经验用 recipes__append_to_recipe,别把整篇重打一遍。
         这道菜不存在时**会新建**,而且回话里会说"之前没有这道"。
         """
         loc = store.locate(name)
@@ -162,7 +162,7 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         # 照样会创建,**说一声才挡得住**——显式 create 参数挡不住(它会照填 True)。
         return (
             f"之前没有「{loc.name}」这道菜,给你新建了({len(content)} 字)。"
-            f"要是名字打错了,rename_recipe 能改过来。"
+            f"要是名字打错了,recipes__rename_recipe 能改过来。"
         )
 
     def append_to_recipe(name: str, text: str) -> str:
@@ -179,9 +179,7 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         if old is None:
             # **隐式创建只留 write_recipe 一条路。** 两条路就是两次"打错字创建新菜",
             # 而追加那条路上连"给你新建了"这句话都不好说(用户以为是在往老的后面加)。
-            return (
-                f'没有「{loc.name}」这道菜,没法追加。要新建就用 write_recipe("{loc.name}", "……")。'
-            )
+            return f'没有「{loc.name}」这道菜,没法追加。要新建就用 recipes__write_recipe("{loc.name}", "……")。'
         separator = "" if old.endswith("\n") else "\n"
         store.save(loc.path, old + separator + text)
         return f"记在「{loc.name}」后面了:{OPEN}{_inline(text)}{CLOSE}。原来那些一个字没动。"
@@ -200,12 +198,12 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
             return f"old 是空的,没法定位改哪里,「{loc.name}」一个字没动。把要换掉的原文贴进 old。"
         text = store.read(loc.path)
         if text is None:
-            return f"没有「{loc.name}」这道菜,没改。list_recipes 看看存了哪些。"
+            return f"没有「{loc.name}」这道菜,没改。recipes__list_recipes 看看存了哪些。"
         got = replace_once(text, old, new)
         if got.count == 0:
             return (
                 f"「{loc.name}」里没找到这段,一个字没动:{OPEN}{_inline(old)}{CLOSE}。"
-                f"可能这处已经改过了,也可能记错了原文——先 read_recipe 看一眼再来。"
+                f"可能这处已经改过了,也可能记错了原文——先 recipes__read_recipe 看一眼再来。"
             )
         if got.text is None:
             # 多次命中**绝不允许"改第一处"**:那是在猜用户指的是哪一处,
@@ -227,21 +225,21 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         """搜菜名**和**正文:「我之前哪道菜写了要少放酱油」这种问题用它。
 
         回的是菜名 + 命中处附近的一小段,并标出命中的是名字还是内容(名字命中通常更强)。
-        **只给片段,要全文用 read_recipe。**
+        **只给片段,要全文用 recipes__read_recipe。**
         """
         needle = query.strip()
         if not needle:
-            return '没说搜什么。给一个词,比如 search_recipes("酱油")。'
+            return '没说搜什么。给一个词,比如 recipes__search_recipes("酱油")。'
         hits = scan(store.entries(), needle)
         shown = _inline(needle)
         if not hits:
             return (
                 f"没有哪道菜提到「{shown}」。换个说法再试(搜的是菜名和正文的原文),"
-                f"或者 list_recipes 看全部(一共 {len(store.names())} 道)。"
+                f"或者 recipes__list_recipes 看全部(一共 {len(store.names())} 道)。"
             )
         rows, page, pages = page_of(hits, page, SEARCH_PER_PAGE)
         lines = [
-            f"「{shown}」命中 {len(hits)} 道菜,第 {page}/{pages} 页(只给片段,要全文用 read_recipe):"
+            f"「{shown}」命中 {len(hits)} 道菜,第 {page}/{pages} 页(只给片段,要全文用 recipes__read_recipe):"
         ]
         for hit in rows:
             kind = (
@@ -265,11 +263,11 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         if src.name == dst.name:
             return f"新名字和「{src.name}」一样,没改。"
         if not src.path.is_file():
-            return f"没有「{src.name}」这道菜,没改。list_recipes 看看存了哪些。"
+            return f"没有「{src.name}」这道菜,没改。recipes__list_recipes 看看存了哪些。"
         if dst.path.is_file():
             return (
                 f"已经有「{dst.name}」这道菜了,没改——改名会把两份做法合到一起,"
-                f"而那是静默的破坏。两边都 read_recipe 看一眼,自己决定留哪份。"
+                f"而那是静默的破坏。两边都 recipes__read_recipe 看一眼,自己决定留哪份。"
             )
         store.move(src.path, dst.path)
         return f"「{src.name}」改名成「{dst.name}」了,正文一个字没动。"
@@ -278,7 +276,7 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         """删掉一道菜。**删的时候 reason 必填**:说清为什么删,三个月后回头看才看得懂
         (不写就不删,会让你补一句)。
 
-        **不是真删**:文件搬到一边存着,list_recipes(include_deleted=True) 看得到。
+        **不是真删**:文件搬到一边存着,recipes__list_recipes(include_deleted=True) 看得到。
         删错了就同一个菜名再调一次、带 undo=True,原样回来(内容逐字节不变)——
         **撤回不用给 reason**,拿回来就是拿回来。
         """
@@ -289,11 +287,11 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
 
         if undo:
             if not trashed.is_file():
-                return f"「{loc.name}」没删过,不用恢复。list_recipes 看看现在存了哪些。"
+                return f"「{loc.name}」没删过,不用恢复。recipes__list_recipes 看看现在存了哪些。"
             if live.is_file():
                 return (
                     f"已经有一道菜占着「{loc.name}」这个名字了,没恢复——"
-                    f"盖上去会把现在那份弄丢。先给现在这份改个名(rename_recipe)再来。"
+                    f"盖上去会把现在那份弄丢。先给现在这份改个名(recipes__rename_recipe)再来。"
                 )
             store.move(trashed, live)
             store.drop_reason(trashed)
@@ -307,7 +305,7 @@ def _tool_functions(store: RecipeStore) -> list[Callable]:
         if not live.is_file():
             if trashed.is_file():
                 return f"「{loc.name}」已经删过了,菜谱里没有它。要拿回来就再调一次、带 undo=True。"
-            return f"没有「{loc.name}」这道菜,什么都没动。list_recipes 看看存了哪些。"
+            return f"没有「{loc.name}」这道菜,什么都没动。recipes__list_recipes 看看存了哪些。"
         if trashed.is_file():
             # 覆盖它就是**把上一次删掉的那份销毁**,而"删掉的东西还能拿回来"正是这个
             # 工具的全部意义。宁可拒绝一次合法的删除,也不静默毁掉一份做法(M5-20)。

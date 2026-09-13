@@ -499,18 +499,21 @@ def wired_steward(tmp_path, monkeypatch, http_spy_factory):
             instructions=PAGE_TO_TEXT,
             sleep=naps or Naps(),
         )
+        registry = Registry.load(Path("bundles"))
+        memory = memory_tool_functions(gate)
         steward = Steward(
             settings=settings,
             inbox=inbox,
             journal=Journal(conn),
-            registry=Registry.load(Path("bundles")),
+            registry=registry,
             ledger=ledger,
             gate=gate,
             model=ChatModel(),
             persona="你是 Lararium。",
             outbox=Outbox(conn),
             threads=Threads(conn),
-            bundle_tools=memory_tool_functions(gate),
+            bundle_tools=registry.qualify_tools("memory", memory),
+            proposal_tool=memory.propose_fact,
             transcriber=transcriber,
         )
         return steward, transcriber

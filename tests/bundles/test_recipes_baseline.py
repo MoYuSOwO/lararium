@@ -23,11 +23,13 @@ import pytest
 from bundles.recipes.server import build
 
 # ── 基线 3e633fc 产出的金样 ───────────────────────────────────────────
+# M6-6d 在金样上做过**一处机械替换、只此一处**:句子里提到的工具名换成带前缀的名字
+# (`read_recipe` → `recipes__read_recipe`),别的字节一个没动。
 
 FLAT = "菜谱是平的一层,名字就是名字,不分类、不带层级。"
 BASELINE_NAME_ERRORS = {
-    "": '菜名是空的。给一个菜名,比如 read_recipe("番茄炒鸡蛋")。',
-    "   ": '菜名是空的。给一个菜名,比如 read_recipe("番茄炒鸡蛋")。',
+    "": '菜名是空的。给一个菜名,比如 recipes__read_recipe("番茄炒鸡蛋")。',
+    "   ": '菜名是空的。给一个菜名,比如 recipes__read_recipe("番茄炒鸡蛋")。',
     "../../etc/passwd": f"菜名里不能有「/」,这一道没存/没读。{FLAT}",
     "..": f"菜名里不能有「..」,这一道没存/没读。{FLAT}",
     "a/b": f"菜名里不能有「/」,这一道没存/没读。{FLAT}",
@@ -52,7 +54,7 @@ BASELINE_REPLACE_ONCE = "\n".join(
 )
 BASELINE_REPLACE_NONE = (
     "「番茄炒鸡蛋」里没找到这段,一个字没动:「先炸个鸡腿」。"
-    "可能这处已经改过了,也可能记错了原文——先 read_recipe 看一眼再来。"
+    "可能这处已经改过了,也可能记错了原文——先 recipes__read_recipe 看一眼再来。"
 )
 BASELINE_REPLACE_THRICE = (
     "这段在「腌肉」里出现了 3 次,一个字没动——不知道你指的是哪一处。"
@@ -74,19 +76,19 @@ BASELINE_LIST_WITH_DELETED = "\n".join(
 
 BASELINE_SEARCH_IN_TEXT = "\n".join(
     (
-        "「酱油」命中 1 道菜,第 1/1 页(只给片段,要全文用 read_recipe):",
+        "「酱油」命中 1 道菜,第 1/1 页(只给片段,要全文用 recipes__read_recipe):",
         "- 红烧肉(内容命中) 「# 红烧肉 冰糖一块,少放酱油」",
     )
 )
 BASELINE_SEARCH_BOTH = "\n".join(
     (
-        "「凉面」命中 1 道菜,第 1/1 页(只给片段,要全文用 read_recipe):",
+        "「凉面」命中 1 道菜,第 1/1 页(只给片段,要全文用 recipes__read_recipe):",
         "- 凉面(名字+内容命中) 「# 凉面 煮面水留一点」",
     )
 )
 BASELINE_SEARCH_NOTHING = (
     "没有哪道菜提到「佛跳墙」。换个说法再试(搜的是菜名和正文的原文),"
-    "或者 list_recipes 看全部(一共 1 道)。"
+    "或者 recipes__list_recipes 看全部(一共 1 道)。"
 )
 
 RECIPE = "1. 烫番茄去皮\n2. 打蛋 <<< 注意 >>>\n3. 一起炒\r\n"

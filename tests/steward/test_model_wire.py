@@ -562,3 +562,51 @@ def test_the_audit_itself_catches_a_broken_history():
 
     assert audit_history(orphan_result), "有结果没有调用,居然没查出来"
     assert audit_history(orphan_call), "有调用没有结果,居然没查出来"
+
+
+def _without_name(tool: dict[str, Any]) -> dict[str, Any]:
+    return {**tool, "function": {**tool["function"], "name": None}}
+
+
+async def test_the_prefix_changes_nothing_in_the_tool_schema_but_the_name(
+    wire, tmp_path, monkeypatch
+):
+    """★ M6-6d:工具名加前缀,**发出去的 `tools` 数组里除了 `name` 一个字节不许变**。
+
+    走生产组装根(`build_steward`)拿模型真收到的那一组工具,再顺着 `__wrapped__` 把每一个
+    剥回 bundle 交出来的原函数(内置工具剥回那个方法),两组各发一次,逐个比:
+    description、parameters、strict……全等;名字只许是"原名"或"manifest 名 + `__` + 原名"。
+    包装层(前缀、P0-1 守卫、断点续跑、ImageReturn 适配)哪一层动了签名或 docstring,这里就红。
+    """
+    import inspect
+
+    from bundles.memory.server import build_memory_components
+
+    from lararium.config import Settings
+    from lararium.gateway.server import build_steward
+
+    monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
+    settings = Settings.load()
+    ledger, gate = build_memory_components(settings.data_dir)
+    steward = build_steward(settings, ledger, gate)
+    wrapped = steward.all_tools()
+    raw = [inspect.unwrap(t) for t in wrapped]
+    # 剥不下来 = 两组是同一批对象,下面的"全等"就是自己跟自己比(假绿)
+    assert all(r is not w for r, w in zip(raw, wrapped, strict=True))
+
+    client, bodies = wire
+    ctx = AssembledContext(system_prompt=PREFIX, messages=[{"role": "user", "content": "你好"}])
+    await client.run(ctx, raw, [])
+    sent_raw = bodies[0]["tools"]
+    first = len(bodies)
+    await client.run(ctx, wrapped, [])
+    sent = bodies[first]["tools"]
+
+    legacy = steward.registry.legacy_tool_names()
+    assert len(sent) == len(sent_raw) == 40
+    for before, after in zip(sent_raw, sent, strict=True):
+        old, new = before["function"]["name"], after["function"]["name"]
+        assert new == legacy.get(old, old), f"{old} → {new}"
+        assert _without_name(after) == _without_name(before), f"{new} 的 schema 除了名字还变了别的"
+    renamed = sum(1 for b, a in zip(sent_raw, sent, strict=True) if b != a)
+    assert renamed == len(legacy) == 29, "只有 bundle 工具改了名;内置工具一个字节不动"
