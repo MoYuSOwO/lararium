@@ -262,7 +262,7 @@ ledger_history(时间戳, 全文快照, 来源[审批批次/手编导入/回滚]
 - **PDF 收到就转,转换不在回复路径上**(M6-6c)。任何一轮对话都可能读任何一份收到的 PDF,所以触发点在收件那一侧、和 bundle 无关;回复一个字节不等转换,后台一次一页、聊天在处理时让路。转出来的文字按 `(sha256, page)` 缓存,读出来和 `web_fetch` 走同一个出口(围栏 + 中和 + 来源标注)并拉不可信闩;页图每次重新渲染、每次重新送进上下文。**失败记不记在这一页头上,看的是怪不怪这一页**(CONVENTIONS E4):内容被拒判死,账号 / 余额 / 配置 / 限流不记账,分不清的封顶。
 - **安全守卫按对象身份认工具,不按名字**(M6-6d)。P0-1 那道防注入守卫原来靠 `__name__ == "propose_fact"` 认工具,给工具名加前缀之后静默脱落——亲眼测红过。现在沿 `__wrapped__` 链和组装根交来的原函数比 `is`,**认不出就拒绝启动**。任何「按名字决定要不要套安全机制」的写法都是同一个洞:名字是会被改的展示层。
 - **写操作确认**:v1 工具面 = 读查询 + 本地记录;任何触达外部世界的写(替用户发消息、支付、删外部数据)一律回到用户确认,无静默执行。
-- **代码执行面**:模型可用工具全量白名单、启动冻结。内置(M6 时点):`current_time` / `read_skill` / `search_history` / `recall_similar` / `open_thread` / `close_thread` / `list_threads` / `read_image` / `read_pdf` / `web_search` / `web_fetch`,加 Memory 工具与各 bundle 工具。**`python_sandbox` 还没做**(M6 推后:没有使用证据要它),所以下面那句「唯一代码执行面」目前描述的是一个不存在的东西——它的规格留着是因为 D12 把「无网络」绑成了门控成立的前提,做的时候不许松。
+- **代码执行面**:模型可用工具全量白名单、启动冻结。内置(M6 时点):`current_time` / `read_skill` / `search_history` / `recall_similar` / `open_thread` / `close_thread` / `list_threads` / `read_image` / `read_pdf` / `search_in_files` / `web_search` / `web_fetch`,加 Memory 工具与各 bundle 工具。**`python_sandbox` 还没做**(M6 推后:没有使用证据要它),所以下面那句「唯一代码执行面」目前描述的是一个不存在的东西——它的规格留着是因为 D12 把「无网络」绑成了门控成立的前提,做的时候不许松。
 - **密钥**:环境变量注入,仓库零密钥;provider 账密隔离在各自 bundle 容器,失陷面 = 单一数据源。
 
 ## 10. 关键决策记录
