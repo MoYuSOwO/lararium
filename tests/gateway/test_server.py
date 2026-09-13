@@ -90,6 +90,9 @@ def test_bundle_tool_order_memory_first_then_finance_then_recipes_then_courses(t
     **M6-6d 第四次改:29 个名字各加上自己 bundle 的前缀,顺序一格没动**(每行的注释
     位置号照旧)。名字是手写在这里的,**故意不从注册表推**——这条是前缀规则的独立对照,
     推出来的名字对着推出来的名字比,规则错了两边一起错。
+
+    **M6-7 第五次改,只在末尾加五个名字**:待办 bundle 整段追加在 courses 之后,前面 29 个
+    一格没动;测试名不再往后拼 bundle 名(已经长到不说明问题了,顺序看列表本身)。
     """
     from lararium.gateway.server import _assemble_bundle_tools
 
@@ -128,6 +131,11 @@ def test_bundle_tool_order_memory_first_then_finance_then_recipes_then_courses(t
         "courses__delete_course",  # courses[6]
         "courses__add_file",  # courses[7] —— M6-6b 课件,只追加在末尾
         "courses__list_materials",  # courses[8]
+        "todos__add_todo",  # todos[0] —— M6-7 待办,整段追加在 courses 之后
+        "todos__list_todos",  # todos[1]
+        "todos__complete_todo",  # todos[2]
+        "todos__update_todo",  # todos[3]
+        "todos__delete_todo",  # todos[4]
     ]
     # 守卫要认的那个对象就是 memory 交出来的原函数,不是哪个名字(M6-6d 第零个坑)
     assert inspect.unwrap(assembled.tools[0]) is assembled.proposal_tool
