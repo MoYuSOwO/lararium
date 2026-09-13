@@ -160,6 +160,9 @@ module = [
     # M6-7:待办表那一层(`Todo` / `Listing`、两个状态位各自的写法)。形状是我们定的,
     # 判据同 courses.materials;FastMCP 那一侧(`bundles/todos/server.py`)留宽松档。
     "bundles.todos.store",
+    # M6-8:夜间归拢自动跑(`slot_day` / `next_slot` / `judge` / `SweepDays` / `NightlySweep`)。
+    # 形状是我们定的,判定"该不该跑"的那几个小函数以后要搬给 M6-9,类型是搬家的安全网。
+    "lararium.steward.nightly",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

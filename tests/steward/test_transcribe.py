@@ -35,6 +35,7 @@ from lararium.steward.outbox import Outbox
 from lararium.steward.pdf import render_page
 from lararium.steward.pdftext import MAX_PAGE_ATTEMPTS, PdfText
 from lararium.steward.registry import Registry
+from lararium.steward.sweep import Sweeper
 from lararium.steward.threads import Threads
 from lararium.steward.transcribe import Transcriber, load_page_prompt
 
@@ -605,6 +606,11 @@ async def test_reading_a_page_that_is_not_converted_yet_does_not_call_the_model(
     assert "还没转完" in tool_result["content"], tool_result["content"]
 
 
+async def quiet_sweep(prompt: str) -> str:
+    """夜间归拢那一侧的模型(M6-8 起服务一起来它就跑):什么都不动,不联网。"""
+    return '{"open": [], "close": [], "suggest": []}'
+
+
 def test_the_server_starts_the_transcriber_and_a_posted_pdf_gets_converted(tmp_path, wired_steward):
     """组装根接线:HTTP 进来一条带 PDF 的消息 → worker 认领 → 叫醒 → lifespan 里那个
     后台任务转它。**哪一环没接上都是静默的**(PDF 永远只有图),所以走一遍真的。"""
@@ -619,6 +625,7 @@ def test_the_server_starts_the_transcriber_and_a_posted_pdf_gets_converted(tmp_p
         control_tokens={"cli": "tok-cli"},
         ingest_tokens={},
         wake=asyncio.Event(),
+        sweeper=Sweeper(steward.journal, steward.threads, steward.gate, quiet_sweep, "测试指令"),
     )
     attachment = pdf_attachment(digest)
 

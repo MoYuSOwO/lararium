@@ -29,7 +29,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from lararium.steward.sweep import build_sweep_runner, make_sweeper, render_event_line
+from lararium.steward.sweep import (
+    Sweeper,
+    SweepResult,
+    build_sweep_runner,
+    render_event_line,
+)
 
 logger = logging.getLogger("lararium")
 
@@ -68,14 +73,7 @@ class CompactResult:
     new_l1: str = ""
 
 
-# 归拢是**以结果返回**失败的(不抛),而 `SweepResult` 里没有结构化的失败位。这里只能认
-# 它摘要的前缀。耦合是真的,所以配了一条走真 Sweeper 的测试钉住它
-# (`test_sweep_failure_blocks_compression`)——sweep.py 哪天改了措辞,那条当场红。
-# 正经做法是给 `SweepResult` 加一个 failed 位,但 sweep.py 这一轮不归我动(M5-24 刚改完)。
-_SWEEP_FAILURE_PREFIXES = ("归拢失败", "归拢:模型输出不是")
-
-
-def _sweep_failed(result: Any) -> bool:
+def _sweep_failed(result: SweepResult) -> bool:
     """归拢**失败**(模型抛 / 输出解不开)算数,归拢**没扫完**(批数上限)不算数。
 
     分界的理由:
@@ -86,9 +84,10 @@ def _sweep_failed(result: Any) -> bool:
       那一条(M5-24),剩下的下次接着补。把它也当红灯的话,积压期间压缩永远轮不上
       ——而那正是上下文最满、最需要压的时候。
 
-    摘要为空(理论上到不了)按"没失败"算:宁可漏判一次,也不要凭一个空字符串挡住压缩。
+    M5-30 那一版认的是摘要前缀(`SweepResult` 当时没有结构化的失败位),并记下"下次动 sweep.py
+    时换掉";M6-8 夜间那一班也要读这一位,于是换成 `failed`。
     """
-    return str(getattr(result, "summary", "")).startswith(_SWEEP_FAILURE_PREFIXES)
+    return result.failed
 
 
 class Compactor:
@@ -308,16 +307,18 @@ def make_compactor(
     settings: Any,
     journal: Any,
     gate: Any,
-    threads: Any,
-    registry: Any,
-    ledger: Any = None,
+    *,
+    sweeper: Sweeper,
     notify: Callable[[str], None] | None = None,
 ) -> Compactor:
-    """组装根的压缩工厂:同一廉价模型 runner(切段)+ 复用 M3-5 的 Sweeper 做沉淀筛。"""
+    """组装根的压缩工厂:同一廉价模型 runner(切段)+ 复用 M3-5 的 Sweeper 做沉淀筛。
+
+    沉淀筛复用 M3-5 的 Sweeper,**不写第二份**——所以判据也自动是同一份(M5-23)。
+    M6-8 起连**实例**也是同一个(组装根造一个,手动 /sweep、夜间那一班、压缩共用):
+    `Sweeper.run` 的互斥锁在实例上,各造各的就等于没锁。
+    """
     cut_instructions = Path("prompts/cut.md").read_text(encoding="utf-8")
     runner = build_sweep_runner(settings)
-    # 沉淀筛复用 M3-5 的 Sweeper,**不写第二份**——所以判据也自动是同一份(M5-23)。
-    sweeper = make_sweeper(settings, journal, threads, gate, registry, ledger=ledger, notify=notify)
     return Compactor(
         journal,
         gate,

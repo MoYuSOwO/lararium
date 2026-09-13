@@ -38,7 +38,12 @@ from typing import Protocol
 
 from lararium.envelope import PDF_MEDIA_TYPE, SUFFIXES, Attachment, is_media_id
 from lararium.steward.journal import Journal
-from lararium.steward.model import ModelCallError, ModelReply
+from lararium.steward.model import (
+    NOT_THE_REQUEST_STATUS,
+    REQUEST_REJECTED_STATUS,
+    ModelCallError,
+    ModelReply,
+)
 from lararium.steward.pdf import RENDER_LONG_SIDE, UnreadablePdf, page_count, render_page
 from lararium.steward.pdftext import PdfText
 from lararium.steward.vision import ImagePart
@@ -113,8 +118,9 @@ def _unregistered_pdfs(media_dir: Path, known: set[str]) -> list[Path]:
 #   5xx / 超时 / 没有状态码   分不清是哪边                       → 照旧扣次数,封顶 MAX_PAGE_ATTEMPTS
 # 原来的写法把 401/403/404 当"明确拒了"当场判死、402/429 扣满三次判死:换一次 key、欠一次费
 # (DeepSeek 是预付费,402 是真会发生的),正在排队的那几页就**永久**只剩图,修好也救不回来。
-_PAGE_REJECTED = frozenset({400, 413, 422})
-_NOT_THIS_PAGE = frozenset({401, 402, 403, 404, 429})
+# 两张表住在 model.py(M6-8 夜间归拢要问同一个问题,一份表,不抄第二份)。
+_PAGE_REJECTED = REQUEST_REJECTED_STATUS
+_NOT_THIS_PAGE = NOT_THE_REQUEST_STATUS
 
 
 class Transcriber:
