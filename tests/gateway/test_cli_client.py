@@ -23,6 +23,7 @@ from lararium.steward.loop import Steward
 from lararium.steward.model import ModelReply
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
+from lararium.steward.sweep import Sweeper
 from lararium.steward.threads import Threads
 
 
@@ -32,6 +33,11 @@ class FakeModel:
 
     async def run(self, ctx, tools, mcp_servers):
         return ModelReply(text=self._text)
+
+
+async def quiet_sweep(prompt):
+    """夜间归拢那一侧的模型(M6-8 起服务一起来它就跑):什么都不动,不联网。"""
+    return '{"open": [], "close": [], "suggest": []}'
 
 
 class _UvicornServer:
@@ -85,6 +91,7 @@ def live_url(tmp_path, monkeypatch):
         control_tokens={"cli": "tok-cli"},
         ingest_tokens={},
         wake=asyncio.Event(),
+        sweeper=Sweeper(steward.journal, steward.threads, gate, quiet_sweep, "测试指令"),
     )
     srv = _UvicornServer(app)
     url = srv.start()

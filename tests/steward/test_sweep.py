@@ -686,3 +686,83 @@ async def test_a_filled_gap_does_not_get_swept_twice(sweeper_factory):
     assert again.skipped, "缺口补完之后再跑该是 no-op"
     assert len(calls) == 1, "模型只该被调一次"
     assert len(gate.pending()) == 1, "不因重跑重复提案"
+
+
+# ── M6-8:自动跑要从结果里读出"失败 / 没扫完",而且不能和手动的撞车 ─────────────
+
+
+async def test_a_sweep_result_says_failed_and_unfinished_as_fields_not_prose(
+    sweeper_factory, monkeypatch
+):
+    """夜间那条要按"怪不怪这一天"分头处置(E4),得拿到服务商的状态码;压缩要分"失败/没扫完"
+    (M5-30)。原来两样都只能从摘要措辞里认——一个叫「归拢失败」的话头就能骗过它。"""
+    from datetime import UTC, datetime, timedelta
+
+    from lararium.steward import sweep as sweep_module
+    from lararium.steward.model import ModelCallError
+
+    async def no_key(prompt):
+        raise ModelCallError("HTTP 401", retryable=False, status=401)
+
+    async def garbage(prompt):
+        return "这不是 JSON"
+
+    async def fine(prompt):
+        return '{"open": [], "close": [], "suggest": []}'
+
+    now = datetime.now(UTC)
+    since, until = (now - timedelta(hours=24)).isoformat(), now.isoformat()
+
+    sweeper, conn, _, _ = sweeper_factory(no_key)
+    _append_at(sweeper, conn, "env-1", "说了一句", now - timedelta(minutes=5))
+    result = await sweeper.run(since, until)
+    assert result.failed and result.status == 401
+
+    sweeper, conn, _, _ = sweeper_factory(garbage)
+    result = await sweeper.run(since, until)
+    assert result.failed and result.status is None
+
+    monkeypatch.setattr(sweep_module, "_PROMPT_CONVO_MAX_CHARS", 70)
+    monkeypatch.setattr(sweep_module, "_SWEEP_MAX_BATCHES", 1)
+    sweeper, conn, _, _ = sweeper_factory(fine)
+    _append_at(sweeper, conn, "env-2", "又说了一句" + "话" * 40, now - timedelta(minutes=4))
+    result = await sweeper.run(since, until)
+    assert not result.failed and result.unfinished, result.summary
+    result = await sweeper.run(since, until)
+    assert not result.failed and not result.unfinished, result.summary
+
+
+async def test_two_sweeps_at_once_do_not_feed_the_same_conversation_twice(sweeper_factory):
+    """手动 `/sweep`、夜间那一班、压缩里的沉淀筛**是同一个 Sweeper**,可能同时被叫到
+    (最常见的一次就是上线那一刻:补跑刚开始,人正好敲了一句 /sweep 看看)。
+
+    没有互斥时,两次都读到同一个光标、把同一段对话各喂一遍——提案成双出现。
+    """
+    import asyncio
+    from datetime import UTC, datetime, timedelta
+
+    prompts: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(prompt):
+        prompts.append(prompt)
+        entered.set()
+        await release.wait()
+        return json.dumps({"open": [], "close": [], "suggest": ["在上学"]})
+
+    sweeper, conn, gate, _ = sweeper_factory(slow)
+    now = datetime.now(UTC)
+    _append_at(sweeper, conn, "env-1", "我还在上学", now - timedelta(minutes=5))
+    since, until = (now - timedelta(hours=24)).isoformat(), now.isoformat()
+
+    first = asyncio.create_task(sweeper.run(since, until))
+    await asyncio.wait_for(entered.wait(), timeout=3)
+    second = asyncio.create_task(sweeper.run(since, until))
+    await asyncio.sleep(0.05)  # 给第二个充足的时间挤进来
+    release.set()
+    _, again = await asyncio.wait_for(asyncio.gather(first, second), timeout=3)
+
+    fed = sum("我还在上学" in p for p in prompts)
+    assert fed == 1, f"同一段对话被喂了 {fed} 遍"
+    assert again.skipped and len(gate.pending()) == 1

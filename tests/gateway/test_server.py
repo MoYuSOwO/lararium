@@ -15,6 +15,7 @@ from lararium.steward.loop import Steward
 from lararium.steward.model import ModelReply
 from lararium.steward.outbox import Outbox
 from lararium.steward.registry import Registry
+from lararium.steward.sweep import Sweeper
 from lararium.steward.threads import Threads
 
 
@@ -34,8 +35,24 @@ TOKENS = {"cli": "tok-cli", "web": "tok-web"}  # 控制端(你):全权
 INGEST_TOKENS = {"smsforwarder": "tok-ingest"}  # 数据面来源:只准 POST /v1/messages
 
 
+class SweepModel:
+    """归拢那一侧的模型(第三方边界):记下每次喂了什么,回一个什么都不动的计划。不联网。"""
+
+    def __init__(self):
+        self.prompts = []
+
+    async def __call__(self, prompt):
+        self.prompts.append(prompt)
+        return '{"open": [], "close": [], "suggest": []}'
+
+
 @pytest.fixture
-def server(tmp_path, monkeypatch):
+def sweep_model():
+    return SweepModel()
+
+
+@pytest.fixture
+def server(tmp_path, monkeypatch, sweep_model):
     monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
     monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
     settings = Settings.load()
@@ -65,6 +82,7 @@ def server(tmp_path, monkeypatch):
         control_tokens=TOKENS,
         ingest_tokens=INGEST_TOKENS,
         wake=wake,
+        sweeper=Sweeper(steward.journal, steward.threads, gate, sweep_model, "测试指令"),
     )
     # 不用 TestClient 上下文(不进 lifespan),worker 不启动——API 契约测试保持确定性。
     return app, steward
@@ -648,3 +666,40 @@ def test_malformed_attachments_are_400_and_never_reach_the_db(server, attachment
     )
     assert r.status_code == 400
     assert steward.inbox.conn.execute("SELECT COUNT(*) FROM inbox").fetchone()[0] == 0
+
+
+def test_the_nightly_sweep_starts_with_the_server_and_shares_the_command_sweeper(
+    server, sweep_model
+):
+    """★ 组装根接线(M6-8):服务起来,夜间那一班就在 lifespan 里跑——库里没有今天那一班的
+    记录,起来就补;手动 `/sweep` 走的是**同一个** Sweeper(模型那一侧只有一个,调用都记在它
+    身上),而且手动跑**不算**"今天跑过"(不写 sweep_days)。哪一环没接上都是静默的。
+    """
+    import time
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from lararium.steward.nightly import SweepDays, slot_day
+
+    app, steward = server
+    steward.journal.append("env-1", "envelope", {"content": "今天食堂 12 块"})
+    days = SweepDays(steward.inbox.conn)
+    today = slot_day(datetime.now(UTC), ZoneInfo(steward.settings.timezone))
+
+    with TestClient(app) as client:
+        for _ in range(300):
+            if days.finished(today):
+                break
+            time.sleep(0.01)
+        assert days.finished(today), "服务起来了,夜间那一班却没跑"
+        assert len(sweep_model.prompts) == 1 and "食堂 12 块" in sweep_model.prompts[0]
+
+        steward.journal.append("env-2", "envelope", {"content": "下周三线代期中考"})
+        r = client.post(
+            "/v1/commands", json={"line": "/sweep"}, headers={"Authorization": "Bearer tok-cli"}
+        )
+
+    assert r.status_code == 200 and r.json()["text"].startswith("归拢完成"), r.text
+    assert len(sweep_model.prompts) == 2 and "线代期中考" in sweep_model.prompts[1]
+    rows = steward.inbox.conn.execute("SELECT day, runs, outcome FROM sweep_days").fetchall()
+    assert [tuple(r) for r in rows] == [(today.isoformat(), 0, "done")], "手动那次写进了 sweep_days"

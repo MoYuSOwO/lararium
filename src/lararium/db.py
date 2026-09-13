@@ -79,6 +79,17 @@ CREATE TABLE IF NOT EXISTS notice_log (
     date TEXT PRIMARY KEY
 );
 
+-- M6-8:夜间归拢自动跑,**一天一行**。"今天跑过没有"只看这里——放内存里的话重启一次就重跑一次,
+-- 崩了再起再崩就是重试到死。只有自动那一班写它,手动 /sweep 不写(见 steward/nightly.py)。
+CREATE TABLE IF NOT EXISTS sweep_days (
+    day        TEXT PRIMARY KEY,             -- 配置时区下的日期:这一天 04:00 那一班
+    runs       INTEGER NOT NULL DEFAULT 0,   -- 没扫完、当晚接着跑过几次
+    failures   INTEGER NOT NULL DEFAULT 0,   -- 记在这一天头上的失败(账号/余额/限流不记)
+    outcome    TEXT,                         -- NULL = 还没了结;done | unfinished | failed
+    note       TEXT NOT NULL DEFAULT '',     -- 最后一次的摘要,给人查
+    updated_at TEXT NOT NULL
+);
+
 -- M3-6 压缩:M3-3 之后的命根子是 append-only(起居注只增不改),压缩**不删正文**,
 -- 只是把"已压成索引"的信封标记掉(退出 L0 一线),索引行单独一张表供 assemble 当 l1。
 -- M4-8:前缀区指纹的变更史。改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么

@@ -12,6 +12,7 @@ import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -42,9 +43,11 @@ from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.model import PydanticAIClient
+from lararium.steward.nightly import NightlySweep, SweepDays
 from lararium.steward.outbox import Outbox
 from lararium.steward.pdftext import PdfText
 from lararium.steward.registry import Registry
+from lararium.steward.sweep import Sweeper, make_sweeper, nominal_window
 from lararium.steward.threads import Threads
 from lararium.steward.transcribe import Transcriber, load_page_prompt
 from lararium.steward.worker import Worker
@@ -193,6 +196,7 @@ def create_app(
     control_tokens: dict[str, str],
     ingest_tokens: dict[str, str],
     wake: asyncio.Event,
+    sweeper: Sweeper,
 ) -> Starlette:
     """纯组装,可测。token 分能力两类(M2-5 补做):
 
@@ -206,6 +210,10 @@ def create_app(
     ledger/gate 由 Memory bundle 提供,这里只调用它的少量方法(如
     gate.unsettled_count),形状归 bundle 管——组装根的适配接口,和 build_steward
     里的 ledger/gate 一样不定死类型。
+
+    `sweeper` 是这个进程**唯一的** Sweeper(M6-8):手动 `/sweep`、lifespan 里的夜间那一班、
+    压缩里的沉淀筛都用它——`run` 的互斥锁在实例上,各造各的就等于没锁。由外面传进来而不是
+    在这里造,是因为它是唯一真会去调模型的那一块:测试把模型那一侧换掉,别的全是真的。
     """
 
     def authenticate(request: Request) -> tuple[str, str] | None:
@@ -253,15 +261,12 @@ def create_app(
         # P1-3:注入带日限的通知器,压缩被屏障停/归拢提提案时用户能收到消息(别堵死没人知)。
         from lararium.steward.compact import make_compactor
 
-        notify = _push_notifier(steward)
         compactor = make_compactor(
             steward.settings,
             steward.journal,
             gate,
-            steward.threads,
-            steward.registry,
-            ledger=steward.ledger,
-            notify=notify,
+            sweeper=sweeper,
+            notify=_push_notifier(steward),
         )
         worker = Worker(steward, wake, compactor=compactor)
         tasks = [asyncio.create_task(worker.run())]
@@ -269,6 +274,14 @@ def create_app(
         # 会把后面所有消息堵住。它启动时先扫一遍池子,重启前转到一半的、6c 之前就收到的都会续上。
         if steward.transcriber is not None:
             tasks.append(asyncio.create_task(steward.transcriber.run()))
+        # M6-8:夜间归拢同样并排跑、同样给聊天让路。它起来先看一眼库:最近那一班没了结就补。
+        nightly = NightlySweep(
+            sweeper=sweeper,
+            days=SweepDays(steward.threads.conn),
+            chat_busy=steward.inbox.has_unfinished,
+            timezone=steward.settings.timezone,
+        )
+        tasks.append(asyncio.create_task(nightly.run()))
         try:
             yield
         finally:
@@ -422,28 +435,9 @@ def create_app(
         if line.strip() == "/sweep":
             # M3-5 夜间归拢:手动命令(占时,需要模型)。归拢**只写话头和 pending 提案**,
             # 账本写入永远走 Gate.settle;模型输入输出都落起居注(sweep.sweep 内部做)。
-            from datetime import UTC as _UTC
-            from datetime import datetime as _dt
-            from datetime import timedelta as _td
-
-            from lararium.steward.sweep import make_sweeper
-
-            notify = _push_notifier(steward)
-            now = _dt.now(_UTC)
-            sweeper = make_sweeper(
-                steward.settings,
-                steward.journal,
-                steward.threads,
-                gate,
-                steward.registry,
-                ledger=steward.ledger,
-                notify=notify,
-            )
-            # since 只是这次触发的名义窗口(留进起居注当由头),**不是扫描下界**——
-            # 下界是光标,没归拢过的历史再老也要补(M5-24)。改这里的 24 小时不影响扫哪一段。
-            sweep_result = await sweeper.run(
-                since=(now - _td(hours=24)).isoformat(), until=now.isoformat()
-            )
+            # M6-8:和夜间那一班是**同一个实例的同一个 run**;手动的不算"今天跑过"(见 nightly.py)。
+            # 夜间那一班正在跑时,这里等它跑完再读光标——喂过的不会再喂一遍。
+            sweep_result = await sweeper.run(*nominal_window(datetime.now(UTC)))
             return JSONResponse({"text": sweep_result.summary}, status_code=200)
 
         if line.strip() == "/compact":
@@ -451,15 +445,12 @@ def create_app(
             # GatePort 不放 propose,单写者编进类型);上下文未顶满时 no-op。
             from lararium.steward.compact import make_compactor
 
-            notify = _push_notifier(steward)
             compactor = make_compactor(
                 steward.settings,
                 steward.journal,
                 gate,
-                steward.threads,
-                steward.registry,
-                ledger=steward.ledger,
-                notify=notify,
+                sweeper=sweeper,
+                notify=_push_notifier(steward),
             )
             compact_summary = await steward.maybe_compact(compactor)
             return JSONResponse({"text": compact_summary or "上下文未满,无需压缩"}, status_code=200)
@@ -490,6 +481,16 @@ def main() -> None:
         control_tokens=settings.control_tokens,
         ingest_tokens=settings.ingest_tokens,
         wake=wake,
+        # 这个进程唯一的 Sweeper(M6-8):廉价模型 runner + sweep.md + writing-facts 判据。
+        sweeper=make_sweeper(
+            settings,
+            steward.journal,
+            steward.threads,
+            gate,
+            steward.registry,
+            ledger=ledger,
+            notify=_push_notifier(steward),
+        ),
     )
     uvicorn.run(app, host=settings.bind_host, port=settings.bind_port)
 

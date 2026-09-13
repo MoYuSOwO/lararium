@@ -22,14 +22,19 @@ now-24h~now,区间永远不同,按区间字符串一秒三次 → 模型调三�
 反复提已入档的事实,那些和重复提交的提案一起把 pending 堵死,压缩又被自己挡住(死循环)。
 
 **失败不影响主循环**:模型调用失败 / 输出不是 JSON → 返回一句可读说明,不抛。
+
+**一个进程一个 Sweeper,`run` 互斥(M6-8)**:手动 `/sweep`、夜间那一班、压缩里的沉淀筛
+共用同一个实例。三条路可能同时到(上线那一刻补跑刚开始、人正好敲了一句 /sweep),
+不互斥的话两边读到同一个光标,同一段对话各喂一遍,提案成双。
 """
 
+import asyncio
 import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -37,6 +42,7 @@ from zoneinfo import ZoneInfo
 from lararium.db import transaction
 from lararium.envelope import Envelope
 from lararium.steward.assembler import FENCE_CLOSE, FENCE_OPEN, fold_text, neutralize_fence
+from lararium.steward.model import ModelCallError
 
 # 推送信封的"由头"正文。**固定常量**:它每次都一样,进 L0 后逐字稳定;
 # 写成"系统自己开口"的形态,而不是把推送正文塞进这里——正文是**回复**,由头是**触发**。
@@ -69,6 +75,21 @@ class SweepResult:
     closed: list[str] = field(default_factory=list)
     suggested: int = 0
     skipped: bool = False  # 幂等跳过(true 时不调模型、不改任何东西)
+    # M6-8:下面三个原来只写在 summary 的措辞里。压缩要分"失败 / 没扫完"(M5-30,原来认的是
+    # 摘要前缀),夜间那一班还要按状态码分"怪不怪这一天"(E4)——从措辞里认,一个叫「归拢失败」
+    # 的话头就能骗过它。
+    failed: bool = False  # 模型调用抛了 / 输出解不开:这次没跑成(中途失败时前面几批照样算数)
+    status: int | None = None  # 失败时服务商回的 HTTP 状态码;没有就是 None
+    unfinished: bool = False  # 没失败,但撞了批数或取数上限,还有没喂进去的
+
+
+def nominal_window(now: datetime) -> tuple[str, str]:
+    """一次触发的名义窗口 `(now-24h, now)`,手动 `/sweep` 和夜间那一班共用。
+
+    **`since` 不决定扫哪一段**(M5-24):下界是光标,since 只落进起居注当由头。
+    写成函数只是为了两处不各写一份"24 小时"。
+    """
+    return (now - timedelta(hours=24)).isoformat(), now.isoformat()
 
 
 def render_event_line(e) -> str:
@@ -117,6 +138,8 @@ class Sweeper:
         self._notify = notify or (lambda _text: None)
         # journal/threads/gate 同库;用 threads.conn(公开口)做 sweep_state 光标
         self._conn = threads.conn
+        # M6-8:`run` 互斥(见模块 docstring 末段)。锁在实例上,所以组装根只造一个实例。
+        self._running = asyncio.Lock()
 
     def _cursor(self) -> int:
         """已归拢覆盖到的最大 journal seq(P1-1 内容幂等)。"""
@@ -190,7 +213,14 @@ class Sweeper:
         **`since` 不再决定扫哪一段**(M5-24):它只是这次触发的名义窗口,留进起居注和
         摘要里当由头。下界只能是光标——按时间取下界的那版会把 `光标 < seq < 窗口下界`
         那一段整段跳过,而且光标只增不减,跳过去就再也回不来。
+
+        **同一个实例上的 run 一次只跑一个**(M6-8):后到的等前一个跑完,再读光标——
+        读到的已经是推过的那个,喂过的不会再喂。
         """
+        async with self._running:
+            return await self._run(since, until)
+
+    async def _run(self, since: str, until: str) -> SweepResult:
         cursor = self._cursor()
         pending = self._journal.events_after_seq(cursor, until, limit=_SCAN_LIMIT)
         batches = self._batches(pending)
@@ -209,6 +239,7 @@ class Sweeper:
         closed: list[str] = []
         suggested = 0
         stopped = ""
+        status: int | None = None
         fed = 0
         for index, batch in enumerate(batches, start=1):
             # 话头每批重取:上一批开/关过的,这一批的模型要看到最新的那份。
@@ -241,6 +272,7 @@ class Sweeper:
                     },
                 )
                 stopped = f"归拢失败(不影响对话):{type(exc).__name__}"
+                status = exc.status if isinstance(exc, ModelCallError) else None
                 break
             self._journal.append(sweep_id, "sweep", {**span, "phase": "output", "content": output})
 
@@ -272,7 +304,15 @@ class Sweeper:
             summary += f";还有 {amount} 条没扫完,再跑一次 /sweep 接着补"
         elif maybe_more:
             summary += f";这次取满了 {_SCAN_LIMIT} 条上限,可能还有没扫完的,再跑一次 /sweep"
-        return SweepResult(summary=summary, opened=opened, closed=closed, suggested=suggested)
+        return SweepResult(
+            summary=summary,
+            opened=opened,
+            closed=closed,
+            suggested=suggested,
+            failed=bool(stopped),
+            status=status,
+            unfinished=not stopped and (left > 0 or maybe_more),
+        )
 
     def _apply(self, plan, opened: list[str], closed: list[str]) -> None:
         """只写话头,绝不动账本正文(Gate.settle 是唯一写路径)。"""

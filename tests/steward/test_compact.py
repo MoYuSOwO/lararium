@@ -409,8 +409,8 @@ async def test_sweep_failure_blocks_compression(compact_factory):
     第 4 步「审批屏障再查」存在的理由正是"沉淀筛刚提的新 pending 也不能毁证据";
     筛子**根本没跑成**的时候,那一步查到的 0 条是**假的安全**。
 
-    这条同时钉住了 compact 认定"归拢失败"的判据(它只能从 SweepResult.summary 认):
-    sweep.py 哪天改了那句措辞,这条当场红。
+    这条同时钉住了 compact 认定"归拢失败"的判据。M5-30 那版认的是摘要前缀;M6-8 起是
+    `SweepResult.failed`——走的仍是真 Sweeper,sweep.py 哪天不再置这一位,这条当场红。
     """
 
     async def cut(p):
