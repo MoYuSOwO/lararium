@@ -107,7 +107,7 @@ MEDIA_ID_RE = re.compile(r"^[0-9a-f]{6,64}$")
 
 def is_media_id(text: str) -> bool:
     """整串是不是一个媒体 id。**整串匹配**,不是 `MEDIA_ID_RE.match`:`$` 会放过末尾一个
-    换行,而 `add_file` 要把 id 存进表、之后渲染进一行一条的列表——带着换行进去就能伪造出
+    换行,而 `courses__add_file` 要把 id 存进表、之后渲染进一行一条的列表——带着换行进去就能伪造出
     下一行。(`read_image` 用的是 `.match`,M6-6b 按"行为逐字节不变"没动它:在它那里末尾
     换行只会让 glob 找不到文件,回一句"没找到"。)"""
     return MEDIA_ID_RE.fullmatch(text) is not None

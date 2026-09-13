@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from fastmcp import FastMCP
 
@@ -33,13 +34,26 @@ def read_ledger(data_dir: Path) -> str:
     return ledger.read()
 
 
-def memory_tool_functions(gate: Gate) -> list[Callable]:
+class MemoryTools(NamedTuple):
+    """Memory 交出来的两个工具,**按字段名拿,不按工具名认**(M6-6d 第零个坑)。
+
+    组装根要把提案那个函数**对象**交给 Steward 去套 P0-1 守卫(不可信轮强制降档)。
+    原来 Steward 拿 `__name__` 和一个字符串字面量比,注册时一加前缀那个 `if` 就永远不成立,
+    守卫整个脱落,而且不报错。字段是 mypy 看得见的属性,改名改不掉它;
+    它仍然是个元组,迭代出来就是冻结顺序的工具列表(`for fn in ...`、`[0]` 照旧能用)。
+    """
+
+    propose_fact: Callable[..., str]
+    list_pending: Callable[..., list[dict]]
+
+
+def memory_tool_functions(gate: Gate) -> MemoryTools:
     """**模型能碰的** Memory 工具,唯一定义处。进程内挂载与 MCP 注册共用,
     避免两条路径漂移。顺序固定——工具 schema 是前缀第0层(DESIGN §4)。
 
     这里**只有两个**,而且都不能直接改账本:
-    - `propose_fact` 只能把内容放进 pending 隔离区;
-    - `list_pending` 只读。
+    - `memory__propose_fact` 只能把内容放进 pending 隔离区;
+    - `memory__list_pending` 只读。
 
     审批(resolve)、结算(settle)、回滚(rollback)一律**不在这个列表里**。
     它们是 `Gate` / `Ledger` 的普通方法,只由 CLI 命令(M1)或 IM 按钮回调(M2)调用
@@ -91,10 +105,14 @@ def memory_tool_functions(gate: Gate) -> list[Callable]:
             for p in gate.pending()
         ]
 
-    return [propose_fact, list_pending]
+    return MemoryTools(propose_fact=propose_fact, list_pending=list_pending)
 
 
 def create_server(data_dir: Path) -> FastMCP:
+    """MCP 形状(以后拆容器用)。**工具注册裸名**:命名空间是 MCP 客户端的事——客户端把服务名
+    接在前面(Claude Code 的 `mcp__<服务>__<工具>`、pydantic-ai 的 `.prefixed()`),服务端
+    再带一份前缀就成了双重前缀。拆容器那天,Steward 那一侧照注册表的同一条规则把名字拼成
+    `memory__propose_fact`,回话里引用的名字才对得上。"""
     _, gate = build_memory_components(data_dir)
     mcp = FastMCP("memory")
     for fn in memory_tool_functions(gate):

@@ -337,7 +337,7 @@ def test_a_course_without_materials_keeps_the_old_replies(tools):
         "「线性待数」改名成「线性代数」了。整个课程目录一起搬的,内容一个字节没动。"
     )
     assert tools["delete_course"]("线性代数", undo=True) == (
-        "「线性代数」没删过,不用恢复。list_courses 看看现在有哪些。"
+        "「线性代数」没删过,不用恢复。courses__list_courses 看看现在有哪些。"
     )
     tools["delete_course"]("线性代数", "退课了")
     assert tools["delete_course"]("线性代数", undo=True) == "「线性代数」拿回来了,一个字节没变。"

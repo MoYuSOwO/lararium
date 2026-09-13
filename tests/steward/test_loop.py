@@ -38,7 +38,9 @@ class FakeModel:
 
 @pytest.fixture
 def steward_factory(tmp_path, monkeypatch):
-    def make(replies=None, *, vision=False):
+    def make(replies=None, *, vision=False, bundle_tools=None):
+        """M6-6d:memory 工具照生产组装根的形状挂——加前缀、把原函数交给守卫去认。
+        `bundle_tools(memory, registry)` 给想换一种挂法的测试用(改名 / 多包一层)。"""
         monkeypatch.setenv("LARARIUM_API_KEY", "sk-test")
         monkeypatch.setenv("LARARIUM_DATA_DIR", str(tmp_path))
         monkeypatch.setenv("LARARIUM_VISION", "on" if vision else "off")
@@ -46,18 +48,22 @@ def steward_factory(tmp_path, monkeypatch):
         conn = connect(tmp_path / "steward.sqlite")
         ledger, gate = build_memory_components(tmp_path)
         model = FakeModel(replies or [])
+        registry = Registry.load(Path("bundles"))
+        memory = memory_tool_functions(gate)
+        mount = bundle_tools or (lambda m, r: r.qualify_tools("memory", m))
         steward = Steward(
             settings=settings,
             inbox=Inbox(conn),
             journal=Journal(conn),
-            registry=Registry.load(Path("bundles")),
+            registry=registry,
             ledger=ledger,
             gate=gate,
             model=model,
             persona="你是 Lararium。",
             outbox=Outbox(conn),
             threads=Threads(conn),
-            bundle_tools=memory_tool_functions(gate),
+            bundle_tools=mount(memory, registry),
+            proposal_tool=memory.propose_fact,
         )
         return steward, model
 
@@ -78,7 +84,7 @@ async def test_process_next_returns_none_when_inbox_empty(steward_factory):
 
 
 async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_factory):
-    """模型必须真能调到 propose_fact,否则门控在真实对话里根本走不通。"""
+    """模型必须真能调到 memory__propose_fact,否则门控在真实对话里根本走不通。"""
     steward, model = steward_factory([ModelReply(text="好")])
     steward.submit(Envelope.new(source="user", channel="cli", content="你好"))
     await steward.process_next()
@@ -107,8 +113,9 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         # M6-6b:read_pdf 同样追加在内置那一段的末尾,不挪到 read_image 旁边
         # (M6-6b 为此改了这条测试:只加这一个名字,前后顺序一个没动)。
         "read_pdf",
-        "propose_fact",
-        "list_pending",
+        # M6-6d:bundle 工具带上 manifest 名做前缀;内置工具不加(它们是主控自己的)。
+        "memory__propose_fact",
+        "memory__list_pending",
     ]
 
 
@@ -117,8 +124,12 @@ async def test_turn_is_fully_recorded_in_journal(steward_factory):
     reply = ModelReply(
         text="记下了",
         tool_events=[
-            {"type": "tool_call", "tool": "propose_fact", "args": {"content": "对芒果过敏"}},
-            {"type": "tool_result", "tool": "propose_fact", "content": "已记下"},
+            {
+                "type": "tool_call",
+                "tool": "memory__propose_fact",
+                "args": {"content": "对芒果过敏"},
+            },
+            {"type": "tool_result", "tool": "memory__propose_fact", "content": "已记下"},
         ],
         cache_hit_tokens=512,
         prompt_tokens=1024,
@@ -645,7 +656,7 @@ async def test_p0_propose_downgraded_when_round_untrusted(steward_factory):
     """P0-1 纵深:本轮信封不可信时,模型传 user_stated 也被强制降档 untrusted →
     落 pending 待审,绝不自动放行;可信轮不受影响。"""
     steward, _ = steward_factory([ModelReply(text="好")])
-    propose = next(f for f in steward.all_tools() if f.__name__ == "propose_fact")
+    propose = next(f for f in steward.all_tools() if f.__name__ == "memory__propose_fact")
     # M5-11:领域工具第一次被调用前要先读该领域总览,否则第一次调用只会拿到一句提示。
     # 先读一遍再测降档——这条测的是**降档**,不是路由守卫。
     next(f for f in steward.all_tools() if f.__name__ == "read_skill")("memory")
@@ -662,6 +673,57 @@ async def test_p0_propose_downgraded_when_round_untrusted(steward_factory):
     steward._active_untrusted = False  # 可信轮:维持自动放行(不进 pending)
     propose(kind="add", content="我在备考雅思", provenance="user_stated", section="正在进行")
     assert len(steward.gate.pending()) == 1, "可信轮 proposa 不应进 pending(user_stated 自动放行)"
+
+
+def _renamed(fn, name):
+    import functools
+
+    @functools.wraps(fn)
+    def renamed(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    renamed.__name__ = name
+    return renamed
+
+
+async def test_the_guard_finds_propose_fact_by_identity_not_by_name(steward_factory):
+    """★ M6-6d 第零个坑:守卫认的是 memory 交出来的**那个函数对象**,不是哪个名字。
+
+    判据是"下一次谁改名、谁换包装顺序,它都不会悄悄脱落":这里把它换成一个没人用过的
+    前缀,再在外面多包一层——守卫照样得套上。按字符串认(哪怕对着今天的新名字)
+    在这里就脱落了。
+    """
+
+    def renamed_and_rewrapped(memory, registry):
+        (qualified, listing) = registry.qualify_tools("memory", memory)
+        return [_renamed(qualified, "notebook__propose_fact"), listing]
+
+    steward, _ = steward_factory(bundle_tools=renamed_and_rewrapped)
+    steward._active_untrusted = True
+
+    tool(steward, "notebook__propose_fact")(**ALLERGY)
+
+    assert [p.provenance for p in steward.gate.pending()] == ["untrusted"]
+    assert steward.gate.unsettled_count() == 0
+
+
+async def test_a_guard_that_cannot_find_its_tool_refuses_to_start(steward_factory):
+    """认不出就**炸**,不许悄悄不守:一层没用 `functools.wraps` 的包装会把 `__wrapped__`
+    链切断,守卫从此找不到 propose_fact——那一刻得是一个异常,不是一扇开着的门。
+    (工具 schema 那边它同样会坏,见 `test_wrapping_tools_does_not_change_the_tool_schema`。)"""
+
+    def chain_cut(memory, registry):
+        (qualified, listing) = registry.qualify_tools("memory", memory)
+
+        def propose_fact(**kwargs):
+            return qualified(**kwargs)
+
+        return [propose_fact, listing]
+
+    steward, _ = steward_factory(bundle_tools=chain_cut)
+
+    with pytest.raises(RuntimeError, match="守卫"):
+        steward.all_tools()
 
 
 def test_p0_untrusted_envelope_renders_fence_and_source():
@@ -705,6 +767,120 @@ async def test_l0_only_replays_registered_tool_names(steward_factory):
     turns = steward._recent_turns("", "")
 
     assert [[e.name for e in t.exchanges] for t in turns] == [["current_time"]]
+
+
+def _seed_exchange(steward, env_id, name, *, content="ok", n=0):
+    steward.journal.append(env_id, "tool_call", {"tool": name, "args": {}, "tool_call_id": f"c{n}"})
+    steward.journal.append(
+        env_id, "tool_result", {"tool": name, "content": content, "tool_call_id": f"c{n}"}
+    )
+
+
+async def test_an_exchange_recorded_before_the_rename_replays_under_the_new_name(steward_factory):
+    """★ M6-6d 第一个坑:改名那一刻,起居注里全是旧名字的往返。L0 回放的闸(L3 封闭词表)
+    认不出旧名字,**直接改名 = 部署那一刻所有近期工具往返从 L0 一次性消失**。
+
+    起居注不许改写(不可协商第 3 条),所以回放时认一张旧名 → 新名的表,**渲染成新名字**:
+    和 `tools` 数组对得上,模型照着历史学到的是调得通的那个名字。
+    这张表只收"新名字确实挂着"的:旧名字对应的工具没挂上(这里没挂 finance),照旧丢。
+    `prompt` 事件里落的是新名字——那就是模型实收的那一份。
+    """
+    model = FakeModel([ModelReply(text="好的")])
+    steward, _ = steward_factory()
+    steward.model = model
+    steward.journal.append("env-old", "envelope", {"content": "上一轮"})
+    _seed_exchange(steward, "env-old", "propose_fact", content="已记下", n=0)
+    _seed_exchange(steward, "env-old", "list_recent", n=1)  # finance 没挂:新名字认不出
+    _seed_exchange(steward, "env-old", "current_time", n=2)  # 内置工具本来就没改名
+    steward.journal.append("env-old", "reply", {"content": "记好了。"})
+
+    turns = steward._recent_turns("", "")
+    env = Envelope.new(source="user", channel="cli", content="这一轮")
+    steward.submit(env)
+    await steward.process_next()
+
+    assert [[e.name for e in t.exchanges] for t in turns] == [
+        ["memory__propose_fact", "current_time"]
+    ]
+    calls = next(m for m in model.seen[0].messages if m.get("tool_calls"))["tool_calls"]
+    assert [c["name"] for c in calls] == ["memory__propose_fact", "current_time"]
+    prompt = next(e for e in steward.journal.replay(env.id) if e["kind"] == "prompt")
+    recorded = next(m for m in prompt["payload"]["messages"] if m.get("tool_calls"))
+    assert [c["name"] for c in recorded["tool_calls"]] == ["memory__propose_fact", "current_time"]
+    old = [
+        e["payload"]["tool"] for e in steward.journal.replay("env-old") if e["kind"] == "tool_call"
+    ]
+    assert old == ["propose_fact", "list_recent", "current_time"], "起居注一个字都不许改"
+
+
+async def test_a_retry_that_straddles_the_rename_replays_instead_of_running_again(
+    steward_factory,
+):
+    """★ 同一张表的第二个读者:断点续跑。部署就是重启,重启时正在跑的那一轮会被重新排队
+    (`recover_stale`);它上一次尝试里**真跑过**的工具记在 `tool_executed` 里,名字是旧的。
+    认不出旧名字 → 这一次按新名字找不到 → **再真跑一遍**:一笔账记两次,一条提案提两次。"""
+    steward, _ = steward_factory()
+    env = Envelope.new(source="user", channel="cli", content="我对花生过敏")
+    steward.submit(env)
+    steward.journal.append(
+        env.id,
+        "tool_executed",
+        {
+            "tool": "propose_fact",
+            "args": ALLERGY,
+            "positional": [],
+            "result": "已记下(提案 abcd1234,将在下次结算落盘):对花生过敏",
+            "replayed": False,
+            "replayable": True,
+        },
+    )
+    steward.model = ToolUsingModel([("memory__propose_fact", ALLERGY)])
+
+    await steward.process_next()
+
+    assert steward.gate.unsettled_count() == 0 and steward.gate.pending() == [], (
+        "改名前真跑过的又跑了一遍"
+    )
+    executed = [
+        e["payload"] for e in steward.journal.replay(env.id) if e["kind"] == "tool_executed"
+    ]
+    assert [(e["tool"], e["replayed"]) for e in executed] == [
+        ("propose_fact", False),
+        ("memory__propose_fact", True),
+    ]
+
+
+async def test_the_legacy_map_is_retired_once_no_uncompressed_history_uses_an_old_name(
+    steward_factory,
+):
+    """★ 这张表的**删除条件**,写成能跑的判据而不是一句注释(G6:它还有没有读者)。
+
+    读者只有两个:L0 回放(`tool_result` 配出来的往返)和断点续跑(`tool_executed`)。
+    两个都只读**没压缩**的信封——压缩过的进 L1,只剩一行摘要,不带工具名。所以
+    "没压缩的历史里一条旧名字都没有" = 这张表没有读者了,删。
+
+    比"L0 里最老的一轮晚于改名那天"更严一点:不依赖部署是哪一天,也不依赖 L0 这一刻的
+    预算有多大(预算调大,更老的没压缩的轮会回到 L0);断点续跑那个读者也算进来了。
+    """
+    steward, _ = steward_factory()
+    assert steward.legacy_tool_names_retired(), "空库:没有旧记录,表一开始就没有读者"
+
+    steward.journal.append("env-new", "envelope", {"content": "改名之后"})
+    _seed_exchange(steward, "env-new", "memory__propose_fact")
+    assert steward.legacy_tool_names_retired(), "只有新名字的历史不算读者"
+
+    steward.journal.append("env-old", "envelope", {"content": "改名之前"})
+    _seed_exchange(steward, "env-old", "propose_fact")
+    assert not steward.legacy_tool_names_retired(), "旧名字的往返还在 L0 里,表还有读者"
+
+    steward.journal.mark_compressed(["env-old"])
+    assert steward.legacy_tool_names_retired(), "压进 L1 之后没人再读它的工具名"
+
+    steward.journal.append("env-retry", "envelope", {"content": "重启时正在跑的那一轮"})
+    steward.journal.append(
+        "env-retry", "tool_executed", {"tool": "propose_fact", "result": "x", "replayed": False}
+    )
+    assert not steward.legacy_tool_names_retired(), "断点续跑那个读者同样算"
 
 
 async def test_wrapping_tools_does_not_change_the_tool_schema(steward_factory, http_spy_factory):
@@ -1063,7 +1239,7 @@ async def test_an_untrusted_hit_pulled_back_by_search_downgrades_the_turn(stewar
     await start_turn(steward)
 
     tool(steward, "search_history")("6688")
-    out = tool(steward, "propose_fact")(**ALLERGY)
+    out = tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "待审" in out and "已记下" not in out, out
     pending = steward.gate.pending()
@@ -1081,7 +1257,7 @@ async def test_a_clean_turn_still_auto_passes(steward_factory):
     await start_turn(steward)
 
     tool(steward, "search_history")("杭州")
-    out = tool(steward, "propose_fact")(**ALLERGY)
+    out = tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "已记下" in out or "待审" not in out, out
     assert steward.gate.pending() == []
@@ -1099,7 +1275,7 @@ async def test_once_raised_it_cannot_be_lowered_again(steward_factory):
 
     tool(steward, "search_history")("6688")
     tool(steward, "search_history")("杭州")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1
 
@@ -1117,7 +1293,7 @@ async def test_the_criterion_is_structural_not_a_string_match(steward_factory, m
     await start_turn(steward)
 
     listed = tool(steward, "search_history")("6688")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "⚠" not in listed and "<<<" not in listed, "阳性对照没生效,措辞还在"
     assert len(steward.gate.pending()) == 1, "换掉措辞降档就没了——判据挂在字符串上"
@@ -1144,7 +1320,7 @@ async def test_a_retried_turn_keeps_the_untrusted_mark(steward_factory):
             if self.attempts == 1:
                 by_name["search_history"]("6688")
                 raise ModelCallError("503 假装限流", retryable=True)
-            by_name["propose_fact"](**ALLERGY)
+            by_name["memory__propose_fact"](**ALLERGY)
             return ModelReply(text="好")
 
     steward, _ = steward_factory()
@@ -1183,7 +1359,7 @@ async def test_recall_similar_raises_the_mark_too(steward_factory, monkeypatch):
     await start_turn(steward)
 
     tool(steward, "recall_similar")("那条通知")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1
 
@@ -1197,7 +1373,7 @@ async def test_the_mark_resets_between_turns(steward_factory):
     steward.inbox.complete(steward._active_envelope_id)
 
     await start_turn(steward, "第二轮")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert steward.gate.pending() == [], "上一轮的脏带到这一轮了"
 
@@ -1217,7 +1393,7 @@ async def test_reading_an_image_raises_the_untrusted_mark(steward_factory, tmp_p
     await start_turn(steward)
 
     tool(steward, "read_image")(digest[:12])
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1
 
@@ -1245,7 +1421,7 @@ async def test_reading_a_pdf_page_raises_the_untrusted_mark(steward_factory, tmp
     await start_turn(steward)
 
     tool(steward, "read_pdf")(pdf_id, 1)
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1
 
@@ -1257,7 +1433,7 @@ async def test_a_pdf_that_could_not_be_read_leaves_the_turn_trusted(steward_fact
     await start_turn(steward)
 
     out = tool(steward, "read_pdf")(pdf_id, 1)
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "密码" in out
     assert steward.gate.pending() == []
@@ -1305,7 +1481,7 @@ async def test_searching_the_web_raises_the_mark(steward_factory):
     await start_turn(steward, "帮我查一下这周末上海天气")
 
     tool(steward, "web_search")("上海天气")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1, "搜过网的这一轮里 user_stated 被自动放行了"
 
@@ -1317,7 +1493,7 @@ async def test_a_failed_web_search_does_not_drag_the_turn_down(steward_factory):
     await start_turn(steward)
 
     tool(steward, "web_search")("上海天气")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert steward.gate.pending() == [], "一次查不成的搜索把正常路径拖下水了"
 
@@ -1364,7 +1540,7 @@ async def test_reading_a_web_page_raises_the_mark(steward_factory):
     await start_turn(steward, "这篇你看一下 https://x.example/a")
 
     tool(steward, "web_fetch")("https://x.example/a")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert len(steward.gate.pending()) == 1, "读过网页的这一轮里 user_stated 被自动放行了"
 
@@ -1376,7 +1552,7 @@ async def test_a_page_that_could_not_be_read_does_not_drag_the_turn_down(steward
     await start_turn(steward)
 
     tool(steward, "web_fetch")("https://x.example/a")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert steward.gate.pending() == [], "一次读不成的抓取把正常路径拖下水了"
 
@@ -1477,7 +1653,7 @@ async def test_a_tool_result_from_a_dirty_turn_is_still_dirty_next_turn(steward_
     await start_turn(steward, "把那条转账安排归到我的长期安排里")
 
     listed = tool(steward, "search_history")("6688")
-    out = tool(steward, "propose_fact")(**ALLERGY)
+    out = tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "6688" in listed, "这一页压根没命中,下面断的是空气"
     assert "待审" in out and "已记下" not in out, out
@@ -1499,7 +1675,7 @@ async def test_a_clean_tool_result_hit_does_not_raise_the_mark(steward_factory):
     await start_turn(steward)
 
     listed = tool(steward, "search_history")("星巴克")
-    out = tool(steward, "propose_fact")(**ALLERGY)
+    out = tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "星巴克" in listed, "这一页压根没命中,下面断的是空气"
     assert "已记下" in out, out
@@ -1522,7 +1698,7 @@ async def test_a_reply_that_quoted_an_untrusted_envelope_is_still_dirty_next_tur
     await start_turn(steward, "刚才那条通知里的定投,归到我的长期安排里吧")
 
     listed = tool(steward, "search_history")("6222")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "6222" in listed and "工商银行" not in listed, "命中的该是回复,不是信封"
     assert len(steward.gate.pending()) == 1, "不可信信封那一轮的回复跨轮就变可信了"
@@ -1538,7 +1714,7 @@ async def test_a_short_query_takes_the_like_branch_and_still_derives_it(steward_
     await start_turn(steward)
 
     listed = tool(steward, "search_history")("转账")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "转账" in listed, "这一页压根没命中,下面断的是空气"
     assert len(steward.gate.pending()) == 1, "LIKE 那条分支没解出来"
@@ -1583,7 +1759,7 @@ async def test_recall_similar_derives_it_from_the_envelope_too(steward_factory, 
     await start_turn(steward, "把那条转账安排归到我的长期安排里")
 
     listed = tool(steward, "recall_similar")("那条转账通知")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "6688" in listed, "语义路压根没命中,下面断的是空气"
     assert len(steward.gate.pending()) == 1, "语义检索那条路上不可信静悄悄地不算数了"
@@ -1602,7 +1778,7 @@ async def test_a_clean_recall_similar_hit_does_not_raise_the_mark(steward_factor
     await start_turn(steward)
 
     listed = tool(steward, "recall_similar")("上周的咖啡")
-    tool(steward, "propose_fact")(**ALLERGY)
+    tool(steward, "memory__propose_fact")(**ALLERGY)
 
     assert "星巴克" in listed, "语义路压根没命中,下面断的是空气"
     assert steward.gate.pending() == [], "干净历史的语义命中把这一轮拖脏了"

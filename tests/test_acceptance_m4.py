@@ -64,12 +64,14 @@ def steward(tmp_path, monkeypatch):
 
     def make(script):
         model = ScriptedToolModel(script)
+        registry = Registry.load(Path("bundles"))
+        memory = memory_tool_functions(gate)
         return (
             Steward(
                 settings=settings,
                 inbox=Inbox(conn),
                 journal=Journal(conn),
-                registry=Registry.load(Path("bundles")),
+                registry=registry,
                 ledger=ledger,
                 gate=gate,
                 model=model,
@@ -77,9 +79,12 @@ def steward(tmp_path, monkeypatch):
                 outbox=Outbox(conn),
                 threads=Threads(conn),
                 bundle_tools=[
-                    *memory_tool_functions(gate),
-                    *build_finance(tmp_path, timezone="Asia/Shanghai").tools,
+                    *registry.qualify_tools("memory", memory),
+                    *registry.qualify_tools(
+                        "finance", build_finance(tmp_path, timezone="Asia/Shanghai").tools
+                    ),
                 ],
+                proposal_tool=memory.propose_fact,
             ),
             model,
             ledger,
@@ -89,13 +94,18 @@ def steward(tmp_path, monkeypatch):
 
 
 SCRIPT = [
-    [("record_expense", {"amount": 28, "category": "交通", "occurred_at": "2026-08-03"})],
-    [("record_expense", {"amount": 45, "category": "餐饮", "occurred_at": "2026-08-04"})],
-    [("query_spending", {"since": "2026-08-01", "until": "2026-08-31", "group_by": "category"})],
+    [("finance__record_expense", {"amount": 28, "category": "交通", "occurred_at": "2026-08-03"})],
+    [("finance__record_expense", {"amount": 45, "category": "餐饮", "occurred_at": "2026-08-04"})],
+    [
+        (
+            "finance__query_spending",
+            {"since": "2026-08-01", "until": "2026-08-31", "group_by": "category"},
+        )
+    ],
     [("read_skill", {"bundle": "finance", "skill": "monthly-review"})],
     [
         (
-            "list_recent",
+            "finance__list_recent",
             {"limit": 1, "since": "2026-08-01", "until": "2026-08-31", "order": "largest"},
         )
     ],

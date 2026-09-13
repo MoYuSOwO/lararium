@@ -93,12 +93,15 @@ def test_the_reply_reads_exactly_as_it_did_before_m6_3(runtime, one):
     它原来长在 `test_finance_income.py` 里(当时是"没有退款指着它"这个**条件分支**的
     对照组)。分支没了,它就该搬到它钉的那个工具旁边:改 `delete_expense` 回话的人
     会看这个文件,不会去翻收入那个文件。
+
+    M6-6d:句子里的工具名换成带前缀的 `finance__delete_expense`(模型调得到的那个),
+    别的字节没动。
     """
     said = tool(runtime, "delete_expense")(expense_id=one, reason="记重了")
 
     assert said == (
         "删了 #1:交通 28.00 元 · 原因「记重了」。合计里不算它了。"
-        "删错的话再调一次 delete_expense、带 undo=True 就能拿回来。"
+        "删错的话再调一次 finance__delete_expense、带 undo=True 就能拿回来。"
     ), said
 
 

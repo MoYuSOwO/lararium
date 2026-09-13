@@ -1,7 +1,8 @@
 import functools
+import inspect
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from lararium.config import Settings
@@ -71,6 +72,7 @@ class Steward:
         outbox: Outbox,
         threads: Threads,
         bundle_tools: list[Callable] | None = None,
+        proposal_tool: Callable | None = None,
         mcp_servers: list[Any] | None = None,
         transcriber: Transcriber | None = None,
     ) -> None:
@@ -85,6 +87,9 @@ class Steward:
         self.outbox = outbox
         self.threads = threads
         self.bundle_tools = bundle_tools or []
+        # P0-1 守卫要套的那个工具:memory 交出来的**原函数对象**(M6-6d)。按身份认,
+        # 不按名字——名字是注册时加的前缀,以后还可能再变;见 `all_tools`。
+        self.proposal_tool = proposal_tool
         self.mcp_servers = mcp_servers or []
         # M6-6c:后台把收到的 PDF 逐页转文字的那一个。None = 不转(视觉关着,模型看不了页图;
         # 或者测试里没接)。它的 `run()` 由 lifespan 和 worker 并排起,这里只在收件那一刻叫醒它。
@@ -118,16 +123,30 @@ class Steward:
         两层包装,都不动签名与 docstring(`functools.wraps` + 转发调用),所以**工具
         schema 逐字节不变**——有报文级测试钉住。
 
-        - P0-1 纵深:propose_fact 包一层,本轮信封不可信时把模型传的 provenance 强制降档
+        - P0-1 纵深:`proposal_tool` 包一层,本轮信封不可信时把模型传的 provenance 强制降档
           untrusted(`user_stated` 自动放行,不可信轮绝不能自动放行)。
         - M4-5d:**所有**工具再包一层断点续跑。放最外层是必须的——回放时连内层的
           propose 守卫都不该走到,因为那次调用这一轮压根没发生。
+
+        ★ **守卫按身份认工具,不按名字**(M6-6d 第零个坑)。原来是拿 `__name__` 和一个字符串
+        字面量比,注册时一加前缀那个 `if` 就永远不成立——不报错、不红,账本多一条后门。现在顺着
+        `functools.wraps` 留下的 `__wrapped__` 链找回原函数,和组装根交来的那个对象比 `is`:
+        谁改名、谁在外面多包几层、谁挪了包装顺序,都认得出。**认不出就炸**:声明了要守却一个
+        都没套上,说明哪一层包装切断了那条链,那一刻得是异常,不是一扇悄悄开着的门。
         """
         tools = list(self.tools.as_tool_functions())
+        guarded = 0
         for t in self.bundle_tools:
-            if getattr(t, "__name__", "") == "propose_fact":
+            if self.proposal_tool is not None and inspect.unwrap(t) is self.proposal_tool:
                 t = self._guard_propose_fact(t)
+                guarded += 1
             tools.append(t)
+        if self.proposal_tool is not None and guarded != 1:
+            raise RuntimeError(
+                f"P0-1 守卫要套的工具在 bundle 工具里认出了 {guarded} 个(应该恰好 1 个):"
+                "多半是哪一层包装没用 functools.wraps、切断了 __wrapped__ 链。"
+                "守卫套不上就不许启动——不可信轮的提案会被自动放行。"
+            )
         return [self._resumable(t) for t in tools]
 
     def _resumable(self, original: Callable[..., Any]) -> Callable[..., Any]:
@@ -294,7 +313,13 @@ class Steward:
         # M4-5d 建、M5-29 改口径:取的是这封信下**真跑过**的全部工具结果(累计),
         # 不是"上一次尝试那一段"——中间有一次还没调到工具就失败,那一段是空的,
         # 而空段会把更早那次真执行遮住,于是这一次把同一笔账再记一遍。
-        self._resume_queue = self.journal.established_tool_results(env.id)
+        # M6-6d:部署就是重启,重启时正在跑的那一轮上一次记下的是**旧名字**;不换成新名字,
+        # 按新名字配不上,就把改名之前真跑过的那笔再跑一遍。
+        renamed = self._legacy_tool_names()
+        self._resume_queue = [
+            (renamed.get(name, name), result)
+            for name, result in self.journal.established_tool_results(env.id)
+        ]
         self._resume_consumed = [False] * len(self._resume_queue)
         self._resume_cursor = 0
         self._active_envelope_id = env.id
@@ -446,6 +471,9 @@ class Steward:
         # 不存在的工具名,框架照样把这次 tool-call 记进起居注——那串名字就是模型可控
         # 文本。挡在进上下文这一步,"封闭词表"才当得起(L3)。
         known = {getattr(f, "__name__", "") for f in self.all_tools()}
+        # M6-6d:改名之前记下的往返,先照映射换成新名字再过这道闸。映射的两边都出自注册表,
+        # 换出来的名字必然注册过,词表照旧是封闭的。**渲染新名字**的理由见 `_legacy_tool_names`。
+        renamed = self._legacy_tool_names()
         return [
             Turn(
                 user=r["user"],
@@ -456,10 +484,49 @@ class Steward:
                 ts=r.get("ts"),
                 # M3-3:历史轮带**当时冻结**的话头快照,渲染的是那份不是最新的
                 open_threads=r.get("open_threads"),
-                exchanges=tuple(e for e in r.get("exchanges", ()) if e.name in known),
+                exchanges=tuple(
+                    replace(e, name=renamed.get(e.name, e.name))
+                    for e in r.get("exchanges", ())
+                    if renamed.get(e.name, e.name) in known
+                ),
             )
             for r in rows
         ]
+
+    def _legacy_tool_names(self) -> dict[str, str]:
+        """起居注里改名之前的工具名 → 现在挂着的名字(M6-6d)。只收"旧名字现在没挂、新名字挂着"的。
+
+        表本身是注册表**按规则推的**(`Registry.legacy_tool_names`),不是手写的 29 行——
+        手写的那份总有一天和注册表漂开。
+
+        **回放时渲染新名字,不是"当时实际发生的"旧名字**:历史里的原生 tool_calls 是模型
+        照着学的范例(M4-5c 实测模型会模仿历史里看到的形状),而 `tools` 数组里已经没有旧名字了
+        ——范例里写着旧名字、能调的只有带前缀的新名字,模型照范例喊出一个不存在的名字,
+        工具重试上限是 1,两次喊错这一轮就「处理失败,已放弃」。"当时发生了什么"的逐字真相在
+        起居注里,一个字没改;进上下文的是一次渲染,和过刀、截断同一个性质,`prompt` 事件
+        落的就是模型实收的这一份(不可协商第 3 条)。
+
+        **删除条件**:`legacy_tool_names_retired()` 为真,见那里。
+        """
+        known = {getattr(f, "__name__", "") for f in self.all_tools()}
+        return {
+            old: new
+            for old, new in self.registry.legacy_tool_names().items()
+            if old not in known and new in known
+        }
+
+    def legacy_tool_names_retired(self) -> bool:
+        """旧名映射还有没有读者——**这就是删掉它的条件**(M6-6d,G6)。
+
+        读者只有两个:L0 回放(读 `tool_result` 配出的往返)、断点续跑(读 `tool_executed`)。
+        两个都只碰**没压缩**的信封。所以没压缩的历史里一条旧名字的这两种记录都没有了,
+        表就再没人读——删掉 `Registry.legacy_tool_names`、`_legacy_tool_names` 和它的两处调用。
+
+        没用"L0 里最老的一轮晚于改名那天":部署是哪一天代码里不知道;L0 这一刻的预算调大,
+        更老的没压缩的轮会回来;而且断点续跑那个读者不在 L0 里。启动时组装根会问一次,
+        为真就在日志里说一句"可以删了"。
+        """
+        return self.journal.count_uncompressed_tool_records(self._legacy_tool_names().keys()) == 0
 
     async def maybe_compact(self, compactor: Any) -> str | None:
         """M3-6 触发:上下文装不下时,把顶出低水位的未压缩轮压成 L1 索引。

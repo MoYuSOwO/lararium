@@ -80,7 +80,7 @@ async def test_ten_daily_expenses_never_reach_the_ledger(live_steward, tmp_path)
     for line in DAILY_EXPENSES:
         reply, tools = await _say(live_steward, line)
         print(f"\n[{line}] → {tools}\n    {reply}")
-        if "propose_fact" in tools:
+        if "memory__propose_fact" in tools:
             proposed.append((line, tools))
 
     live_steward.settle_if_needed()  # worker 空闲时就是这么干的
@@ -131,7 +131,7 @@ async def test_a_monthly_arrangement_is_still_proposed(live_steward):
     _reply, tools = await _say(live_steward, "我房租每月 3800")
     print(f"\n[房租] → {tools}")
 
-    assert "propose_fact" in tools, f"月级安排没被 propose,矫枉过正了。工具调用:{tools}"
+    assert "memory__propose_fact" in tools, f"月级安排没被 propose,矫枉过正了。工具调用:{tools}"
 
 
 async def test_a_reply_that_claims_a_record_is_backed_by_a_real_tool_call(live_steward, tmp_path):
@@ -148,7 +148,7 @@ async def test_a_reply_that_claims_a_record_is_backed_by_a_real_tool_call(live_s
 
     for line in DAILY_EXPENSES:
         reply, tools = await _say(live_steward, line)
-        if any(c in reply for c in claims) and "record_expense" not in tools:
+        if any(c in reply for c in claims) and "finance__record_expense" not in tools:
             unbacked.append((line, reply, tools))
 
     print(f"\n[无凭证的声称] {len(unbacked)}/{len(DAILY_EXPENSES)}")

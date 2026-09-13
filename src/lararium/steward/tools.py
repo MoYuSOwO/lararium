@@ -499,7 +499,7 @@ class BuiltinTools:
     def read_pdf(self, pdf_id: str, page: int) -> Any:
         """看一份 PDF 的**某一页**(page 从 1 数)。**PDF 不会自己进上下文,不调这个就等于没看过。**
 
-        pdf_id 是附件那行报告里 `id` 后面那串十六进制(归到课下的课件,list_materials
+        pdf_id 是附件那行报告里 `id` 后面那串十六进制(归到课下的课件,courses__list_materials
         也列得出来),**整串照抄**。一次给一页:**这一页转出来的文字 + 这一页的图**,
         并告诉你这份共几页;页码超了会说共几页。
         用户问的是文件里的东西(第几页讲了什么 / 这道题怎么做 / 帮我看看这份讲义),
@@ -510,7 +510,7 @@ class BuiltinTools:
         没转完的过一会儿再调就有文字了。文字是看着页图转写的,表格、公式拿不准时以图为准。
 
         图**只在这一轮**进模型;文字到了之后的轮里只剩开头一小段。要再看就再调一次,
-        要留下什么得当场说出来,或者用 append_to_note 写进那门课的笔记。
+        要留下什么得当场说出来,或者用 courses__append_to_note 写进那门课的笔记。
         和看图共用一轮的张数上限(一页算一张),超了会拒绝并说清。
         读不了的时候(不是 PDF、加了密码、文件坏了、原件不在)会回一句人话,照实告诉用户。
         """
@@ -518,7 +518,7 @@ class BuiltinTools:
             return "当前模型看不了图,而 PDF 只能一页页画成图来看,所以这份读不了。"
         if not (self.media_dir and is_media_id(pdf_id)):
             shown = neutralize_fence(_one_line(pdf_id)[:20])
-            return f"认不出这个文件 id:{shown}。它应该是那行报告里(或 list_materials 列出来的)那串十六进制,整串照抄。"
+            return f"认不出这个文件 id:{shown}。它应该是那行报告里(或 courses__list_materials 列出来的)那串十六进制,整串照抄。"
         found = self._pool_file(pdf_id)
         if found is None:
             return f"没找到 id {pdf_id[:12]} 这份文件(原件可能已经不在了,或者 id 抄错了)。"

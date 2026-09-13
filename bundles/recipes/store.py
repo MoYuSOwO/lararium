@@ -101,7 +101,7 @@ def name_error(name: str) -> str | None:
     if fault is None:
         return None
     if fault.kind == "empty":
-        return '菜名是空的。给一个菜名,比如 read_recipe("番茄炒鸡蛋")。'
+        return '菜名是空的。给一个菜名,比如 recipes__read_recipe("番茄炒鸡蛋")。'
     if fault.kind == "too_long":
         return (
             f"这个菜名太长了({len(name)} 字,最多 {MAX_NAME_CHARS} 字),没这么存。"

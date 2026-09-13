@@ -1,7 +1,17 @@
+import functools
+from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
+
+# M6-6d:bundle 工具名 = `<manifest 的 name>__<原工具名>`。双下划线:单下划线分不清边界
+# (`web_search` 自己就带一个),点号 OpenAI 系函数名不许用;和 MCP 客户端的
+# `mcp__server__tool` 同形。**这条规则只在这个文件里写一次**——组装根加前缀、回放认旧名、
+# 文字检查推"能调得到的名字",都从这里取。
+TOOL_NAME_SEPARATOR = "__"
 
 
 @dataclass(frozen=True)
@@ -15,8 +25,30 @@ class BundleInfo:
     name: str
     description: str
     skills: tuple[SkillInfo, ...]
+    # manifest 里写的是**裸名**(bundle 自己的函数叫什么)。前缀只在 `name` 那一处写一次,
+    # 在注册那一刻加上——写成前缀名的话同一个前缀要手抄十遍,还可能和 `name` 对不上。
     tools: tuple[str, ...]
     root: Path
+
+    def tool_name(self, tool: str) -> str:
+        """模型看到、调用的那个名字。"""
+        return f"{self.name}{TOOL_NAME_SEPARATOR}{tool}"
+
+
+def _renamed(fn: Callable[..., Any], name: str) -> Callable[..., Any]:
+    """换一个名字,别的一个字节不动:`functools.wraps` 带过签名与 docstring(工具 schema 就是它俩),
+    `__wrapped__` 让守卫能顺着找回原函数(见 `Steward.all_tools`)。
+
+    **包一层而不是改原函数的 `__name__`**:函数对象是 bundle 的,`create_server()` 那条路上
+    MCP 要的是裸名(命名空间是客户端的事),改了原对象两边就互相踩。
+    """
+
+    @functools.wraps(fn)
+    def renamed(*args: Any, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+
+    renamed.__name__ = name
+    return renamed
 
 
 class Registry:
@@ -72,6 +104,38 @@ class Registry:
         if bundle not in self._by_name:
             raise KeyError(f"没有这个 bundle: {bundle};已注册: {sorted(self._by_name)}")
         return self._by_name[bundle]
+
+    def qualify_tools(
+        self, bundle: str, tools: Iterable[Callable[..., Any]]
+    ) -> list[Callable[..., Any]]:
+        """给一个 bundle 交出来的工具加上前缀(M6-6d),顺序不变。
+
+        **前缀取自 manifest 的 `name`,调用方给的 `bundle` 只用来找 manifest**——而且找到之后
+        要对账:交出来的函数名必须和 manifest 的 `tools` 逐个、按顺序相同。对不上就是组装根
+        拿错了名字(前缀会贴到别人头上)或者 manifest 没跟着改(目录会撒谎),两种都当场炸。
+        """
+        info = self.get(bundle)
+        funcs = list(tools)
+        handed = tuple(getattr(f, "__name__", "") for f in funcs)
+        if handed != info.tools:
+            raise ValueError(
+                f"{bundle} 的 manifest 声明的工具是 {list(info.tools)},交来加前缀的是 {list(handed)}"
+                "——名字和顺序都得逐个对上,否则前缀会贴错,或者 manifest 在撒谎。"
+            )
+        return [_renamed(f, info.tool_name(f.__name__)) for f in funcs]
+
+    def legacy_tool_names(self) -> dict[str, str]:
+        """加前缀之前的名字 → 现在的名字,**从 manifest 推出来**,不手写(M6-6d)。
+
+        读者是起居注里改名之前的那些记录:L0 回放(`Steward._recent_turns`)和断点续跑
+        (`Steward.process_next`)。**删除条件**是 `Steward.legacy_tool_names_retired()`
+        ——没压缩的历史里一条旧名字都没有了,这张表就没有读者。
+
+        一个裸名要是有两个 bundle 都叫它,那条旧记录是谁的说不清——**不收**,让它像任何
+        认不出的名字一样被丢掉,不猜。
+        """
+        owners = Counter(t for b in self.bundles for t in b.tools)
+        return {t: b.tool_name(t) for b in self.bundles for t in b.tools if owners[t] == 1}
 
     def read_skill(self, bundle: str, skill: str | None = None) -> str:
         """不带 skill 名时列出这个领域有哪些方法篇,**不报错**(M5-14)。

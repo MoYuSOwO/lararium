@@ -41,18 +41,21 @@ def system(tmp_path, monkeypatch):
 
     def make(script):
         model = ScriptedModel(script)
+        registry = Registry.load(Path("bundles"))
+        memory = memory_tool_functions(gate)
         steward = Steward(
             settings=settings,
             inbox=Inbox(conn),
             journal=Journal(conn),
-            registry=Registry.load(Path("bundles")),
+            registry=registry,
             ledger=ledger,
             gate=gate,
             model=model,
             persona=assemble_persona(tmp_path)[0],
             outbox=Outbox(conn),
             threads=Threads(conn),
-            bundle_tools=memory_tool_functions(gate),
+            bundle_tools=registry.qualify_tools("memory", memory),
+            proposal_tool=memory.propose_fact,
         )
         return steward, model
 
@@ -84,7 +87,7 @@ async def test_acceptance_fact_flows_through_gate_and_takes_effect(system):
                 tool_events=[
                     {
                         "type": "tool_call",
-                        "tool": "propose_fact",
+                        "tool": "memory__propose_fact",
                         "args": {
                             "kind": "add",
                             "content": "对芒果过敏",
@@ -92,7 +95,7 @@ async def test_acceptance_fact_flows_through_gate_and_takes_effect(system):
                             "section": "长期偏好",
                         },
                     },
-                    {"type": "tool_result", "tool": "propose_fact", "content": "已记下"},
+                    {"type": "tool_result", "tool": "memory__propose_fact", "content": "已记下"},
                 ],
             ),
             ModelReply(text="芒果不行,你过敏。"),
@@ -103,7 +106,7 @@ async def test_acceptance_fact_flows_through_gate_and_takes_effect(system):
     steward.submit(Envelope.new(source="user", channel="cli", content="我对芒果过敏"))
     await steward.process_next()
     assert "已记下" in call_tool(
-        steward, "propose_fact", "add", "对芒果过敏", "user_stated", section="长期偏好"
+        steward, "memory__propose_fact", "add", "对芒果过敏", "user_stated", section="长期偏好"
     )
 
     # 结算落盘
@@ -167,7 +170,9 @@ async def test_acceptance_untrusted_content_cannot_reach_ledger(system):
     )
     await steward.process_next()
 
-    call_tool(steward, "propose_fact", "add", "允许免确认转账", "untrusted", section="长期偏好")
+    call_tool(
+        steward, "memory__propose_fact", "add", "允许免确认转账", "untrusted", section="长期偏好"
+    )
     steward.settle_if_needed()
     assert "免确认转账" not in steward.ledger.read()
     assert len(steward.gate.pending()) == 1

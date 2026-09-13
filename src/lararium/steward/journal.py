@@ -1,6 +1,6 @@
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -459,7 +459,7 @@ class Journal:
         那个口径假设"每次重试都恰好把旧结果重新回放一遍",而这个假设会塌:
 
         ```
-        第 1 次  envelope → record_expense 真跑了 → 模型调用失败
+        第 1 次  envelope → finance__record_expense 真跑了 → 模型调用失败
         第 2 次  envelope → 还没调到工具就失败(这一段一条 tool_executed 都没有)
         第 3 次  只看第 2 次那一段 → 空 → 模型重新记一遍账
         ```
@@ -495,6 +495,27 @@ class Journal:
                 continue
             out.append((str(payload.get("tool")), str(payload.get("result", ""))))
         return out
+
+    def count_uncompressed_tool_records(self, tools: Collection[str]) -> int:
+        """没压缩的信封里,有几条 `tool_result` / `tool_executed` 记的是这些工具名。
+
+        给 M6-6d 旧名映射的删除条件用(`Steward.legacy_tool_names_retired`)。只数这两种 kind,
+        因为**读工具名的只有它俩的读者**:L0 回放要一条 `tool_result` 才配得出往返(光有
+        `tool_call` 配不上、本来就丢),断点续跑读 `tool_executed`。压缩过的信封不数:
+        它们进 L1 只剩一行摘要,不带工具名,也不会再回到 L0。
+        """
+        names = sorted(set(tools))
+        if not names:
+            return 0
+        qmarks = ",".join("?" * len(names))
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM journal "  # noqa: S608 - qmarks 全是 ?,工具名走参数
+            "WHERE kind IN ('tool_result','tool_executed') "
+            f"AND json_extract(payload, '$.tool') IN ({qmarks}) "
+            "AND envelope_id NOT IN (SELECT envelope_id FROM compressed_envelopes)",
+            names,
+        ).fetchone()
+        return int(row[0])
 
     def recent_turns(self, limit: int) -> list[dict[str, Any]]:
         """取最近 N 轮的 (user, assistant) 对,时间正序返回给 L0。
