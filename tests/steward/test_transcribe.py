@@ -36,7 +36,9 @@ from lararium.steward.pdf import render_page
 from lararium.steward.pdftext import MAX_PAGE_ATTEMPTS, PdfText
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
-from lararium.steward.transcribe import PAGE_TO_TEXT, Transcriber
+from lararium.steward.transcribe import Transcriber, load_page_prompt
+
+PAGE_TO_TEXT = load_page_prompt()
 
 
 def put_pdf(tmp_path: Path, blob: bytes) -> str:
@@ -82,7 +84,8 @@ class Provider:
     """假服务商。**认图不认顺序**:把报文里的 PNG 对回 (哪份, 第几页)。
 
     `script[(digest, page)]` 决定那一页怎么答:整数 = 回这个状态码;"hang" = 挂住不回;
-    "" = 回一个空答复;缺省 = 回「<页码>页的文字」。
+    "" = 回一个空答复;缺省 = 回「<页码>页的文字」;**列表 = 按调用次序一次取一个**,
+    取完了走缺省(验收补:"先坏一阵、后来好了"要靠它造)。
     """
 
     def __init__(self, tmp_path: Path, script: dict | None = None) -> None:
@@ -108,6 +111,8 @@ class Provider:
         self.calls.append(key)
         self.entered.set()
         behave = self.script.get(key)
+        if isinstance(behave, list):
+            behave = behave.pop(0) if behave else None
         if behave == "hang":
             await asyncio.Event().wait()
         if isinstance(behave, int):
@@ -141,6 +146,7 @@ def pipeline(tmp_path, http_spy_factory):
             media_dir=tmp_path / "media",
             reader=http_spy_factory(provider),
             chat_busy=busy,
+            instructions=PAGE_TO_TEXT,
             sleep=naps or Naps(),
         )
         return transcriber, pages
@@ -337,6 +343,32 @@ async def test_a_page_that_keeps_failing_is_given_up_after_a_bounded_number_of_c
     assert naps.taken == sorted(naps.taken), "退避应该越歇越久"
 
 
+@pytest.mark.parametrize("status", [401, 402, 403, 404, 429])
+async def test_account_and_rate_failures_never_cost_the_page(tmp_path, pipeline, status):
+    """★ 验收补:**服务商说的是账号、余额、配置、限流时,不许把次数记在这一页头上。**
+
+    原来 401 / 403 / 404 当"明确拒了"当场判死,402 / 429 扣满三次判死——而判死是终态,
+    重启不重试,也没有重转的命令。于是**换一次 key、欠一次费**(DeepSeek 是预付费,402
+    是真会发生的)、**一阵限流**,正在排队的那几页就永久只剩图,修好之后也救不回来。
+    这几类失败**不可能是这一页引起的**,换哪一页都一样。
+
+    造法:同一页先连着坏 5 次(**比上限多**),然后好了——必须转出来,而且每次失败之后
+    整条流水线都歇了一下。400(内容被拒)当场判死、500 扣满上限判死,那两条老测试照旧钉着。
+    """
+    assert MAX_PAGE_ATTEMPTS < 5, "这条要靠「坏的次数比上限多」才有意义"
+    digest = put_pdf(tmp_path, pdf_samples.pdf(1))
+    provider = Provider(tmp_path, script={(digest, 1): [status] * 5})
+    provider.learn(digest, 1)
+    naps = Naps()
+    transcriber, pages = pipeline(provider, naps=naps)
+
+    await drain(transcriber)
+
+    assert pages.page(digest, 1).state == "done", f"{status} 把这一页判死了"
+    assert provider.pages(digest) == [1] * 6
+    assert len(naps.taken) == 5, "每次失败之后都该歇一下"
+
+
 async def test_an_empty_answer_is_a_failure_not_a_blank_page(tmp_path, pipeline):
     """模型回了个空:当失败算(计次数),不当"这页没字"缓存下来——缓存下来就再也不会重转了。"""
     digest = put_pdf(tmp_path, pdf_samples.pdf(1))
@@ -464,6 +496,7 @@ def wired_steward(tmp_path, monkeypatch, http_spy_factory):
             media_dir=tmp_path / "media",
             reader=http_spy_factory(provider),
             chat_busy=inbox.has_unfinished,
+            instructions=PAGE_TO_TEXT,
             sleep=naps or Naps(),
         )
         steward = Steward(

@@ -44,7 +44,7 @@ from lararium.steward.outbox import Outbox
 from lararium.steward.pdftext import PdfText
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
-from lararium.steward.transcribe import Transcriber
+from lararium.steward.transcribe import Transcriber, load_page_prompt
 from lararium.steward.worker import Worker
 
 logger = logging.getLogger("lararium")
@@ -115,6 +115,7 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
             media_dir=settings.data_dir / "media",
             reader=PydanticAIClient(settings),
             chat_busy=inbox.has_unfinished,
+            instructions=load_page_prompt(),
         )
         if settings.vision
         else None

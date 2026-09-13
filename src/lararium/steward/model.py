@@ -65,11 +65,27 @@ class ModelCallError(Exception):
     """
 
     def __init__(
-        self, message: str, *, retryable: bool, details: tuple[dict[str, str], ...] = ()
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        details: tuple[dict[str, str], ...] = (),
+        status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.details = details
+        # 服务商回的 HTTP 状态码,**没有就是 None**(连不上、超时、库自己抛的)。
+        # `retryable` 回答的是"这一轮要不要重试";有的调用方要问的是另一件事——
+        # **这次失败怪不怪请求本身**(M6-6c 转 PDF:401 是 key 的事,不是这一页的事)。
+        self.status = status
+
+
+def _status_of(exc: Exception) -> int | None:
+    """服务商回的状态码;不是 HTTP 错误就是 None。第三方异常的形状只在隔离盒里认。"""
+    from pydantic_ai.exceptions import ModelHTTPError
+
+    return exc.status_code if isinstance(exc, ModelHTTPError) else None
 
 
 def _classify_retryable(exc: Exception) -> bool:
@@ -375,7 +391,10 @@ class PydanticAIClient:
                 if details:
                     logger.warning("工具重试耗尽,模型填的参数与服务端反馈:%s", details)
                 raise ModelCallError(
-                    _error_message(exc), retryable=_classify_retryable(exc), details=details
+                    _error_message(exc),
+                    retryable=_classify_retryable(exc),
+                    details=details,
+                    status=_status_of(exc),
                 ) from exc
         usage = result.usage
 
@@ -427,7 +446,9 @@ class PydanticAIClient:
                 [prompt, BinaryContent(data=image.data, media_type=image.media_type)]
             )
         except Exception as exc:
-            raise ModelCallError(_error_message(exc), retryable=_classify_retryable(exc)) from exc
+            raise ModelCallError(
+                _error_message(exc), retryable=_classify_retryable(exc), status=_status_of(exc)
+            ) from exc
         return _reply(result.output, result.usage, [])
 
 

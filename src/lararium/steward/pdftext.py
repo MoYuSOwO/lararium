@@ -169,9 +169,26 @@ class PdfText:
             (sha256, page, text, _now()),
         )
 
+    def refund_attempt(self, sha256: str, page: int, error: str) -> None:
+        """这一次没成,**但不怪这一页**:把 `begin_attempt` 记下的那一次退回去,只留原因。
+
+        验收补(M6-6c):服务商说的是账号 / 余额 / 配置 / 限流(401 / 402 / 403 / 404 / 429)
+        的时候,**换哪一页都一样失败**——把次数记在这一页头上,等于让一次换 key、一次欠费、
+        一阵限流**永久**把正在排队的那几页判成"转失败了,只能看图",修好之后也救不回来
+        (判死是终态,重启不重试,也没有重转的命令)。
+        **不会饿死别的页**:这几类失败对每一页都一样,轮到谁都是同一个结果,
+        等环境好了第一个转的就是它。
+        """
+        self._conn.execute(
+            "UPDATE pdf_pages SET attempts = MAX(attempts - 1, 0), error = ?, updated_at = ? "
+            "WHERE sha256 = ? AND page = ?",
+            (error, _now(), sha256, page),
+        )
+
     def record_failure(self, sha256: str, page: int, error: str, *, give_up: bool) -> None:
         """这一次没成。次数在 `begin_attempt` 里已经记过了,这里只记原因;
-        `give_up=True`(服务商明确拒了、这页画不出来)直接顶到上限——再调也是同一个结果。"""
+        `give_up=True`(服务商拒了**这一次请求的内容**、这页画不出来)直接顶到上限
+        ——再调也是同一个结果。不怪这一页的失败走 `refund_attempt`,不走这里。"""
         self._conn.execute(
             "INSERT INTO pdf_pages (sha256, page, attempts, error, updated_at) "
             "VALUES (?, ?, ?, ?, ?) "
