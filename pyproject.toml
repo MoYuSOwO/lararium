@@ -154,6 +154,9 @@ module = [
     # 第三方的那一半在 model.py(宽松档)里,这里只认 `ModelReply` / `ModelCallError`。
     "lararium.steward.pdftext",
     "lararium.steward.transcribe",
+    # M6-6e:按 id 搜内容的判定那一层(`PageMatch` / `match_page` / `coverage_note`),
+    # 形状是我们定的,严格档的 tools.py 靠它。
+    "lararium.steward.contentsearch",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

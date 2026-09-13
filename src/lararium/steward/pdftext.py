@@ -7,8 +7,9 @@ import-linter 挡住 bundle import steward,`test_no_bundle_touches_the_page_text
 **键是 `(sha256, page)`**:sha256 是媒体池里那份 PDF 的内容哈希(池子里的文件名就是它,
 附件报告里的 id 是它的前 12 位)。同一份发两次是同一个键,"只转一次"不需要任何去重逻辑。
 
-**写它的只有 `transcribe.Transcriber`,读它的是 `read_pdf`。** 6d 的按 id 搜也会读它——
-按 sha256 取出每一页的 `text`,这张表的形状已经够用;**这一轮一行搜索代码都不写**。
+**写它的只有 `transcribe.Transcriber`,读它的是 `read_pdf` 和按 id 搜内容(`search_in_files`,
+M6-6e)。** 两个读者问的是同一件事——"这一页现在是哪种状态、有没有字"——所以状态怎么推
+只写在 `_classify` 一处,`page()` 和 `document()` 都经它。
 
 **一页的状态不另存一列,由 `text` 和 `attempts` 推出来**(一个事实一个出处——状态列和
 这两列各说各的那天,"说转好了、文字却是空的"这种账就对不上了):
@@ -80,6 +81,19 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _classify(
+    page: int, row: sqlite3.Row | None, *, unreadable: bool, converted: int, limit: int
+) -> PageText:
+    """一页的状态怎么推(模块 docstring 那张表),**只写这一处**。超上限由调用方先判。"""
+    if unreadable:
+        return PageText("failed", "", converted, limit)
+    if row is not None and row["text"] is not None:
+        return PageText("done", str(row["text"]), converted, limit)
+    if row is not None and row["attempts"] >= MAX_PAGE_ATTEMPTS:
+        return PageText("failed", "", converted, limit)
+    return PageText("pending", "", converted, limit)
+
+
 class PdfText:
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
@@ -93,26 +107,53 @@ class PdfText:
     def page(self, sha256: str, page: int) -> PageText:
         """这一页现在是哪种状态。**没登记过的也答得出**(刚收到、转换器还没扫到):pending。"""
         limit = MAX_CONVERTED_PAGES
-        converted = int(
+        converted = self._converted(sha256)
+        if page > limit:
+            return PageText("beyond", "", converted, limit)
+        row = self._conn.execute(
+            "SELECT text, attempts FROM pdf_pages WHERE sha256=? AND page=?", (sha256, page)
+        ).fetchone()
+        return _classify(
+            page, row, unreadable=self._unreadable(sha256), converted=converted, limit=limit
+        )
+
+    def document(self, sha256: str, total_pages: int) -> list[PageText]:
+        """这份每一页现在的状态,第 i 项是第 i+1 页(M6-6e 按 id 搜内容用)。只读。
+
+        **一次取完,不逐页调 `page()`**:一份 200 页的讲义逐页查就是 600 条语句,而搜索一次
+        可能给好几份。页数由调用方给(`read_pdf` 同样是自己数的,那是文件本身说的数);
+        没登记过的照样答得出,全是 pending。
+        """
+        limit = MAX_CONVERTED_PAGES
+        converted = self._converted(sha256)
+        unreadable = self._unreadable(sha256)
+        rows = {
+            int(r["page"]): r
+            for r in self._conn.execute(
+                "SELECT page, text, attempts FROM pdf_pages WHERE sha256=?", (sha256,)
+            ).fetchall()
+        }
+        return [
+            PageText("beyond", "", converted, limit)
+            if page > limit
+            else _classify(
+                page, rows.get(page), unreadable=unreadable, converted=converted, limit=limit
+            )
+            for page in range(1, total_pages + 1)
+        ]
+
+    def _converted(self, sha256: str) -> int:
+        return int(
             self._conn.execute(
                 "SELECT COUNT(*) FROM pdf_pages WHERE sha256=? AND text IS NOT NULL", (sha256,)
             ).fetchone()[0]
         )
-        if page > limit:
-            return PageText("beyond", "", converted, limit)
+
+    def _unreadable(self, sha256: str) -> bool:
         doc = self._conn.execute(
             "SELECT unreadable FROM pdf_docs WHERE sha256=?", (sha256,)
         ).fetchone()
-        if doc is not None and doc["unreadable"]:
-            return PageText("failed", "", converted, limit)
-        row = self._conn.execute(
-            "SELECT text, attempts FROM pdf_pages WHERE sha256=? AND page=?", (sha256, page)
-        ).fetchone()
-        if row is not None and row["text"] is not None:
-            return PageText("done", str(row["text"]), converted, limit)
-        if row is not None and row["attempts"] >= MAX_PAGE_ATTEMPTS:
-            return PageText("failed", "", converted, limit)
-        return PageText("pending", "", converted, limit)
+        return doc is not None and bool(doc["unreadable"])
 
     def next_page(self) -> tuple[str, int] | None:
         """下一页该转哪一页;都收尾了回 None。
