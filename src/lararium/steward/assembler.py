@@ -1,7 +1,7 @@
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,10 @@ class Turn:
     channel: str = "cli"
     untrusted: bool = False
     ts: str | None = None
+    # M6-10:"前一条"的发送时间——认领时从起居注查出来、冻结进信封 meta 的那份
+    # (`Steward.process_next`)。**不是 L0 窗口里挨着的那条**:窗口会滑、会被压缩截掉,
+    # 按窗口取的话最老那条的间隔每轮都在变,缓存从它起全 miss。
+    prev_ts: str | None = None
     # 该轮认领时冻结的话头快照(meta["open_threads"] 的形态:list[{topic,note}])。
     # 历史轮渲染的是**当时那份**,不是最新的——这是 append-only 成立的另一半。
     open_threads: list[dict[str, Any]] | None = None
@@ -205,9 +209,57 @@ def _render_user_text(
     return body
 
 
-def _stamp(ts: datetime, tz: ZoneInfo) -> str:
-    # 必须用配置时区,不能用裸 astimezone()——理由见下方原注释
-    return ts.astimezone(tz).isoformat(timespec="seconds")
+_WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+# 同一天里隔了多久才值得说一句。**拍的**:三小时是"午饭聊的、晚饭接着聊"的量级,
+# 再短的间隔她顺着说不会错。跨了日历日不看这个阈值——23:50 的「明晚」到 00:10 就是「今晚」。
+GAP_WORTH_SAYING = timedelta(hours=3)
+
+
+def _span(delta: timedelta) -> str:
+    """间隔说成她说话会用的量级:分钟、小时,向下取整。"""
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 1:
+        return "不到 1 分钟"
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    return f"{minutes // 60} 小时"
+
+
+def _gap(local: datetime, prev_local: datetime) -> str | None:
+    """这一条距他上一条隔了多久。**只看这两个时间,不看"现在"**——同一条消息哪一轮渲染都一样。
+
+    倒序(重试的那封信排在了后来的消息之后)不说:那种间隔没有意义,说了只会误导。
+    """
+    delta = local - prev_local
+    if delta <= timedelta(0):
+        return None
+    days = (local.date() - prev_local.date()).days
+    if days >= 2:
+        return f"距他上一条跨了 {days} 天"
+    if days == 1:
+        return f"距他上一条 {_span(delta)},跨天了"
+    if delta >= GAP_WORTH_SAYING:
+        return f"距他上一条 {_span(delta)}"
+    return None
+
+
+def _stamp(ts: datetime, prev_ts: datetime | None, tz: ZoneInfo) -> str:
+    """人读的时间 + 隔了多久(M6-10):`9月13日 周日 18:21 · 距他上一条 18 小时,跨天了`。
+
+    必须用配置时区,不能用裸 astimezone()——理由见 `_render_envelope`。日历日也按配置时区切。
+    年份只在和上一条**不是同一年**时写出来:每条都带是每轮都付的钱,而跨年那条带上了,
+    之后的消息都在它下面。
+    """
+    local = ts.astimezone(tz)
+    prev_local = prev_ts.astimezone(tz) if prev_ts is not None else None
+    year = f"{local.year}年" if prev_local is not None and prev_local.year != local.year else ""
+    head = f"{year}{local.month}月{local.day}日 {_WEEKDAYS[local.weekday()]} {local:%H:%M}"
+    gap = _gap(local, prev_local) if prev_local is not None else None
+    return f"{head} · {gap}" if gap else head
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
 
 
 def _render_envelope(envelope: Envelope, tz: ZoneInfo) -> str:
@@ -219,7 +271,8 @@ def _render_envelope(envelope: Envelope, tz: ZoneInfo) -> str:
         source=envelope.source,
         channel=envelope.channel,
         untrusted=envelope.meta.get("untrusted", False),
-        stamp=_stamp(envelope.ts, tz),
+        # M6-10:前一条的时间是认领时冻结进 meta 的那份,历史轮渲染读的是同一份
+        stamp=_stamp(envelope.ts, _parse_ts(envelope.meta.get("prev_ts")), tz),
         # M3-3:话头在认领时已被 Steward 冻结进 meta,渲染的是那份快照
         open_threads=envelope.meta.get("open_threads"),
     )
@@ -271,7 +324,11 @@ def assemble(
     for turn in l0:
         if turn.user is None or turn.assistant is None:
             continue
-        stamp = _stamp(datetime.fromisoformat(turn.ts), tz) if turn.ts is not None else None
+        stamp = (
+            _stamp(datetime.fromisoformat(turn.ts), _parse_ts(turn.prev_ts), tz)
+            if turn.ts is not None
+            else None
+        )
         messages.append(
             {
                 "role": "user",
