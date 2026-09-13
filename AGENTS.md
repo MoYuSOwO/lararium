@@ -10,9 +10,10 @@ Lararium:跑在用户自己服务器上的个人生活助手,通过一个 IM 对
 学习、待办。架构是**单 agent + plugin bundle**:一个主控(Steward)持有全部智能,
 各生活领域是独立的 MCP bundle,只提供工具和数据,不含 LLM。
 
-**当前状态**:M1–M4 已完成(骨架 / 前后端分离 / 记忆中间层 / 第一个领域 bundle),
-M5(上手机)收尾中——微信通道、媒体入站、读图都已交付。进度见 `REVIEW.md` 的验收记录、
-待办见 `PLAN.md` 的 M5 段。
+**当前状态**:M1–M6 已完成(骨架 / 前后端分离 / 记忆中间层 / 第一个领域 bundle / 上手机 / 按真实使用
+重排)。服务跑在用户自己的服务器上(香港),通过微信用;领域 bundle 有财务、做菜、学习、待办,
+另有语音转写、PDF 看页与后台转文字、归拢自动跑、隔一阵问一嘴。M5-32、M5-34 挂起等数据;
+M7(上线)要按现状重排。进度见 `REVIEW.md` 的验收记录、`PLAN.md` 的 M6 段。
 
 ## 按需读,别全读
 
@@ -27,7 +28,7 @@ M5(上手机)收尾中——微信通道、媒体入站、读图都已交付。�
 
 `DESIGN.md` 是参考手册,不要通读——它比你这次需要的多得多。
 
-**`PLAN.md`(5700 行)和 `REVIEW.md`(8100 行)绝对不要整份读进上下文。**
+**`PLAN.md`(8500 行)和 `REVIEW.md`(17000 行)绝对不要整份读进上下文。**
 它们是按里程碑追加的档案,九成的内容和你手上这个任务无关,读全份就是把上下文烧在
 历史上——而这个项目最贵的东西就是上下文。**按章节取**:
 
@@ -135,13 +136,18 @@ uv run python -m lararium.gateway.wechat
 ```
 src/lararium/
   config.py envelope.py db.py        基础设施(db.py:连接一律从这里建,见下)
+  docstore.py                         用户手写文档库的共用层(做菜、学习笔记;全仓库唯一写用户文档的地方)
+  timeofday.py                        每天某个时刻 / 静默时段的判定
   persona.py                          前缀第 1 层:人设 + 纪律,以及前缀指纹
   steward/                            主控:唯一持有智能的地方
     ports.py                          对 bundle 的抽象(守 import 边界)
     inbox.py outbox.py journal.py     收件箱、出件箱、起居注(Steward 独占存储)
-    registry.py assembler.py tools.py 注册表、上下文组装、内置工具
-    threads.py compact.py sweep.py    话头、压缩、夜间归拢
+    registry.py assembler.py tools.py 注册表(工具名加 bundle 前缀)、上下文组装、内置工具
+    threads.py compact.py sweep.py    话头、压缩、归拢
+    nightly.py notice.py nudge.py     归拢自动跑、每天一条的待审通知、隔一阵问一嘴
     embeddings.py vision.py           本地 embedding、图片进模型那一层
+    pdf.py pdftext.py transcribe.py   PDF 渲染、逐页文字缓存、收到就转的后台任务
+    contentsearch.py websearch.py     按文件 id 搜内容、联网搜索
     model.py                          第三方库隔离盒(类型宽松档)
     loop.py worker.py                 一轮的编排、常驻 worker
   gateway/
@@ -152,8 +158,13 @@ bundles/memory/                       Memory 也是一个 bundle,没有特例
   ledger.py                           账本 + 快照表(唯一写入路径 Gate.settle)
   gate.py                             门控状态机
   server.py                           FastMCP server(类型宽松档)
-bundles/finance/                      第一个生活领域:记账与消费分析
+bundles/finance/                      记账:支出、收入、预算
+bundles/recipes/                      做菜:一道菜一份 markdown
+bundles/courses/                      学习:一门课一个笔记本 + 课件归属
+bundles/todos/                        待办:作业、考试、一次性的事
+prompts/                              纪律、归拢、切段、转 PDF、问一嘴的指令(人设在 data/,不在这里)
 tests/test_architecture.py            项目不变量门禁
+tests/test_tool_names.py              文字里引用的工具名必须调得到
 ```
 
 **数据库连接一律走 `db.connect()` / `db.open_connection()`,不许自己 `sqlite3.connect`。**
