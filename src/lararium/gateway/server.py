@@ -41,8 +41,10 @@ from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.model import PydanticAIClient
 from lararium.steward.outbox import Outbox
+from lararium.steward.pdftext import PdfText
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
+from lararium.steward.transcribe import Transcriber, load_page_prompt
 from lararium.steward.worker import Worker
 
 logger = logging.getLogger("lararium")
@@ -102,9 +104,25 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
     persona, warnings = assemble_persona(settings.data_dir)
     for warning in warnings:
         logger.warning(warning)
+    inbox = Inbox(conn)
+    # M6-6c:收到的 PDF 后台逐页转文字。**视觉关着就不接**——转换是让模型看页图,它看不了图
+    # 就无从谈起(read_pdf 那时也只回"看不了图")。模型客户端单独一个:和聊天同一个 key、
+    # 同一个模型(得是能看图的那个),但各用各的连接池;让不让路由 `chat_busy` 管。
+    transcriber = (
+        Transcriber(
+            pages=PdfText(conn),
+            journal=Journal(conn),
+            media_dir=settings.data_dir / "media",
+            reader=PydanticAIClient(settings),
+            chat_busy=inbox.has_unfinished,
+            instructions=load_page_prompt(),
+        )
+        if settings.vision
+        else None
+    )
     steward = Steward(
         settings=settings,
-        inbox=Inbox(conn),
+        inbox=inbox,
         journal=Journal(conn),
         registry=registry,
         ledger=ledger,
@@ -115,6 +133,7 @@ def build_steward(settings: Settings, ledger: Any, gate: Any) -> Steward:
         threads=Threads(conn),
         # M1 进程内挂载;M2 容器化时换成 MCP 传输,工具定义不变
         bundle_tools=_assemble_bundle_tools(settings.data_dir, gate, settings.timezone),
+        transcriber=transcriber,
     )
     # 前缀变更留痕:改了人设、缓存命中从 90% 掉到 0,得有地方说得清为什么
     # (不可协商第 1 条:缓存命中是设计约束,不是优化项)。
@@ -211,14 +230,20 @@ def create_app(
             notify=notify,
         )
         worker = Worker(steward, wake, compactor=compactor)
-        task = asyncio.create_task(worker.run())
+        tasks = [asyncio.create_task(worker.run())]
+        # M6-6c:PDF 后台转换和 worker 并排跑——**不在 worker 的循环里**:那样一页挂住的转换
+        # 会把后面所有消息堵住。它启动时先扫一遍池子,重启前转到一半的、6c 之前就收到的都会续上。
+        if steward.transcriber is not None:
+            tasks.append(asyncio.create_task(steward.transcriber.run()))
         try:
             yield
         finally:
-            # 退出:cancel worker + 最后一次结算(把已通过的提案落盘)。
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            # 退出:cancel worker(和转换)+ 最后一次结算(把已通过的提案落盘)。
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             settled = steward.settle_if_needed()
             if settled:
                 logger.info("退出前结算 %d 条提案", settled)

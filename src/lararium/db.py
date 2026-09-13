@@ -104,6 +104,29 @@ CREATE TABLE IF NOT EXISTS compressed_envelopes (
     envelope_id TEXT PRIMARY KEY,
     created_at  TEXT NOT NULL
 );
+
+-- M6-6c:收到的 PDF 逐页转出来的文字(Steward 独占,和起居注同库同产权;bundle 碰不到)。
+-- 键是 (媒体池里那份的内容哈希, 页码)——同一份发两次是同一个键,只转一次。
+-- 一份一行:页数打开之后才知道;整份打不开(加密、坏文件)记下原因,一页都不转。
+CREATE TABLE IF NOT EXISTS pdf_docs (
+    sha256      TEXT PRIMARY KEY,
+    total_pages INTEGER NOT NULL DEFAULT 0,
+    unreadable  TEXT NOT NULL DEFAULT '',
+    found_at    TEXT NOT NULL
+);
+-- 一页一行,**只有调过模型的页才有行**。状态不另存一列,由这两列推出来(见 pdftext.py):
+--   text 不为 NULL                     → 转好了
+--   text 为 NULL、attempts 到了上限    → 转失败了(终态)
+--   text 为 NULL、attempts 没到上限    → 调过没成,下次接着试
+CREATE TABLE IF NOT EXISTS pdf_pages (
+    sha256     TEXT NOT NULL,
+    page       INTEGER NOT NULL,
+    text       TEXT,
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    error      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (sha256, page)
+);
 """
 
 # M3-4 语义检索:嵌入向量(256 维,L2 归一化后入库)与起居注同库。

@@ -16,6 +16,7 @@ from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
 from lararium.steward.threads import Threads
 from lararium.steward.tools import BuiltinTools
+from lararium.steward.transcribe import Transcriber
 from lararium.steward.vision import unreadable_notes
 from lararium.steward.websearch import TavilyExtract, TavilySearch
 
@@ -71,6 +72,7 @@ class Steward:
         threads: Threads,
         bundle_tools: list[Callable] | None = None,
         mcp_servers: list[Any] | None = None,
+        transcriber: Transcriber | None = None,
     ) -> None:
         self.settings = settings
         self.inbox = inbox
@@ -84,6 +86,9 @@ class Steward:
         self.threads = threads
         self.bundle_tools = bundle_tools or []
         self.mcp_servers = mcp_servers or []
+        # M6-6c:后台把收到的 PDF 逐页转文字的那一个。None = 不转(视觉关着,模型看不了页图;
+        # 或者测试里没接)。它的 `run()` 由 lifespan 和 worker 并排起,这里只在收件那一刻叫醒它。
+        self.transcriber = transcriber
         # P0-1 纵深:本轮信封是否不可信(认领时定格);不可信轮任何 propose 强制降档。
         self._active_untrusted = False
         # M4-5d 断点续跑:上一次尝试已确立的工具结果序列、逐条消费标记、位置游标。
@@ -273,6 +278,13 @@ class Steward:
         env = self.inbox.claim_next()
         if env is None:
             return TurnOutcome(kind="empty")
+
+        # M6-6c:**收到 PDF 就转**,触发点在收件这一侧(和 bundle 无关)。`notice` 只置一个
+        # Event——这一轮的回复一个字节都不等转换;真正干活的是和 worker 并排跑的那个后台任务,
+        # 它这会儿看到有信封在处理,会先让着聊天。挂在认领这里,是因为每个信封(HTTP 入站、
+        # 数据面、重试、重启后重新排队)都必经这一点;入站处理器按 DESIGN §9 不碰业务逻辑。
+        if self.transcriber is not None:
+            self.transcriber.notice(env.attachments)
 
         # P0-1 纵深:本轮信封的信任度在认领时定格。不可信轮里模型传什么 provenance
         # 都会被降档成 untrusted(门控不建立在"渲染永远不出错"的假设上——这次就是

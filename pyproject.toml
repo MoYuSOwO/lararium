@@ -149,6 +149,11 @@ module = [
     # Any,不会逼出 type: ignore。课件归属表(`Material` / `Materials`)判据同 courses.store。
     "lararium.steward.pdf",
     "bundles.courses.materials",
+    # M6-6c:页文字缓存(`PageText` / `PdfText`,状态怎么由两列推出来)和后台转换器
+    # (`Transcriber` / `PageReader`)。形状全是我们定的,严格档的 tools.py / loop.py 靠它们;
+    # 第三方的那一半在 model.py(宽松档)里,这里只认 `ModelReply` / `ModelCallError`。
+    "lararium.steward.pdftext",
+    "lararium.steward.transcribe",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
