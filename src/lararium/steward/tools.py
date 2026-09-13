@@ -2,7 +2,7 @@ import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from re import sub
 from typing import Any
@@ -34,6 +34,7 @@ from lararium.steward.assembler import (
 from lararium.steward.contentsearch import PageMatch, coverage_note, match_page, squeeze
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal, SearchHit
+from lararium.steward.nudge import NudgeState
 from lararium.steward.pdf import UnreadablePdf, page_count, render_page
 from lararium.steward.pdftext import PdfText
 from lararium.steward.registry import Registry
@@ -396,6 +397,8 @@ class BuiltinTools:
         # M6-6e:按 id 搜内容时找文件原名(附件进门时记在收件箱里)。同一个库、同一条连接,
         # 理由同上;只读。
         self._inbox = Inbox(threads.conn)
+        # M6-9:"隔一阵问一嘴"的开关。同一个库、同一条连接,理由同上;这里**只会关**。
+        self._nudge = NudgeState(threads.conn)
 
     def begin_turn(self) -> None:
         """一轮开始时清零本轮的看图额度。由 `loop.process_next` 认领信封之后调。
@@ -975,6 +978,14 @@ class BuiltinTools:
                 )
         return "\n".join(lines)
 
+    def stop_nudging(self) -> str:
+        """用户明确说别再主动找他(「别隔一阵就发消息」「安静点」)时调:从此不再隔一阵主动开口。
+        **只有关,没有开**——关掉之后你没有办法、也不该自己再打开。只管主动开口这一件事:
+        照常回他的消息,待审提醒照常。别自己拿主意调,只在他说了的时候调。"""
+        if self._nudge.turn_off(datetime.now(UTC)):
+            return "关好了:以后不会再隔一阵主动找他。"
+        return "本来就关着,不用再关。"
+
     def _searchable_file(self, raw: str) -> tuple[str, Path | None]:
         """按 id 搜内容的一个 id → 池子里那一份 PDF;不行就回**一句说清为什么的话**。
 
@@ -1014,6 +1025,9 @@ class BuiltinTools:
         后面所有工具的 schema 全平移一格,那是每轮毁一次缓存。
         M6-6b:read_pdf 追加在 list_threads 之后,**不挪到 read_image 旁边**——同一条理由。
         M6-6e:search_in_files 追加在 read_pdf 之后,**不挪到 search_history 旁边**——同一条理由。
+        M6-9:stop_nudging 追加在 search_in_files 之后。**非加不可**:用户说"别发了"那一轮,
+        她得在**同一轮**里真把它关掉——没有工具,她只能回一句"好的"然后照发不误
+        (「说记好了之前先真的调工具」那条纪律的同一个形状);换成斜杠命令就得先教会她让用户去敲。
         open_threads() 不在这(是代码路径,组装器调)。
         """
         return [
@@ -1029,4 +1043,5 @@ class BuiltinTools:
             self.list_threads,
             self.read_pdf,
             self.search_in_files,
+            self.stop_nudging,
         ]

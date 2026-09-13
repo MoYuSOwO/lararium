@@ -300,8 +300,8 @@ def test_p1_daily_notifier_dedupes(tmp_path):
     """P1-3:make_daily_notifier 每天最多一条——同一天第二次不重投(DB 是唯一判据)。"""
     from lararium.db import connect
     from lararium.steward.journal import Journal
+    from lararium.steward.notice import make_daily_notifier
     from lararium.steward.outbox import Outbox
-    from lararium.steward.sweep import make_daily_notifier
 
     conn = connect(tmp_path / "n.sqlite")
     outbox = Outbox(conn)
@@ -324,8 +324,8 @@ def test_p1_daily_notifier_dedupes(tmp_path):
 def _notifier(tmp_path, channel="wecom", outbox=None):
     from lararium.db import connect
     from lararium.steward.journal import Journal
+    from lararium.steward.notice import make_daily_notifier
     from lararium.steward.outbox import Outbox
-    from lararium.steward.sweep import make_daily_notifier
 
     conn = connect(tmp_path / "push.sqlite")
     journal = Journal(conn)

@@ -116,6 +116,8 @@ async def test_model_receives_builtin_and_bundle_tools_in_fixed_order(steward_fa
         "read_pdf",
         # M6-6e:按 id 搜内容追加在 read_pdf 之后,同一条规矩。
         "search_in_files",
+        # M6-9:stop_nudging 同样追加在内置那一段的末尾。
+        "stop_nudging",
         # M6-6d:bundle 工具带上 manifest 名做前缀;内置工具不加(它们是主控自己的)。
         "memory__propose_fact",
         "memory__list_pending",
@@ -279,12 +281,12 @@ async def test_envelope_not_completed_until_reply_is_in_outbox(steward_factory):
             self.state_at_put: str | None = None
             self.conn = conn  # loop 的事务经 self.outbox.conn 判断同库,spy 也要有这个口
 
-        def put(self, envelope_id, channel, content, kind="reply"):
+        def put(self, envelope_id, channel, content, kind="reply", *, expires_at=None):
             row = self._conn.execute(
                 "SELECT state FROM inbox WHERE id=?", (envelope_id,)
             ).fetchone()
             self.state_at_put = row["state"]
-            return self._inner.put(envelope_id, channel, content, kind)
+            return self._inner.put(envelope_id, channel, content, kind, expires_at=expires_at)
 
     steward, _ = steward_factory([ModelReply(text="回复")])
     spy = SpyOutbox(steward.outbox, steward.inbox.conn)

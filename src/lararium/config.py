@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from lararium.timeofday import QuietHours
+
 
 def parse_tokens(raw: str) -> dict[str, str]:
     """解析 LARARIUM_TOKENS(渠道:token[,渠道:token…])→ {channel: token}。
@@ -49,6 +51,10 @@ class Settings:
     push_channel: str
     vision: bool
     tavily_key: str
+    nudge: bool
+    nudge_min_minutes: float
+    nudge_max_minutes: float
+    quiet_hours: QuietHours
     bind_host: str
     bind_port: int
     control_tokens: dict[str, str]
@@ -59,6 +65,12 @@ class Settings:
         api_key = os.environ.get("LARARIUM_API_KEY", "")
         if not api_key:
             raise ValueError("LARARIUM_API_KEY 未设置,请参考 .env.example")
+        min_minutes = float(os.environ.get("LARARIUM_NUDGE_MIN", "45"))
+        max_minutes = float(os.environ.get("LARARIUM_NUDGE_MAX", "90"))
+        if not 0 < min_minutes <= max_minutes:
+            raise ValueError(
+                f"LARARIUM_NUDGE_MIN/MAX 不对:{min_minutes}~{max_minutes},要 0 < MIN ≤ MAX(分钟)"
+            )
         return cls(
             api_key=api_key,
             api_base_url=os.environ.get("LARARIUM_API_BASE_URL", "https://api.deepseek.com/v1"),
@@ -92,6 +104,15 @@ class Settings:
             # 时 web_search 回一句「没接搜索」,而不是去打一个必然 401 的请求——后者
             # 会让用户以为 key 配错了,真相是压根没配。空着不影响任何别的功能。
             tavily_key=os.environ.get("LARARIUM_TAVILY_KEY", "").strip(),
+            # M6-9 隔一阵问一嘴。**默认关**,和 LARARIUM_VISION 同一个判断:复制一份 .env.example
+            # 不该顺带打开一个会主动找你说话的东西。
+            nudge=os.environ.get("LARARIUM_NUDGE", "off").strip().lower() == "on",
+            # 间隔在这个区间里随机(分钟)。45~90 是 PLAN 里建议的,用户原话"比如说一个小时这种,随机也行"。
+            nudge_min_minutes=min_minutes,
+            nudge_max_minutes=max_minutes,
+            # 静默时段:问一嘴不醒、不发;归拢的待审通知攒到结束那一刻再发。**02:00~08:00 是拍的**
+            # ——这个用户凌晨两三点还在记宵夜,"晚上不发"对他是错的,所以给得很窄;该由用户自己调。
+            quiet_hours=QuietHours.parse(os.environ.get("LARARIUM_QUIET_HOURS", "02:00-08:00")),
             bind_host=os.environ.get("LARARIUM_BIND_HOST", "127.0.0.1"),
             bind_port=int(os.environ.get("LARARIUM_BIND_PORT", "8420")),
             # 控制端(你):全权,四个端点都能碰。数据面来源(短信/网页):只准入站。

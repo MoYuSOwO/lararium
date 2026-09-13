@@ -163,6 +163,12 @@ module = [
     # M6-8:夜间归拢自动跑(`slot_day` / `next_slot` / `judge` / `SweepDays` / `NightlySweep`)。
     # 形状是我们定的,判定"该不该跑"的那几个小函数以后要搬给 M6-9,类型是搬家的安全网。
     "lararium.steward.nightly",
+    # M6-9:一天里的钟点与静默时段(`slot_day` / `next_slot` 从 nightly 搬来、`QuietHours`)、
+    # 攒着再发的通知器(`DailyNotifier`)、隔一阵问一嘴(`NudgeState` / `Nudger`)。形状全是我们定的,
+    # 严格档的 loop.py / tools.py 靠后两个。
+    "lararium.timeofday",
+    "lararium.steward.notice",
+    "lararium.steward.nudge",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

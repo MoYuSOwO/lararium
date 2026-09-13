@@ -38,20 +38,21 @@
 而凌晨四点撞上聊天的代价只是最多和聊天重叠这一次 run。
 
 **形状留给以后搬**:判定"该不该跑"(`slot_day` + `SweepDays.finished`)和"下次什么时候醒"
-(`next_slot`)是两个不依赖这个类的小函数。M6-9(隔一阵问一嘴)也要一个定时的后台任务,
-**这一轮不为它建通用调度器**(G5)——到那天看清两处真正共有的是什么,再搬。
+(`next_slot`)是两个不依赖这个类的小函数。M6-9 搬走了(`lararium.timeofday`,多了一个参数
+`at`):两处真正共有的只有"一天里的某个钟点",静默时段的起止问的也是它。**仍然没有通用调度器**。
 """
 
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, time
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from lararium.steward.model import NOT_THE_REQUEST_STATUS, REQUEST_REJECTED_STATUS
 from lararium.steward.sweep import Sweeper, SweepResult, nominal_window
+from lararium.timeofday import next_slot, slot_day
 
 logger = logging.getLogger("lararium")
 
@@ -60,17 +61,6 @@ SWEEP_AT = time(4, 0)
 
 Outcome = Literal["done", "unfinished", "failed"]
 Verdict = Literal["done", "unfinished", "rejected", "environment", "failed"]
-
-
-def slot_day(now: datetime, tz: ZoneInfo) -> date:
-    """最近一个已经过去的 `SWEEP_AT` 是哪一天的。"这一班跑没跑"问的就是这一天。"""
-    local = now.astimezone(tz)
-    return local.date() if local.time() >= SWEEP_AT else local.date() - timedelta(days=1)
-
-
-def next_slot(now: datetime, tz: ZoneInfo) -> datetime:
-    """`now` 之后下一个 `SWEEP_AT`(严格之后:正好 04:00 那一刻,下一个是明天的)。"""
-    return datetime.combine(slot_day(now, tz) + timedelta(days=1), SWEEP_AT, tzinfo=tz)
 
 
 def judge(result: SweepResult) -> Verdict:
@@ -186,7 +176,7 @@ class NightlySweep:
     async def step(self) -> float:
         """判一次、该跑就跑一次。返回离下次该醒还有几秒。"""
         now = self._clock()
-        day = slot_day(now, self._tz)
+        day = slot_day(now, self._tz, SWEEP_AT)
         if self._days.finished(day):
             return self._idle(now)
         if self._chat_busy():
@@ -236,5 +226,5 @@ class NightlySweep:
         return min(self.RETRY_AFTER * 2.0 ** (times - 1), self.MAX_BACKOFF)
 
     def _idle(self, now: datetime) -> float:
-        until = (next_slot(now, self._tz) - now).total_seconds()
+        until = (next_slot(now, self._tz, SWEEP_AT) - now).total_seconds()
         return max(0.0, min(until, self.IDLE_POLL))

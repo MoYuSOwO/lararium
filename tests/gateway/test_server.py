@@ -351,6 +351,25 @@ def test_outbox_scopes_to_channel_and_respects_after(server):
     assert [i["content"] for i in r2.json()["items"]] == ["cli 回复2"], "after 过滤应生效"
 
 
+def test_the_outbox_endpoint_drops_expired_items_and_journals_the_drop(server):
+    """M6-9 接线:过了保质期的(问一嘴那一句)不再交给适配器,扔的那一刻起居注里记一笔。
+    窗口关着的时候适配器会一遍遍回来取;用户三天后开口那一次,三天前那句问候不许跟着出去。"""
+    from datetime import UTC, datetime, timedelta
+
+    app, steward = server
+    steward.outbox.put("env-old", "cli", "在忙什么呢", expires_at=datetime.now(UTC) - timedelta(1))
+    steward.outbox.put("env-new", "cli", "回你刚才那句")
+    client = TestClient(app)
+
+    r = client.get("/v1/outbox", headers={"Authorization": "Bearer tok-cli"})
+
+    assert [i["content"] for i in r.json()["items"]] == ["回你刚才那句"]
+    dropped = steward.inbox.conn.execute(
+        "SELECT envelope_id FROM journal WHERE kind='outbox_expired'"
+    ).fetchall()
+    assert [d["envelope_id"] for d in dropped] == ["env-old"]
+
+
 def test_health_returns_counts(server):
     app, _ = server
     client = TestClient(app)
@@ -679,12 +698,13 @@ def test_the_nightly_sweep_starts_with_the_server_and_shares_the_command_sweeper
     from datetime import UTC, datetime
     from zoneinfo import ZoneInfo
 
-    from lararium.steward.nightly import SweepDays, slot_day
+    from lararium.steward.nightly import SWEEP_AT, SweepDays
+    from lararium.timeofday import slot_day
 
     app, steward = server
     steward.journal.append("env-1", "envelope", {"content": "今天食堂 12 块"})
     days = SweepDays(steward.inbox.conn)
-    today = slot_day(datetime.now(UTC), ZoneInfo(steward.settings.timezone))
+    today = slot_day(datetime.now(UTC), ZoneInfo(steward.settings.timezone), SWEEP_AT)
 
     with TestClient(app) as client:
         for _ in range(300):

@@ -8,7 +8,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # M4-7:主动推送(夜间归拢/压缩的提醒)是**系统自己开口**,来源必须能和用户原话分开
 # ——L0 渲染靠它走「(系统触发 · source/channel)」那一支。用现成的 "cron" 是小谎:
 # 它不是定时器触发的,是 worker 空闲跑完归拢/压缩之后触发的。
-Source = Literal["user", "cron", "module_event", "sweep"]
+# M6-9:`nudge` 是"隔一阵问一嘴"那条指令信封——同样是系统自己开口,同样走那一支。
+Source = Literal["user", "cron", "module_event", "sweep", "nudge"]
 
 # M5-4:附件种类。四种对应 iLink 的 IMAGE/VOICE/FILE/VIDEO,词是给人看的
 # ——`Attachment.as_line()` 和 M5-5 的取回工具用**同一份**,不许各写各的
