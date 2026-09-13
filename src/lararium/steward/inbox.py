@@ -119,6 +119,27 @@ class Inbox:
         ).fetchone()
         return row is not None
 
+    def attachment_name(self, sha256: str) -> str:
+        """这份附件原来叫什么(对方给的名字,进门时已经洗过);没有就回空串,**不编**。
+
+        M6-6e:按 id 搜内容时顺手显示——模型拿着 id 很难说出"那份合同"。名字就在收件箱这条
+        信封的附件里,**是 Steward 自己的库**,不用为它另建一张表(学习 bundle 的归属表里也有
+        名字,但那是 bundle 的数据,主控读不到)。同一份发过几次、名字不一样的,取最近那次。
+
+        `LIKE` 先把"附件里压根没提这个哈希"的信封筛掉,`json_each` 才去拆那一小撮——收件箱
+        只增不删,十年下来几十万行,每一行都拆一遍 JSON 不值。
+        """
+        row = self._conn.execute(
+            "SELECT json_extract(a.value, '$.name') AS name "
+            "FROM inbox, json_each(inbox.attachments) AS a "
+            "WHERE inbox.attachments LIKE ? "
+            "AND json_extract(a.value, '$.sha256') = ? "
+            "AND COALESCE(json_extract(a.value, '$.name'), '') != '' "
+            "ORDER BY inbox.ts DESC, inbox.rowid DESC LIMIT 1",
+            (f"%{sha256}%", sha256),
+        ).fetchone()
+        return str(row["name"]) if row is not None else ""
+
     def pending_count(self) -> int:
         return int(
             self._conn.execute("SELECT COUNT(*) FROM inbox WHERE state='pending'").fetchone()[0]

@@ -603,7 +603,7 @@ async def test_the_prefix_changes_nothing_in_the_tool_schema_but_the_name(
     sent = bodies[first]["tools"]
 
     legacy = steward.registry.legacy_tool_names()
-    assert len(sent) == len(sent_raw) == 40
+    assert len(sent) == len(sent_raw) == 41  # M6-6e 多一个内置工具 search_in_files
     for before, after in zip(sent_raw, sent, strict=True):
         old, new = before["function"]["name"], after["function"]["name"]
         assert new == legacy.get(old, old), f"{old} → {new}"

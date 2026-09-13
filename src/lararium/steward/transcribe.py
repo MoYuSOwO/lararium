@@ -72,7 +72,7 @@ def load_page_prompt(path: Path = PAGE_TO_TEXT_PATH) -> str:
 
 
 # 起居注里这类事件的 kind。**不在 `SEARCHABLE_KINDS` 里**:转出来的文字不许经 search_history
-# 以"工具输出"的样子冒出来(按 id 搜内容是 6d,读的是缓存,而且要过刀)。
+# 以"工具输出"的样子冒出来(按 id 搜内容是 M6-6e 的 `search_in_files`,读的是缓存,而且要过刀)。
 JOURNAL_KIND = "pdf_text"
 
 # 池子里一份 PDF 的文件名:`<内容哈希>.pdf`。后缀由 media_type 查表,不另写一份;

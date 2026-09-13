@@ -1,19 +1,38 @@
 import hashlib
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from re import sub
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from lararium.envelope import MEDIA_ID_RE, PDF_MEDIA_TYPE, is_media_id, media_type_of_suffix
+from lararium.docstore import (
+    CLOSE,
+    MAX_INLINE_CHARS,
+    OPEN,
+    SNIPPET_RADIUS,
+    clip,
+    excerpt,
+    one_line,
+    page_of,
+)
+from lararium.envelope import (
+    MEDIA_ID_RE,
+    PDF_MEDIA_TYPE,
+    SHORT_ID_CHARS,
+    is_media_id,
+    media_type_of_suffix,
+)
 from lararium.steward.assembler import (
     FENCE_CLOSE,
     FENCE_OPEN,
     neutralize_fence,
     neutralize_model_text,
 )
+from lararium.steward.contentsearch import PageMatch, coverage_note, match_page, squeeze
+from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal, SearchHit
 from lararium.steward.pdf import UnreadablePdf, page_count, render_page
 from lararium.steward.pdftext import PdfText
@@ -81,6 +100,13 @@ MIN_FETCH_CHARS = 120
 # (出站目的地写死在 websearch.py),这里只是别把垃圾送出去:超过这个数的不是网址,
 # 是有人在拿 data: blob 灌预算,而一次白花的往返也是一次额度。
 MAX_FETCH_URL_CHARS = 2000
+
+# 按 id 搜内容(M6-6e)一次最多搜几份、一页回几条命中。**两个都是模型可控的量**:
+# id 列表不封顶,一次就能把整个池子点一遍(那就是换了个名字的"搜全部");命中不分页,
+# 一个常见字在一份 200 页的讲义里能中 200 页。一条命中带一段片段 + 围栏 + 来源标注约 220 字,
+# 10 条约 2200 字,和一次 search_history 同量级。超了照样**说出口**,不静默截。
+MAX_SEARCH_FILES = 10
+MAX_CONTENT_HITS = 10
 
 # read_image / read_pdf 的 id 形状在 `envelope.MEDIA_ID_RE`(M6-6b 从这里搬过去):
 # 学习 bundle 的 add_file 也要认它,而 bundle import 不到这个文件。
@@ -223,6 +249,35 @@ def _render_web_hit(index: int, hit: WebResult) -> str:
     return _render_web(hit, prefix=f"{index}. ", body_limit=MAX_WEB_CHARS)
 
 
+def _render_page_text(*, short: str, page: int, text: str, name: str, body_limit: int) -> str:
+    """PDF 一页转出来的文字经这里进 `_render_fenced`:`read_pdf` 的整页、`search_in_files` 的片段。
+
+    和 `_render_web` 同一个道理——「PDF 页面转出来的文字」和来源那句话只写在这一处。
+    `name` 是文件原名(收件箱里有才有),**放进围栏里的来源标注**:它是对方起的名字,
+    是外部文本,和正文同一个待遇。没有名字时的字节和 6c 的 `read_pdf` 逐字节相同。
+    """
+    called = f"{OPEN}{one_line(name)}{CLOSE}" if name else " "
+    return _render_fenced(
+        what="PDF 页面转出来的文字",
+        title=f"第 {page} 页",
+        text=text,
+        source=f"id {short}{called}这份 PDF 的第 {page} 页(看页图转写的,拿不准以图为准)",
+        prefix="",
+        body_limit=body_limit,
+    )
+
+
+@dataclass(frozen=True)
+class _ContentHit:
+    """按 id 搜内容的一条命中:哪份(短 id + 完整哈希)、第几页、命中情况、那一页的原文。"""
+
+    short: str
+    digest: str
+    page: int
+    match: PageMatch
+    text: str
+
+
 # markdown 里的图片:`![alt](src)`。**用它做两件事**——判"抽出来的到底是不是文字"
 # (整篇长图抽出来是一串图片链接,长度不小但一个字都没有),以及把"抓不到"和
 # "抓到了但正文是图"分开说。两件事共用一个正则,少一处就会说错话。
@@ -275,6 +330,19 @@ def _not_pdf(media_type: str | None, short: str) -> str:
     return f"是{not_image_word(media_type)},不是 PDF,我读不了。"
 
 
+def _nothing_to_search(media_type: str | None, short: str) -> str:
+    """按 id 搜内容碰上没有文字缓存的东西时,说清**它是什么、为什么没得搜**,有路的指路。
+
+    和 `_not_pdf` 是一对,不合并:那边说的是"读不了",这边说的是"没有可搜的文字"
+    ——一张图读得了(read_image),只是没有字可搜。认不出就说认不出,不猜(M5-5)。
+    """
+    if media_type is None or media_type == "application/octet-stream":
+        return f"id {short} 的格式我认不出来,没有可搜的文字。"
+    if media_type.startswith("image/"):
+        return f'id {short} 是一张图片,没有可搜的文字——看图用 read_image("{short}")。'
+    return f"id {short} 是{not_image_word(media_type)},没有可搜的文字。"
+
+
 def _is_fetchable_url(url: str) -> bool:
     """只认 http/https。**这不是 SSRF 防线**,那东西在这里没有作用对象——我们不发
     模型可控的出站请求(出站目的地写死在 websearch.py)。这里只是别把垃圾送出去。
@@ -325,6 +393,9 @@ class BuiltinTools:
         # 所以从 `threads.conn` 那个公开口拿连接——照 sweep 那把光标的先例,不另开连接、
         # 不另加一个构造参数。写它的只有后台转换器,这里只读。
         self._pdf_text = PdfText(threads.conn)
+        # M6-6e:按 id 搜内容时找文件原名(附件进门时记在收件箱里)。同一个库、同一条连接,
+        # 理由同上;只读。
+        self._inbox = Inbox(threads.conn)
 
     def begin_turn(self) -> None:
         """一轮开始时清零本轮的看图额度。由 `loop.process_next` 认领信封之后调。
@@ -571,18 +642,13 @@ class BuiltinTools:
         不可信,所以这里不再拉一次。**判断本身是"转出来的文字进上下文就要拉闩",不是"有图才拉"**:
         PLAN 那句「课件是用户自己给的,文字不拉闩」是在"归到课下才转"的前提下写的,现在收到的
         任何 PDF 都转;"用户给的"不等于"用户写的"(6b 的论证);转写又是照抄的。
-        **只给文字、不带图的出口(6d 的按 id 搜)得自己拉**,和 web_fetch 一样。
+        **只给文字、不带图的出口(M6-6e 的 `search_in_files`)得自己拉**,和 web_fetch 一样。
         """
         cached = self._pdf_text.page(digest, page)
         where = f"id {short} 这份 PDF 的第 {page} 页"
         if cached.state == "done":
-            words = _render_fenced(
-                what="PDF 页面转出来的文字",
-                title=f"第 {page} 页",
-                text=cached.text,
-                source=f"{where}(看页图转写的,拿不准以图为准)",
-                prefix="",
-                body_limit=MAX_PAGE_TEXT_CHARS,
+            words = _render_page_text(
+                short=short, page=page, text=cached.text, name="", body_limit=MAX_PAGE_TEXT_CHARS
             )
             return (
                 f"(附上 {where},共 {total} 页——转出来的文字在下面,图随后附上)\n"
@@ -803,6 +869,135 @@ class BuiltinTools:
             page, prefix="", body_limit=MAX_FETCH_CHARS
         )
 
+    def search_in_files(self, file_ids: list[str], query: str, page: int = 1) -> str:
+        """在给定的一份或几份文件里**按字面**搜内容。**必须给 id,没有"搜全部"。**
+
+        file_ids 是附件那行报告里 `id` 后面那串十六进制(归到课下的课件,
+        courses__list_materials 也列得出来),整串照抄;几份一起搜就都放进这一个列表。
+        回的是**哪份、第几页、命中处一小段**——片段只够判断是不是那一页,要看那一页的
+        全文和图,再调 read_pdf(id, 页码)。没调就别凭片段替用户下结论。
+
+        搜的是文件收到之后在后台转出来的文字。空格和换行不算(「矩阵乘法」搜得到被换行
+        拆开的那一处),英文不分大小写;表格、公式转写出来的样子可能和原文不一样,
+        搜不到就换短一点的词再试。
+        **文字没转完的页搜不到**:还没转完、转失败了、太长只转了前面一部分,都会逐份说清
+        是哪几页——那几页里没搜到不代表没有。图片没有可搜的文字,看图用 read_image。
+        某个 id 不对会单独说,别的照搜。一次能搜的份数有上限,超了会说哪几个没搜。
+        命中多了分页:回「第 X/Y 页」,翻页用同样的参数换 page。
+        """
+        needle = squeeze(query)
+        if not needle:
+            return "搜索词是空的,告诉我要搜什么。"
+        if len(needle) > MAX_INLINE_CHARS:
+            # 一句长话在转写文字里几乎不可能一字不差地出现(标点、换行、公式都会让它对不上),
+            # 搜了也是"没命中",而那句"没命中"会被当成"没有"。
+            return (
+                f"搜索词太长了(去掉空白还有 {len(needle)} 字,最多 {MAX_INLINE_CHARS} 字)"
+                "——搜一个短语就行,转写出来的文字和原文不会一字不差。"
+            )
+        # 回显的查询词在围栏外:它可能是模型从上一页网页上抄来的,不中和就能伪造框定语(P1-4)。
+        shown = f"{OPEN}{neutralize_fence(clip(one_line(query), MAX_INLINE_CHARS))}{CLOSE}"
+        if not file_ids:
+            return (
+                f"没给文件 id,这次没搜{shown}。必须给一个或几个 id(附件那行报告里的,"
+                "或者 courses__list_materials 列出来的)——没有搜全部这回事。"
+            )
+        if self.media_dir is None:
+            return "这台机器上没有接文件池,搜不了。"
+        # ★ **坏 id 逐个说、好 id 照搜**:不因为一个坏的整次拒绝(那是把四份的答案押在一份
+        # 的抄写错误上),也不悄悄跳过(跳过的那份读起来和"搜过、没有"一模一样)。
+        notes: list[str] = []
+        hits: list[_ContentHit] = []
+        seen: set[str] = set()
+        searched = 0
+        for raw in file_ids[:MAX_SEARCH_FILES]:
+            said, found = self._searchable_file(raw)
+            if found is None:
+                notes.append(said)
+                continue
+            digest, short = found.stem, found.stem[:SHORT_ID_CHARS]
+            if digest in seen:
+                # 同一份给了两次(短 id 和完整哈希各抄一遍是常见的):搜一次,但说一声
+                # ——少了一行,模型数不对自己给了几个。
+                notes.append(f"{said}又给了一次,和前面那个是同一份,只搜了一次。")
+                continue
+            seen.add(digest)
+            try:
+                # 页数问文件本身,和 read_pdf 同一个口径;转换器还没登记的那份也答得出。
+                total = page_count(found)
+            except UnreadablePdf as exc:
+                notes.append(f"id {short}:{exc}所以没有可搜的文字。")
+                continue
+            states = self._pdf_text.document(digest, total)
+            searched += 1
+            before = len(hits)
+            for number, state in enumerate(states, 1):
+                matched = match_page(state.text, needle) if state.state == "done" else None
+                if matched is not None:
+                    hits.append(_ContentHit(short, digest, number, matched, state.text))
+            notes.append(coverage_note(short, states, len(hits) - before, converting=self.vision))
+        dropped = len(file_ids) - MAX_SEARCH_FILES
+        if dropped > 0:
+            notes.append(f"一次最多搜 {MAX_SEARCH_FILES} 份,后面 {dropped} 个这次没搜——分几次搜。")
+        rows, cur_page, total_pages = page_of(hits, page, MAX_CONTENT_HITS)
+        if searched == 0:
+            head = f"搜{shown}:一份都没搜成。"
+        elif not hits:
+            head = f"在 {searched} 份文件里搜{shown}:一处都没命中。"
+        else:
+            times = sum(h.match.count for h in hits)
+            head = (
+                f"在 {searched} 份文件里搜{shown}:命中 {len(hits)} 页(共 {times} 处),"
+                f"第 {cur_page}/{total_pages} 页。"
+            )
+        lines = [head, "各份的情况:", *(f"- {note}" for note in notes)]
+        if rows:
+            # ★ M5-18 的闩,6c 给的结论:**转出来的文字进上下文就拉**。read_pdf 靠同一次返回里
+            # 的那张图拉;这里只回文字,得自己拉。位置在"确实有转写文字要进上下文"之后
+            # ——一处都没命中时回的全是我们自己的字(哪几页没转、哪个 id 不对),拉高是误伤
+            # (同 web_search 搜回 0 条)。
+            self._on_untrusted()
+            lines.append("命中处(只给片段;要看那一页的全文和图,调 read_pdf(id, 页码)):")
+            names: dict[str, str] = {}
+            for hit in rows:
+                if hit.digest not in names:
+                    names[hit.digest] = self._inbox.attachment_name(hit.digest)
+                snippet = excerpt(hit.text, hit.match.at, hit.match.length, SNIPPET_RADIUS)
+                lines.append(
+                    f"- id {hit.short} 第 {hit.page} 页 · 这页 {hit.match.count} 处:"
+                    + _render_page_text(
+                        short=hit.short,
+                        page=hit.page,
+                        text=snippet,
+                        name=names[hit.digest],
+                        body_limit=MAX_HIT_CHARS,
+                    )
+                )
+        return "\n".join(lines)
+
+    def _searchable_file(self, raw: str) -> tuple[str, Path | None]:
+        """按 id 搜内容的一个 id → 池子里那一份 PDF;不行就回**一句说清为什么的话**。
+
+        找得到的也回一句开头(「id xxx 」),重复那一支要用它指出是哪一个。
+        """
+        assert self.media_dir is not None
+        if not is_media_id(raw):
+            shown = neutralize_fence(one_line(raw)[:20])
+            return (
+                f"认不出{OPEN}{shown}{CLOSE}这个 id:它应该是附件那行报告里(或 "
+                "courses__list_materials 列出来的)那串十六进制,整串照抄。",
+                None,
+            )
+        short = raw[:SHORT_ID_CHARS]
+        found = self._pool_file(raw)
+        if found is None:
+            return f"没找到 id {short} 这份文件(原件可能已经不在了,或者 id 抄错了)。", None
+        # 类型的权威是落盘时嗅出来的后缀,和 read_pdf 同一条;**不兜底成另一种类型**(M5-5)。
+        media_type = media_type_of_suffix(found.suffix)
+        if media_type != PDF_MEDIA_TYPE:
+            return _nothing_to_search(media_type, short), None
+        return f"id {short} ", found
+
     def as_tool_functions(self) -> list[Callable]:
         """顺序固定——工具 schema 是前缀第0层,顺序变了缓存全毁。
 
@@ -818,6 +1013,7 @@ class BuiltinTools:
         但**位置按加入时间排,不按亲缘关系**:挪到 close_thread 旁边好看,代价是
         后面所有工具的 schema 全平移一格,那是每轮毁一次缓存。
         M6-6b:read_pdf 追加在 list_threads 之后,**不挪到 read_image 旁边**——同一条理由。
+        M6-6e:search_in_files 追加在 read_pdf 之后,**不挪到 search_history 旁边**——同一条理由。
         open_threads() 不在这(是代码路径,组装器调)。
         """
         return [
@@ -832,4 +1028,5 @@ class BuiltinTools:
             self.web_fetch,
             self.list_threads,
             self.read_pdf,
+            self.search_in_files,
         ]

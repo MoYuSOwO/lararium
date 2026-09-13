@@ -81,7 +81,8 @@ def test_tool_function_order_is_fixed(tools):
     加入时间排,不按亲缘关系:挪到 close_thread 旁边会让后面五个工具的 schema
     整体平移一格,那是每轮毁一次缓存。
     M6-6b:read_pdf 追加在**末尾**,不挪到 read_image 旁边——同一条理由(M6-6b 为此改了
-    这条测试:只在末尾加一个名字,前面十个一个没动)。"""
+    这条测试:只在末尾加一个名字,前面十个一个没动)。
+    M6-6e:search_in_files 追加在 read_pdf 之后,不挪到 search_history 旁边——同一条理由。"""
     names = [f.__name__ for f in tools.as_tool_functions()]
     assert names == [
         "current_time",
@@ -95,6 +96,7 @@ def test_tool_function_order_is_fixed(tools):
         "web_fetch",
         "list_threads",
         "read_pdf",
+        "search_in_files",
     ]
 
 
