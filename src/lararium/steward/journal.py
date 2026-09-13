@@ -58,6 +58,8 @@ def estimate_tokens(text: str) -> int:
 # 旧值是 10 / 40。**普通轮那条低估到了三分之一**:28 个字符的时间戳全是数字与符号,
 # 是 BPE 最吃亏的形状,连 estimate_tokens 自己都只算得出 14。2000 轮就是四万 token
 # 没进预算。**换渲染 / 换 provider 要重测**,这一条不是摆设——它已经错过两次了。
+# M6-10 换了一次渲染(`[9月13日 周日 18:21 · 距他上一条 18 小时,跨天了] `,最长 33 字符、
+# 其中 13 个汉字,比旧的 28 个数字符号便宜),**还没对真 tokenizer 重测**,待真机补。
 #
 # 工具痕迹行(M4-5c)**不设常量**:它长度随工具名变,由 _render_overhead 直接
 # estimate_tokens 算。实测核过够用:单个工具实测 +9 估算 10,两个实测 +12 估算 15。
@@ -427,6 +429,8 @@ class Journal:
                 "channel": e.get("channel", "cli") if e else "cli",
                 "untrusted": bool(e.get("meta", {}).get("untrusted")) if e else False,
                 "ts": e.get("ts") if e else None,
+                # M6-10:认领时冻结的"前一条"发送时间(见 previous_turn_ts)
+                "prev_ts": e.get("meta", {}).get("prev_ts") if e else None,
                 # M3-3:该轮认领时冻结的话头快照(meta 里存的形态:list[{topic,note}])
                 "open_threads": e.get("meta", {}).get("open_threads") if e else None,
                 # M4-5c v2:该轮的工具往返(调用+结果),按发生顺序、不去重;配不上对的
@@ -437,6 +441,34 @@ class Journal:
                 ),
             }
         return out
+
+    def previous_turn_ts(self, envelope_id: str) -> str | None:
+        """这封信之前、起居注里**用户**最近一条**答过了**的消息的发送时间(M6-10)。没有就 None。
+
+        "前一条"这么定,理由各一条:
+        - **按起居注,不按 L0 窗口**:窗口会滑、会被压缩截掉,按窗口取则同一条消息的间隔
+          随窗口变化。调用方在认领时查一次、冻结进 meta,之后渲染只读那份。
+        - **只算用户说的**(`source="user"`):问一嘴、归拢通知、数据面转进来的短信都不算。
+          问一嘴选了不说是常态,一天醒好几次——拿它当"上一条",昨晚聊的「明晚」到今天傍晚
+          读到的是「距上一条 8 小时」(上午那次没开口的问一嘴),跨天这件事被它吃掉了。
+          所以标签写的是「距**他**上一条」:系统触发那几行上的也是"他多久没说话了"。
+        - **只算答过了的**:答不出来的那轮不进 L0(`assemble` 跳过有问无答的轮),
+          他重发的那条读到「距他上一条 5 分钟」,指的是一条她看不见的消息。
+        - **排序按 seq**(和 L0 的顺序同一个口径),重试的信封按它最后那次记的位置算。
+        """
+        row = self._conn.execute(
+            "SELECT j.payload FROM journal j "
+            "WHERE j.kind='envelope' AND j.envelope_id != ? "
+            "AND json_extract(j.payload, '$.source') = 'user' "
+            "AND EXISTS (SELECT 1 FROM journal r WHERE r.envelope_id = j.envelope_id "
+            "AND r.kind='reply') "
+            "ORDER BY j.seq DESC LIMIT 1",
+            (envelope_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        ts = json.loads(row["payload"]).get("ts")
+        return str(ts) if ts else None
 
     def has_kind(self, envelope_id: str, kind: str) -> bool:
         """这封信下面有没有过某一类事件。给"跨重试继承"用:重试是同一个信封,

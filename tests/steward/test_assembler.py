@@ -1,6 +1,9 @@
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from lararium.envelope import Attachment, Envelope
+from lararium.steward import assembler as assembler_module
 from lararium.steward.assembler import Turn, assemble
 
 PERSONA = "你是 Lararium。"
@@ -55,13 +58,15 @@ def test_envelope_timestamp_follows_configured_timezone_not_the_os():
     """VPS 默认时区基本都是 UTC。用裸 astimezone() 的话,信封会显示 UTC 时间,
     而 current_time 工具显示配置的 Asia/Shanghai——同一轮对话里差 8 小时,
     模型对"今天/昨天/晚上"的判断全错。用两个时区对比,测试本身不依赖开发机的 TZ。"""
-    env = Envelope.new(source="user", channel="cli", content="现在几点")
+    # M6-10:ISO 换成人读的格式,时区偏移不再写出来——断言改成比钟点(同一刻差 8 小时)
+    env = Envelope.new(source="user", channel="cli", content="现在几点").model_copy(
+        update={"ts": datetime.fromisoformat("2026-08-17T20:00:00+00:00")}
+    )
     shanghai = build(env, timezone="Asia/Shanghai").messages[-1]["content"]
     utc = build(env, timezone="UTC").messages[-1]["content"]
 
-    assert "+08:00" in shanghai
-    assert "+00:00" in utc
-    assert shanghai != utc
+    assert shanghai == "[8月18日 周二 04:00] 现在几点"
+    assert utc == "[8月17日 周一 20:00] 现在几点"
 
 
 def test_envelope_message_carries_the_timestamp():
@@ -69,8 +74,9 @@ def test_envelope_message_carries_the_timestamp():
     ctx = build(env)
     last = ctx.messages[-1]
     assert last["role"] == "user"
-    assert "几点了" in last["content"]
-    assert str(env.ts.year) in last["content"]
+    local = env.ts.astimezone(ZoneInfo("Asia/Shanghai"))
+    assert last["content"].startswith(f"[{local.month}月{local.day}日 ")
+    assert last["content"].endswith(f"{local:%H:%M}] 几点了")
 
 
 def test_appending_a_turn_leaves_earlier_messages_untouched():
@@ -202,7 +208,7 @@ def test_l0_user_message_carries_the_journal_timestamp():
         Envelope.new(source="user", channel="cli", content="本轮"),
         l0=[Turn(user="我明天要去看牙医", assistant="记下了", ts="2026-08-17T05:00:00+00:00")],
     )
-    assert ctx.messages[0]["content"] == "[2026-08-17T13:00:00+08:00] 我明天要去看牙医"
+    assert ctx.messages[0]["content"] == "[8月17日 周一 13:00] 我明天要去看牙医"
 
 
 def test_l0_user_message_degrades_to_plain_text_without_a_timestamp():
@@ -529,3 +535,173 @@ def test_notes_reach_the_model_as_plain_words():
     )
 
     assert "看不了图" in ctx.messages[-1]["content"]
+
+
+# ── M6-10:消息带上"隔了多久" ─────────────────────────────────────────────
+#
+# 间隔**只由存下来的两个时间**决定:这一条的 ts、它前一条的 ts(认领时冻结进 meta 的
+# `prev_ts`,见 `Steward.process_next`)。不读"现在",也不看 L0 窗口里谁挨着谁。
+
+SH = ZoneInfo("Asia/Shanghai")
+
+
+def _sh(y, mo, d, h, mi, s=0):
+    return datetime(y, mo, d, h, mi, s, tzinfo=SH).isoformat()
+
+
+def _history_line(ts, prev_ts, *, timezone="Asia/Shanghai", user="那就明晚吧"):
+    ctx = build(
+        Envelope.new(source="user", channel="cli", content="本轮"),
+        l0=[Turn(user=user, assistant="好", ts=ts, prev_ts=prev_ts)],
+        timezone=timezone,
+    )
+    return ctx.messages[0]["content"]
+
+
+def test_a_message_minutes_after_the_previous_one_gets_only_the_readable_time():
+    assert (
+        _history_line(_sh(2026, 9, 13, 18, 21, 59), _sh(2026, 9, 13, 18, 10))
+        == "[9月13日 周日 18:21] 那就明晚吧"
+    )
+
+
+def test_just_under_the_same_day_threshold_says_nothing_about_the_gap():
+    line = _history_line(_sh(2026, 9, 13, 18, 21), _sh(2026, 9, 13, 15, 21, 1))
+    assert line == "[9月13日 周日 18:21] 那就明晚吧"
+
+
+def test_exactly_at_the_same_day_threshold_says_how_long_it_has_been():
+    line = _history_line(_sh(2026, 9, 13, 18, 21), _sh(2026, 9, 13, 15, 21))
+    assert line == "[9月13日 周日 18:21 · 距他上一条 3 小时] 那就明晚吧"
+
+
+def test_crossing_midnight_is_said_even_when_only_minutes_apart():
+    """23:50 说的「明晚」到 00:10 就成了「今晚」——几分钟也得说跨天了。"""
+    line = _history_line(_sh(2026, 9, 13, 0, 10), _sh(2026, 9, 12, 23, 50))
+    assert line == "[9月13日 周日 00:10 · 距他上一条 20 分钟,跨天了] 那就明晚吧"
+
+
+def test_yesterday_evening_to_today_evening_is_hours_and_a_crossed_day():
+    """真机那一例的形状:昨晚说「明晚」,今天傍晚还顺着说「明晚」。"""
+    line = _history_line(_sh(2026, 9, 13, 18, 21, 59), _sh(2026, 9, 12, 23, 59))
+    assert line == "[9月13日 周日 18:21 · 距他上一条 18 小时,跨天了] 那就明晚吧"
+
+
+def test_several_calendar_days_are_counted_in_days():
+    line = _history_line(_sh(2026, 9, 13, 9, 0), _sh(2026, 9, 10, 18, 0))
+    assert line == "[9月13日 周日 09:00 · 距他上一条跨了 3 天] 那就明晚吧"
+
+
+def test_crossing_a_month_is_just_another_crossed_day():
+    line = _history_line(_sh(2026, 9, 1, 8, 0), _sh(2026, 8, 31, 22, 0))
+    assert line == "[9月1日 周二 08:00 · 距他上一条 10 小时,跨天了] 那就明晚吧"
+
+
+def test_crossing_a_year_puts_the_year_back_into_the_stamp():
+    line = _history_line(_sh(2027, 1, 1, 0, 15), _sh(2026, 12, 31, 23, 30))
+    assert line == "[2027年1月1日 周五 00:15 · 距他上一条 45 分钟,跨天了] 那就明晚吧"
+
+
+def test_the_calendar_day_is_the_configured_timezones_day():
+    """UTC 里是同一天、上海已经跨了午夜。按配置时区算,不按 UTC、不按系统时区。"""
+    ts, prev = "2026-09-12T16:30:00+00:00", "2026-09-12T15:30:00+00:00"
+    assert (
+        _history_line(ts, prev, timezone="Asia/Shanghai")
+        == "[9月13日 周日 00:30 · 距他上一条 1 小时,跨天了] 那就明晚吧"
+    )
+    assert _history_line(ts, prev, timezone="UTC") == "[9月12日 周六 16:30] 那就明晚吧"
+
+
+def test_no_previous_message_means_no_gap_and_no_year():
+    assert _history_line(_sh(2026, 9, 13, 18, 21), None) == "[9月13日 周日 18:21] 那就明晚吧"
+
+
+def test_no_timestamp_means_neither_time_nor_gap():
+    assert _history_line(None, _sh(2026, 9, 12, 18, 0)) == "那就明晚吧"
+
+
+def test_system_triggers_and_untrusted_data_carry_the_same_stamp_but_replies_do_not():
+    stamp = "[9月13日 周日 09:00 · 距他上一条跨了 3 天]"
+    ts, prev = _sh(2026, 9, 13, 9, 0), _sh(2026, 9, 10, 18, 0)
+    ctx = build(
+        Envelope.new(source="user", channel="cli", content="本轮"),
+        l0=[
+            Turn(user="问一嘴", assistant="在忙什么", source="nudge", ts=ts, prev_ts=prev),
+            Turn(
+                user="支出 30",
+                assistant="收到",
+                source="module_event",
+                channel="finance",
+                untrusted=True,
+                ts=ts,
+                prev_ts=prev,
+            ),
+        ],
+    )
+    assert ctx.messages[0]["content"] == f"{stamp} (系统触发 · nudge/cli) 问一嘴"
+    assert ctx.messages[1] == {"role": "assistant", "content": "在忙什么"}
+    assert ctx.messages[2]["content"].startswith(f"{stamp} 来自 finance 的外部数据。")
+    assert ctx.messages[3] == {"role": "assistant", "content": "收到"}
+
+
+def test_the_arriving_envelope_renders_exactly_as_it_will_in_history():
+    """当前轮和历史轮同一个渲染器(P1-1):这一轮发出去的那条,下一轮逐字节还是它。"""
+    prev = _sh(2026, 9, 12, 23, 59)
+    env = Envelope(
+        id="a" * 32,
+        source="user",
+        channel="wechat",
+        content="已经不是明晚了 是今晚了",
+        meta={"prev_ts": prev},
+        ts=datetime(2026, 9, 13, 18, 21, 59, tzinfo=SH),
+    )
+    now_render = build(env).messages[-1]["content"]
+    later = build(
+        Envelope.new(source="user", channel="cli", content="下一条"),
+        l0=[
+            Turn(
+                user=env.content,
+                assistant="好",
+                channel="wechat",
+                ts=env.ts.isoformat(),
+                prev_ts=prev,
+            )
+        ],
+    )
+    assert now_render == "[9月13日 周日 18:21 · 距他上一条 18 小时,跨天了] 已经不是明晚了 是今晚了"
+    assert later.messages[0]["content"] == now_render
+
+
+def test_the_gap_never_depends_on_what_time_it_is_now(monkeypatch):
+    """★ 同一段历史,两个不同的"现在",渲染逐字节相同。拿现在算间隔,下一轮就变了。"""
+    turns = [
+        Turn(user="明晚吃火锅", assistant="好", ts=_sh(2026, 9, 12, 23, 0)),
+        Turn(
+            user="已经不是明晚了",
+            assistant="对",
+            ts=_sh(2026, 9, 13, 18, 21),
+            prev_ts=_sh(2026, 9, 12, 23, 0),
+        ),
+    ]
+    env = Envelope(
+        id="b" * 32,
+        source="user",
+        channel="cli",
+        content="几点去",
+        meta={"prev_ts": _sh(2026, 9, 13, 18, 21)},
+        ts=datetime(2026, 9, 13, 18, 30, tzinfo=SH),
+    )
+
+    def render_at(moment):
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return moment if tz is None else moment.astimezone(tz)
+
+        monkeypatch.setattr(assembler_module, "datetime", Frozen)
+        return build(env, l0=turns).messages
+
+    a = render_at(datetime(2026, 9, 13, 18, 31, tzinfo=SH))
+    b = render_at(datetime(2027, 3, 1, 9, 0, tzinfo=SH))
+    assert a == b
+    assert a[2]["content"] == "[9月13日 周日 18:21 · 距他上一条 19 小时,跨天了] 已经不是明晚了"

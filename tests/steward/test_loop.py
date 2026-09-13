@@ -1,6 +1,9 @@
 import hashlib
 import json
+from datetime import datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from bundles.memory.server import build_memory_components, memory_tool_functions
@@ -1832,3 +1835,109 @@ async def test_a_clean_recall_similar_hit_does_not_raise_the_mark(steward_factor
 
     assert "星巴克" in listed, "语义路压根没命中,下面断的是空气"
     assert steward.gate.pending() == [], "干净历史的语义命中把这一轮拖脏了"
+
+
+# ── M6-10:消息带上"隔了多久" ─────────────────────────────────────────────
+
+SH = ZoneInfo("Asia/Shanghai")
+
+
+def sent_at(content: str, when: datetime) -> Envelope:
+    return Envelope.new(source="user", channel="cli", content=content).model_copy(
+        update={"ts": when}
+    )
+
+
+def user_renders(ctx: AssembledContext, texts: list[str]) -> dict[str, str]:
+    """这份上下文里每条用户消息(按正文认)实际渲染成的那一串。"""
+    return {
+        text: m["content"]
+        for m in ctx.messages
+        if m["role"] == "user"
+        for text in texts
+        if m["content"].endswith(f" {text}")
+    }
+
+
+async def test_an_old_message_renders_byte_identical_as_the_window_slides(
+    steward_factory, monkeypatch
+):
+    """★ M6-10 的命根子:L0 窗口往后滑、老的被压缩、新消息进来,**旧消息逐字节不变**。
+
+    窗口只留 3 轮历史(兜底 4 = 3 轮 + 正在处理的这封,它的信封事件在组装前就记下了),
+    每进一条新消息最老那条就掉出去——窗口里最老那条"在窗口里的前一条"每轮都没了。
+    "前一条"要是按窗口取,它的间隔标签下一轮就消失,缓存从那一条起全 miss。
+    """
+    monkeypatch.setenv("LARARIUM_L0_MAX_TURNS", "4")
+    steward, model = steward_factory()
+    start = datetime(2026, 9, 8, 21, 0, tzinfo=SH)
+    offsets = [0, 26, 31, 78, 79, 151, 155]  # 小时:跨天、同一天、隔几天都有
+    texts = ["甲消息", "乙消息", "丙消息", "丁消息", "戊消息", "己消息", "庚消息"]
+    ids = []
+    for i, (text, hours) in enumerate(zip(texts, offsets, strict=True)):
+        env = sent_at(text, start + timedelta(hours=hours))
+        ids.append(env.id)
+        steward.submit(env)
+        await steward.process_next()
+        if i == 4:
+            # 压缩掉这会儿窗口里最老的那条:它后面那条的"前一条"照样是它
+            steward.journal.mark_compressed([ids[2]])
+
+    contexts = model.seen
+    for before, after in pairwise(contexts):
+        old, new = user_renders(before, texts), user_renders(after, texts)
+        shared = old.keys() & new.keys()
+        assert shared, "两轮之间没有共同的消息,下面比的是空气"
+        for text in shared:
+            assert new[text] == old[text], f"{text} 在下一轮渲染变了:{old[text]!r} → {new[text]!r}"
+
+    last = user_renders(contexts[-1], texts)
+    assert set(last) == {"丁消息", "戊消息", "己消息", "庚消息"}, "窗口没滑动"
+    assert "距他上一条" in last["丁消息"], "窗口最老那条没带间隔,测不到'前一条按窗口取'"
+    assert last["己消息"] == "[9月15日 周二 04:00 · 距他上一条跨了 3 天] 己消息"
+
+
+async def test_the_previous_message_is_the_users_last_answered_one_frozen_into_the_journal(
+    steward_factory,
+):
+    """ "前一条" = 认领时起居注里**用户**最近一条**答过了**的消息。
+
+    - 答不出来的那轮不在 L0 里,拿它当"上一条",她读到「距他上一条 5 分钟」、上面那条其实是昨晚的;
+    - 系统触发(问一嘴、归拢通知)不算:上午一次没开口的问一嘴,会把「跨天了」吃掉。
+    """
+
+    class FailsThird:
+        def __init__(self) -> None:
+            self.seen: list[AssembledContext] = []
+
+        async def run(self, ctx, tools, mcp_servers):
+            self.seen.append(ctx)
+            if len(self.seen) == 3:
+                raise ModelCallError("HTTP 400", retryable=False, status=400)
+            return ModelReply(text="好")
+
+    steward, _ = steward_factory()
+    model = FailsThird()
+    steward.model = model
+    first = sent_at("明晚吃火锅", datetime(2026, 9, 12, 20, 0, tzinfo=SH))
+    trigger = Envelope.new(source="cron", channel="cli", content="晨报时间到").model_copy(
+        update={"ts": datetime(2026, 9, 13, 7, 0, tzinfo=SH)}
+    )
+    broken = sent_at("这条炸了", datetime(2026, 9, 13, 8, 0, tzinfo=SH))
+    third = sent_at("几点去", datetime(2026, 9, 13, 8, 5, tzinfo=SH))
+    for env in (first, trigger, broken, third):
+        steward.submit(env)
+        await steward.process_next()
+
+    def frozen_meta(env):
+        (recorded,) = [e for e in steward.journal.replay(env.id) if e["kind"] == "envelope"]
+        return recorded["payload"]["meta"]
+
+    assert frozen_meta(third)["prev_ts"] == first.ts.isoformat()
+    assert frozen_meta(trigger)["prev_ts"] == first.ts.isoformat()
+    assert "prev_ts" not in frozen_meta(first)
+    messages = model.seen[-1].messages
+    assert messages[-1]["content"] == "[9月13日 周日 08:05 · 距他上一条 12 小时,跨天了] 几点去"
+    assert messages[2]["content"] == (
+        "[9月13日 周日 07:00 · 距他上一条 11 小时,跨天了] (系统触发 · cron/cli) 晨报时间到"
+    )

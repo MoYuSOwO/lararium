@@ -387,7 +387,8 @@ async def test_the_instruction_renders_as_a_system_trigger_not_as_the_user(world
     (row,) = nudge_rows(w)
     await say(w, "在写作业")
 
-    stamp = fired.astimezone(SH).isoformat(timespec="seconds")
+    # M6-10:人读的时间;距上一句「今天没课」(10:10)不到 3 小时、同一天,不带间隔
+    stamp = f"1月10日 周四 {fired.astimezone(SH):%H:%M}"
     instruction = render_instruction(load_nudge_prompt(), recent=[], timezone=TZ)
     assert row["content"] == instruction
     messages = w.model.seen[-1].messages

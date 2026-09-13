@@ -337,6 +337,14 @@ class Steward:
         snapshot = [{"topic": t.topic, "note": t.note} for t in self.threads.open_threads()]
         if snapshot:
             env.meta["open_threads"] = snapshot
+        # M6-10:"前一条"的发送时间同样在认领时**冻结**进 meta——间隔由这条和它存下的
+        # 那份算,历史轮渲染读的也是那份,于是窗口怎么滑、压缩截掉谁,这条都逐字节不变。
+        # 重试时照样重查:重试之间答过的消息排在它前面,L0 里它也排在那条后面。
+        prev_ts = self.journal.previous_turn_ts(env.id)
+        if prev_ts is not None:
+            env.meta["prev_ts"] = prev_ts
+        else:
+            env.meta.pop("prev_ts", None)
 
         self.journal.append(
             env.id,
@@ -491,6 +499,7 @@ class Steward:
                 channel=r.get("channel", "cli"),
                 untrusted=r.get("untrusted", False),
                 ts=r.get("ts"),
+                prev_ts=r.get("prev_ts"),
                 # M3-3:历史轮带**当时冻结**的话头快照,渲染的是那份不是最新的
                 open_threads=r.get("open_threads"),
                 exchanges=tuple(
