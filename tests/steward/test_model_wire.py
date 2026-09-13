@@ -603,10 +603,13 @@ async def test_the_prefix_changes_nothing_in_the_tool_schema_but_the_name(
     sent = bodies[first]["tools"]
 
     legacy = steward.registry.legacy_tool_names()
-    assert len(sent) == len(sent_raw) == 41  # M6-6e 多一个内置工具 search_in_files
+    # M6-6e 多一个内置工具 search_in_files(41);M6-7 多五个待办工具(46)
+    assert len(sent) == len(sent_raw) == 46
     for before, after in zip(sent_raw, sent, strict=True):
         old, new = before["function"]["name"], after["function"]["name"]
         assert new == legacy.get(old, old), f"{old} → {new}"
         assert _without_name(after) == _without_name(before), f"{new} 的 schema 除了名字还变了别的"
     renamed = sum(1 for b, a in zip(sent_raw, sent, strict=True) if b != a)
-    assert renamed == len(legacy) == 29, "只有 bundle 工具改了名;内置工具一个字节不动"
+    # M6-7:34 = 改名那天的 29 + 待办的 5。待办的 5 条从来没有裸名时代,映射里多出来的这几条
+    # 在历史里配不上任何东西(无害);这条断言钉的是"只有 bundle 工具带前缀",不是那天的 29。
+    assert renamed == len(legacy) == 34, "只有 bundle 工具改了名;内置工具一个字节不动"

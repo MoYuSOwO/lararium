@@ -108,6 +108,9 @@ def test_the_discipline_file_carries_what_the_milestones_bought(tmp_path):
         # M5-23:指路本身也是买来的。指针没了,前缀里就再没有通往判据的路,
         # 而"少了一条指路"看起来像文字精简,不像丢了东西。
         "writing-facts",
+        # M6-7:话头和待办的边界。原来这一句把「下周要交什么」指给 open_thread,待办 bundle
+        # 进来之后那就是前缀里一句和工具 docstring 反着说的话(第二份真相)。
+        "做完能勾掉的事",
     ):
         assert bought in text, f"纪律里丢了:{bought}"
 

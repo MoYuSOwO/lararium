@@ -1,0 +1,7 @@
+name: todos
+description: 待办:要去做、做完能勾掉的事——交材料、作业、考试
+skills: []      # 没有方法篇:记一件事、勾掉一件事不需要一套方法论(G5,同 recipes)
+# 顺序即冻结顺序(§5 示例);以后加工具**只追加在末尾**
+tools: [add_todo, list_todos, complete_todo, update_todo, delete_todo]
+triggers: []
+events: []

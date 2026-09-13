@@ -157,6 +157,9 @@ module = [
     # M6-6e:按 id 搜内容的判定那一层(`PageMatch` / `match_page` / `coverage_note`),
     # 形状是我们定的,严格档的 tools.py 靠它。
     "lararium.steward.contentsearch",
+    # M6-7:待办表那一层(`Todo` / `Listing`、两个状态位各自的写法)。形状是我们定的,
+    # 判据同 courses.materials;FastMCP 那一侧(`bundles/todos/server.py`)留宽松档。
+    "bundles.todos.store",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true

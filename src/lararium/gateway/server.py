@@ -20,6 +20,7 @@ from bundles.courses.server import build as build_courses
 from bundles.finance.server import build as build_finance
 from bundles.memory.server import build_memory_components, memory_tool_functions
 from bundles.recipes.server import build as build_recipes
+from bundles.todos.server import build as build_todos
 from pydantic import ValidationError
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -94,6 +95,8 @@ def _assemble_bundle_tools(
     # M6-6a 学习:同样**追加在末尾**,上面 20 个一格没动(M6-6b 课件那两个在它自己那段末尾)。
     # 它收 timezone:回收站目录名里有时间戳。
     tools += registry.qualify_tools("courses", build_courses(data_dir, timezone=timezone).tools)
+    # M6-7 待办:同样**追加在末尾**,上面 29 个一格没动。收 timezone:「今天」和完成时间按它算。
+    tools += registry.qualify_tools("todos", build_todos(data_dir, timezone=timezone).tools)
     return AssembledTools(tools=tools, proposal_tool=memory.propose_fact)
 
 
