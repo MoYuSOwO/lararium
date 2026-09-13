@@ -24,10 +24,12 @@ from lararium.db import connect
 from lararium.steward import sweep as sweep_module
 from lararium.steward.journal import Journal
 from lararium.steward.model import ModelCallError
-from lararium.steward.nightly import NightlySweep, SweepDays, next_slot, slot_day
+from lararium.steward.nightly import SWEEP_AT, NightlySweep, SweepDays
+from lararium.steward.notice import make_daily_notifier
 from lararium.steward.outbox import Outbox
-from lararium.steward.sweep import Sweeper, make_daily_notifier
+from lararium.steward.sweep import Sweeper
 from lararium.steward.threads import Threads
+from lararium.timeofday import next_slot, slot_day
 
 TZ = "Asia/Shanghai"
 SH = ZoneInfo(TZ)
@@ -109,17 +111,17 @@ async def settle_day(nightly: NightlySweep, clock: Clock, days: SweepDays, day, 
 
 def test_the_slot_is_today_once_the_run_time_has_passed_and_yesterday_before_it():
     """「今天该不该跑」问的是**最近一个已经过去的 04:00 是哪天的**,按配置时区算。"""
-    assert slot_day(at(10, 4, 0), SH).isoformat() == "2030-01-10"
-    assert slot_day(at(10, 3, 59), SH).isoformat() == "2030-01-09"
+    assert slot_day(at(10, 4, 0), SH, SWEEP_AT).isoformat() == "2030-01-10"
+    assert slot_day(at(10, 3, 59), SH, SWEEP_AT).isoformat() == "2030-01-09"
     # 同一个瞬间,换一个时区就是另一天的那一班:上海 01-10 03:59 = UTC 01-09 19:59
-    assert slot_day(at(10, 3, 59), ZoneInfo("UTC")).isoformat() == "2030-01-09"
-    assert slot_day(at(10, 12, 30), ZoneInfo("UTC")).isoformat() == "2030-01-10"
+    assert slot_day(at(10, 3, 59), ZoneInfo("UTC"), SWEEP_AT).isoformat() == "2030-01-09"
+    assert slot_day(at(10, 12, 30), ZoneInfo("UTC"), SWEEP_AT).isoformat() == "2030-01-10"
 
 
 def test_the_next_wake_is_the_next_run_time():
-    assert next_slot(at(10, 3, 59), SH) == at(10, 4, 0)
-    assert next_slot(at(10, 4, 0), SH) == at(11, 4, 0)
-    assert next_slot(at(10, 23, 0), SH) == at(11, 4, 0)
+    assert next_slot(at(10, 3, 59), SH, SWEEP_AT) == at(10, 4, 0)
+    assert next_slot(at(10, 4, 0), SH, SWEEP_AT) == at(11, 4, 0)
+    assert next_slot(at(10, 23, 0), SH, SWEEP_AT) == at(11, 4, 0)
 
 
 # ── 一天一次,判据在库里 ─────────────────────────────────────────────────────
@@ -135,7 +137,7 @@ async def test_a_day_that_has_run_is_not_run_again_after_a_restart(process):
     first = Model()
     nightly, days, journal, _ = process(first, clock)
     talk(journal, "今天食堂 12 块")
-    await settle_day(nightly, clock, days, slot_day(clock(), SH))
+    await settle_day(nightly, clock, days, slot_day(clock(), SH, SWEEP_AT))
     assert len(first.prompts) == 1
 
     talk(journal, "晚上又聊了一句:下周三线代期中考")
@@ -159,14 +161,14 @@ async def test_a_night_the_process_was_away_is_made_up_once_not_once_per_day(pro
     clock = Clock(at(7, 4, 30))
     nightly, days, journal, _ = process(Model(), clock)
     talk(journal, "七号说的")
-    await settle_day(nightly, clock, days, slot_day(clock(), SH))
+    await settle_day(nightly, clock, days, slot_day(clock(), SH, SWEEP_AT))
 
     for day in (8, 9, 10):
         talk(journal, f"{day} 号说的")
     clock = Clock(at(10, 12, 0))  # 8、9 号整晚不在,10 号中午才起来
     model = Model()
     nightly, days, _, conn = process(model, clock)
-    await settle_day(nightly, clock, days, slot_day(clock(), SH))
+    await settle_day(nightly, clock, days, slot_day(clock(), SH, SWEEP_AT))
     while clock() < at(11, 3, 59):
         clock.advance(await nightly.step())
 
@@ -183,7 +185,7 @@ async def test_starting_before_the_run_time_makes_up_the_night_before(process):
     nightly, days, journal, _ = process(Model(), clock)
     talk(journal, "九号晚上说的")
 
-    await settle_day(nightly, clock, days, slot_day(clock(), SH))
+    await settle_day(nightly, clock, days, slot_day(clock(), SH, SWEEP_AT))
 
     assert days.finished(at(9, 0).date()) and not days.finished(at(10, 0).date())
 
@@ -220,7 +222,7 @@ async def test_a_failing_sweep_is_given_up_for_the_day_after_a_bounded_number_of
     model = Model(*([502] * 50))
     nightly, days, journal, _ = process(model, clock)
     talk(journal, "今天说的")
-    day = slot_day(clock(), SH)
+    day = slot_day(clock(), SH, SWEEP_AT)
 
     delays = await settle_day(nightly, clock, days, day)
 
@@ -239,7 +241,7 @@ async def test_a_failing_sweep_is_given_up_for_the_day_after_a_bounded_number_of
 async def test_the_failure_count_survives_a_restart(process):
     """次数在库里:崩了重启、再崩再重启,**不会**每次起来都白送一次机会(那也是重试到死)。"""
     clock = Clock(at(10, 4, 0))
-    day = slot_day(clock(), SH)
+    day = slot_day(clock(), SH, SWEEP_AT)
     for _ in range(NightlySweep.MAX_FAILURES - 1):
         nightly, days, journal, _ = process(Model(502), clock)
         talk(journal, "又说了一句")
@@ -262,7 +264,7 @@ async def test_account_and_rate_failures_are_not_recorded_against_the_day(proces
     model = Model(*([status] * outage))
     nightly, days, journal, _ = process(model, clock)
     talk(journal, "今天说的")
-    day = slot_day(clock(), SH)
+    day = slot_day(clock(), SH, SWEEP_AT)
 
     delays = await settle_day(nightly, clock, days, day)
 
@@ -282,7 +284,7 @@ async def test_a_rejected_request_gives_up_the_day_at_once(process, status):
     model = Model(status, status, status)
     nightly, days, journal, _ = process(model, clock)
     talk(journal, "今天说的")
-    day = slot_day(clock(), SH)
+    day = slot_day(clock(), SH, SWEEP_AT)
 
     await settle_day(nightly, clock, days, day)
 
@@ -307,7 +309,7 @@ async def test_an_unfinished_sweep_goes_on_the_same_night_up_to_a_cap(process, m
     model = Model()
     nightly, days, journal, conn = process(model, clock)
     seqs = [talk(journal, f"第{i}条" + "话" * 40) for i in range(10)]
-    day = slot_day(clock(), SH)
+    day = slot_day(clock(), SH, SWEEP_AT)
 
     await settle_day(nightly, clock, days, day)
 
@@ -326,7 +328,7 @@ async def test_an_unfinished_sweep_that_catches_up_the_same_night_is_done(proces
     model = Model()
     nightly, days, journal, conn = process(model, clock)
     seqs = [talk(journal, f"第{i}条" + "话" * 40) for i in range(2)]
-    day = slot_day(clock(), SH)
+    day = slot_day(clock(), SH, SWEEP_AT)
 
     await settle_day(nightly, clock, days, day)
 
@@ -346,13 +348,13 @@ async def test_the_only_push_is_the_existing_once_a_day_notice(process, monkeypa
     nightly, days, journal, conn = process(model, clock)
     for i in range(10):
         talk(journal, f"第{i}条" + "话" * 40)
-    await settle_day(nightly, clock, days, slot_day(clock(), SH))
+    await settle_day(nightly, clock, days, slot_day(clock(), SH, SWEEP_AT))
     assert len(model.prompts) == NightlySweep.MAX_RUNS, "阳性对照:确实提了三次"
 
     clock.now = at(11, 4, 0)
     failing = Model(502, 502, 502)
     nightly, days, _, _ = process(failing, clock)
-    await settle_day(nightly, clock, days, slot_day(clock(), SH))
+    await settle_day(nightly, clock, days, slot_day(clock(), SH, SWEEP_AT))
 
     kinds = [r["kind"] for r in conn.execute("SELECT kind FROM outbox ORDER BY seq")]
     assert kinds == ["notice"], f"出件箱里应该只有那一条待审通知:{kinds}"

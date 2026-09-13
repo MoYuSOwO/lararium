@@ -47,7 +47,11 @@ CREATE TABLE IF NOT EXISTS outbox (
     kind         TEXT NOT NULL DEFAULT 'reply',   -- reply | notice
     content      TEXT NOT NULL,
     created_at   TEXT NOT NULL,
-    delivered_at TEXT
+    delivered_at TEXT,
+    -- M6-9:保质期。NULL = 一直等(回复、待审通知:"消息在等你开口");有值 = 过了就扔
+    -- (主动问一嘴:三天前那句「在忙什么」现在发出去是荒谬的)。扔的时候记 dropped_at。
+    expires_at   TEXT,
+    dropped_at   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_channel ON outbox(channel, seq);
 
@@ -79,6 +83,18 @@ CREATE TABLE IF NOT EXISTS notice_log (
     date TEXT PRIMARY KEY
 );
 
+-- M6-9:静默时段里来的待审通知**攒在这里**,时段结束那一刻放出去。一行:已经攒着一条就不再攒。
+-- 落库而不是放内存:04:00 攒下、崩了、08:00 前起来——那一条照样得发(见 steward/notice.py)。
+CREATE TABLE IF NOT EXISTS held_notice (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    content TEXT NOT NULL,
+    held_at TEXT NOT NULL
+);
+-- M6-9:隔一阵问一嘴被用户叫停。一行 = 关着。**代码里没有删它的路**:关掉之后不许自己又开。
+CREATE TABLE IF NOT EXISTS nudge_off (
+    id     INTEGER PRIMARY KEY CHECK (id = 1),
+    off_at TEXT NOT NULL
+);
 -- M6-8:夜间归拢自动跑,**一天一行**。"今天跑过没有"只看这里——放内存里的话重启一次就重跑一次,
 -- 崩了再起再崩就是重试到死。只有自动那一班写它,手动 /sweep 不写(见 steward/nightly.py)。
 CREATE TABLE IF NOT EXISTS sweep_days (
@@ -190,6 +206,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
         "attachments",
         "ALTER TABLE inbox ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     ),
+    ("PRAGMA table_info(outbox)", "expires_at", "ALTER TABLE outbox ADD COLUMN expires_at TEXT"),
+    ("PRAGMA table_info(outbox)", "dropped_at", "ALTER TABLE outbox ADD COLUMN dropped_at TEXT"),
 )
 
 

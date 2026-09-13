@@ -12,7 +12,7 @@ import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
@@ -44,6 +44,8 @@ from lararium.steward.journal import Journal
 from lararium.steward.loop import Steward
 from lararium.steward.model import PydanticAIClient
 from lararium.steward.nightly import NightlySweep, SweepDays
+from lararium.steward.notice import DailyNotifier, make_daily_notifier
+from lararium.steward.nudge import Nudger, NudgeState, discard_expired, load_nudge_prompt
 from lararium.steward.outbox import Outbox
 from lararium.steward.pdftext import PdfText
 from lararium.steward.registry import Registry
@@ -103,17 +105,38 @@ def _assemble_bundle_tools(
     return AssembledTools(tools=tools, proposal_tool=memory.propose_fact)
 
 
-def _push_notifier(steward: Steward) -> Any:
+def _push_notifier(steward: Steward) -> DailyNotifier:
     """三处调用点共用的通知器构造。渠道走配置(`LARARIUM_PUSH_CHANNEL`),不再写死 "cli"
-    ——M5 双通道下推送若掉进没人看的窗口,等于没推(M3 结转第 2 条)。"""
-    from lararium.steward.sweep import make_daily_notifier
-
+    ——M5 双通道下推送若掉进没人看的窗口,等于没推(M3 结转第 2 条)。
+    M6-9:守静默时段(攒着、到点放出去);判据在库里,所以各造一个实例也是同一份真相。"""
     return make_daily_notifier(
         journal=steward.journal,
         outbox=steward.outbox,
         conn=steward.outbox.conn,
         timezone=steward.settings.timezone,
         channel=steward.settings.push_channel,
+        quiet=steward.settings.quiet_hours,
+    )
+
+
+def _nudger(steward: Steward, wake: asyncio.Event) -> Nudger:
+    """隔一阵问一嘴的那一圈。投信封 = 进收件箱 + 叫醒 worker,和 HTTP 入站同一个动作。"""
+
+    def submit(envelope: Envelope) -> None:
+        steward.inbox.put(envelope)
+        wake.set()
+
+    settings = steward.settings
+    return Nudger(
+        state=NudgeState(steward.threads.conn),
+        submit=submit,
+        chat_busy=steward.inbox.has_unfinished,
+        quiet=settings.quiet_hours,
+        timezone=settings.timezone,
+        channel=settings.push_channel,
+        instructions=load_nudge_prompt(),
+        min_interval=timedelta(minutes=settings.nudge_min_minutes),
+        max_interval=timedelta(minutes=settings.nudge_max_minutes),
     )
 
 
@@ -282,6 +305,13 @@ def create_app(
             timezone=steward.settings.timezone,
         )
         tasks.append(asyncio.create_task(nightly.run()))
+        # M6-9:攒在静默时段里的待审通知,时段结束那一刻放出去。**问一嘴关着也要跑**:两件事只是
+        # 守同一个时段,归拢的通知不该因为问一嘴没开就在凌晨四点响。
+        tasks.append(asyncio.create_task(_push_notifier(steward).run()))
+        # M6-9:隔一阵问一嘴。**默认关**(LARARIUM_NUDGE=off);开着才起。它只往收件箱投信封、叫醒
+        # worker,不自己调模型——那一轮是 worker 的普通一轮,和聊天严格串行。
+        if steward.settings.nudge:
+            tasks.append(asyncio.create_task(_nudger(steward, wake).run()))
         try:
             yield
         finally:
@@ -369,6 +399,9 @@ def create_app(
         except ValueError:
             wait = 0
 
+        # M6-9:过了保质期的先扔掉、记进起居注,再取——窗口关着时适配器会一遍遍回来取同一段,
+        # 用户三天后开口那一次,三天前那句问候不许跟着出去。
+        discard_expired(outbox=steward.outbox, journal=steward.journal, now=datetime.now(UTC))
         loop = asyncio.get_running_loop()
         deadline = loop.time() + wait
         # 长轮询:有货即返;无货且 wait>0 则等(轮询即可,单用户不值得按渠道分事件)。

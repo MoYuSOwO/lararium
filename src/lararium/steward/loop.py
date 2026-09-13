@@ -12,6 +12,7 @@ from lararium.steward.assembler import Turn, assemble
 from lararium.steward.inbox import Inbox
 from lararium.steward.journal import Journal, estimate_tokens
 from lararium.steward.model import ModelCallError, ModelClient, format_cache_log
+from lararium.steward.nudge import NUDGE_SOURCE, expiry_of, is_silent
 from lararium.steward.outbox import Outbox
 from lararium.steward.ports import GatePort, LedgerPort
 from lararium.steward.registry import Registry
@@ -418,7 +419,12 @@ class Steward:
                 # 用异常不用 assert:python -O 会吞 assert,异连接下事务会静默退回旧 bug。
                 raise RuntimeError("组装根必须给 inbox/outbox 注入同一连接——异连接下事务不成立")
             with transaction(self.inbox.conn):
-                self.outbox.put(env.id, env.channel, reply.text, kind="reply")
+                # M6-9:问一嘴那一轮,模型选了不说 → **不推**。这是正常出口:信封照样 done,
+                # 起居注里这一轮照样完整(模型下次看得见自己上次看过、没开口)。
+                if not (env.source == NUDGE_SOURCE and is_silent(reply.text)):
+                    self.outbox.put(
+                        env.id, env.channel, reply.text, kind="reply", expires_at=expiry_of(env)
+                    )
                 self.inbox.complete(env.id)
             return TurnOutcome(kind="replied", text=reply.text)
 
@@ -435,12 +441,15 @@ class Steward:
                 self.inbox.release(env.id)  # 回 pending,attempts 已在 claim 时 +1
                 return TurnOutcome(kind="retry_later", attempts=attempts)
             self.inbox.fail(env.id, str(exc))
-            self.outbox.put(
-                env.id,
-                env.channel,
-                f"这条消息处理失败({exc}),已放弃:{env.content[:50]}",
-                kind="notice",
-            )
+            # M6-9:问一嘴那一轮失败了**什么都不发**——那条通知会把 `env.content` 的开头带出去,
+            # 而问一嘴的 content 是给模型的指令,用户一个字都不该看到;一句问候没问成也不值得告诉他。
+            if env.source != NUDGE_SOURCE:
+                self.outbox.put(
+                    env.id,
+                    env.channel,
+                    f"这条消息处理失败({exc}),已放弃:{env.content[:50]}",
+                    kind="notice",
+                )
             return TurnOutcome(kind="replied")  # 终态:发 notice,消费了槽位
 
         except Exception as exc:
