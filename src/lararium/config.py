@@ -79,7 +79,7 @@ class Settings:
             timezone=os.environ.get("LARARIUM_TIMEZONE", "Asia/Shanghai"),
             # M3-1:L0 按 token 预算截断,l0_max_turns 只当轮数兜底(M3 前默认 30 太小)。
             l0_max_turns=int(os.environ.get("LARARIUM_L0_MAX_TURNS", "2000")),
-            l0_max_tokens=int(os.environ.get("LARARIUM_L0_MAX_TOKENS", "200000")),
+            l0_max_tokens=int(os.environ.get("LARARIUM_L0_MAX_TOKENS", "400000")),
             max_attempts=int(os.environ.get("LARARIUM_MAX_ATTEMPTS", "3")),
             # M3-4:语义检索相似度阈值。0.35 是猜的初值(2026-08-18 实测命中 0.44~0.58、
             # 未命中 0.35),真机跑几天要按实际分布调。
@@ -87,10 +87,12 @@ class Settings:
             # M3-5 夜间归拢(sweep)的廉价模型,单配;空则用主模型。归拢是扫历史做剪枝,
             # 不需要主模型那么强,便宜够用就行。
             sweep_model=os.environ.get("LARARIUM_SWEEP_MODEL", ""),
-            # M3-6 压缩(M3 最后一块硬骨头)。整窗 200k、低水位 150k、索引保留 90 天,
+            # M3-6 压缩(M3 最后一块硬骨头)。整窗 400k、低水位 350k、索引保留 90 天,
+            # (2026-09-14 用户改:原来的 200k/150k 是按 M3 时 200k 的模型窗口定的,
+            # 现在 deepseek-flash 窗口 1M;两者之间留 50k,是两次空闲压缩之间对话增长的余量)
             # 口径一律 estimate_tokens + _render_overhead(渲染后形态,M3-1b/M3-3 定死)。
             compact=os.environ.get("LARARIUM_COMPACT", "on"),  # on | off(off 退回纯截断)
-            compact_low_water=int(os.environ.get("LARARIUM_COMPACT_LOW_WATER", "150000")),
+            compact_low_water=int(os.environ.get("LARARIUM_COMPACT_LOW_WATER", "350000")),
             compact_index_days=int(os.environ.get("LARARIUM_COMPACT_INDEX_DAYS", "90")),
             # M4-7:主动推送落在哪个渠道。以前写死 "cli",于是 M5 双通道下推送会掉进
             # 没人看的窗口(M3 结转第 2 条)。默认仍是 cli,单渠道部署行为不变。
